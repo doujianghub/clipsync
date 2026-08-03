@@ -1,0 +1,297 @@
+//! 文件内容的发送侧：登记本机待发文件、流式分块发送、被新内容取代时立即中止。
+//!
+//! **为什么发送要"拉"而不是"推"**：若把 100MB 全部切块塞进发送通道，内存会被
+//! 占满且无法中途取消。这里改为由连接的收发泵**按需拉取**——每轮循环读一块、
+//! 发一块，天然受 TCP 背压约束，内存占用恒定为一个块的大小。
+//!
+//! **取代语义**：每轮发送前比对代际号。用户复制了新内容后代际号递增，正在进行
+//! 的旧传输会立刻停止并通知对端——因为此刻剪贴板里已经不是那个文件了，继续
+//! 传输只会让对端剪贴板与本机不一致。
+
+use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use clipsync_core::SyncMessage;
+use tracing::debug;
+
+use crate::filecache::{hash_file, CHUNK_SIZE};
+
+/// 本机可供对端索取的文件登记表：代际号 → [(文件标识, 本机路径)]。
+///
+/// 只保留最近若干代际——旧代际的内容已不在剪贴板里，对端不会再索取。
+#[derive(Clone, Default)]
+pub struct OutgoingFiles {
+    inner: Arc<Mutex<HashMap<u64, Vec<(u64, PathBuf)>>>>,
+    /// 当前代际号：由本地剪贴板变化递增，用于判断传输是否已被取代。
+    current: Arc<AtomicU64>,
+}
+
+impl OutgoingFiles {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 登记一次文件复制，并将其设为当前代际。
+    pub fn register(&self, generation: u64, files: Vec<(u64, PathBuf)>) {
+        let mut map = self.inner.lock().unwrap();
+        map.insert(generation, files);
+        // 只保留最近 4 代，防止长期运行后无限增长。
+        if map.len() > 4 {
+            let mut keys: Vec<u64> = map.keys().copied().collect();
+            keys.sort_unstable();
+            let drop_count = keys.len() - 4;
+            for k in keys.into_iter().take(drop_count) {
+                map.remove(&k);
+            }
+        }
+        drop(map);
+        self.current.store(generation, Ordering::SeqCst);
+    }
+
+    /// 剪贴板变成了非文件内容：推进代际号以中止正在进行的文件传输。
+    pub fn advance(&self, generation: u64) {
+        self.current.store(generation, Ordering::SeqCst);
+    }
+
+    /// 当前代际号。
+    pub fn current(&self) -> u64 {
+        self.current.load(Ordering::SeqCst)
+    }
+
+    /// 该代际是否仍是当前剪贴板内容。
+    pub fn is_current(&self, generation: u64) -> bool {
+        self.current() == generation
+    }
+
+    /// 查某代际下某文件的本机路径。
+    pub fn path_for(&self, generation: u64, file_id: u64) -> Option<PathBuf> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&generation)?
+            .iter()
+            .find(|(id, _)| *id == file_id)
+            .map(|(_, p)| p.clone())
+    }
+}
+
+/// 一个进行中的发送流：从某文件的指定偏移持续读出并发送。
+pub struct OutgoingStream {
+    generation: u64,
+    file_id: u64,
+    path: PathBuf,
+    file: std::fs::File,
+    offset: u64,
+    buf: Vec<u8>,
+}
+
+impl OutgoingStream {
+    /// 应对端请求开始发送某文件的 `offset` 之后的内容。
+    pub fn start(generation: u64, file_id: u64, path: PathBuf, offset: u64) -> Result<Self> {
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("打开待发送文件失败: {}", path.display()))?;
+        file.seek(SeekFrom::Start(offset))
+            .context("定位到续传偏移失败")?;
+        Ok(Self {
+            generation,
+            file_id,
+            path,
+            file,
+            offset,
+            buf: vec![0u8; CHUNK_SIZE],
+        })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 产出下一条待发消息。返回 `None` 表示本文件已发送完毕。
+    ///
+    /// 每次只读一个块，因此单次调用的内存与耗时都有界，便于在块之间响应
+    /// 取代请求与其它剪贴板同步。
+    pub fn next_message(&mut self) -> Result<Option<SyncMessage>> {
+        let n = self.file.read(&mut self.buf).context("读取待发送文件失败")?;
+        if n == 0 {
+            // 读到结尾：计算整份内容的哈希供对端校验。
+            // 此处才计算是有意为之——续传时我们只读了文件的后半段，无法边读边算
+            // 出完整哈希；而这一次完整读取也顺带验证了文件当前确实可读。
+            let content_hash = hash_file(&self.path).context("计算发送文件哈希失败")?;
+            return Ok(Some(SyncMessage::FileDone {
+                generation: self.generation,
+                file_id: self.file_id,
+                content_hash,
+            }));
+        }
+        let msg = SyncMessage::FileChunk {
+            generation: self.generation,
+            file_id: self.file_id,
+            offset: self.offset,
+            data: self.buf[..n].to_vec(),
+        };
+        self.offset += n as u64;
+        Ok(Some(msg))
+    }
+}
+
+/// 处理对端的文件索取请求，构造发送流。
+///
+/// 返回 `Ok(None)` 表示该请求已过期或文件不可用，调用方应回复相应消息。
+pub fn begin_stream(
+    outgoing: &OutgoingFiles,
+    generation: u64,
+    file_id: u64,
+    offset: u64,
+) -> std::result::Result<OutgoingStream, SyncMessage> {
+    // 请求的代际已被新剪贴板内容取代：告知对端放弃，不再浪费带宽。
+    if !outgoing.is_current(generation) {
+        debug!("忽略过期代际 {generation} 的文件请求（当前 {}）", outgoing.current());
+        return Err(SyncMessage::FileAbort { generation });
+    }
+    let path = match outgoing.path_for(generation, file_id) {
+        Some(p) => p,
+        None => {
+            return Err(SyncMessage::FileUnavailable {
+                generation,
+                file_id,
+                reason: "该文件不在当前剪贴板内容中".into(),
+            })
+        }
+    };
+    OutgoingStream::start(generation, file_id, path.clone(), offset).map_err(|e| {
+        SyncMessage::FileUnavailable {
+            generation,
+            file_id,
+            reason: format!("无法读取文件 {}: {e}", path.display()),
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_temp(tag: &str, data: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join("ClipSyncOutTest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(tag);
+        std::fs::write(&p, data).unwrap();
+        p
+    }
+
+    #[test]
+    fn registers_and_finds_paths() {
+        let o = OutgoingFiles::new();
+        let p = write_temp("reg.bin", b"x");
+        o.register(7, vec![(123, p.clone())]);
+
+        assert_eq!(o.current(), 7);
+        assert!(o.is_current(7));
+        assert_eq!(o.path_for(7, 123), Some(p));
+        assert_eq!(o.path_for(7, 999), None);
+    }
+
+    #[test]
+    fn advancing_generation_invalidates_old() {
+        let o = OutgoingFiles::new();
+        o.register(1, vec![]);
+        assert!(o.is_current(1));
+        // 用户复制了别的内容。
+        o.advance(2);
+        assert!(!o.is_current(1), "旧代际应立即失效，使进行中的传输中止");
+    }
+
+    #[test]
+    fn only_recent_generations_are_kept() {
+        let o = OutgoingFiles::new();
+        let p = write_temp("keep.bin", b"y");
+        for gen in 1..=6u64 {
+            o.register(gen, vec![(gen, p.clone())]);
+        }
+        // 最早的代际应已被清理，避免无限增长。
+        assert!(o.path_for(1, 1).is_none());
+        assert!(o.path_for(6, 6).is_some());
+    }
+
+    #[test]
+    fn stream_emits_chunks_then_done() {
+        // 构造略大于一个块的数据，确保产生多块。
+        let data = vec![9u8; CHUNK_SIZE + 100];
+        let p = write_temp("stream.bin", &data);
+        let mut s = OutgoingStream::start(1, 55, p, 0).unwrap();
+
+        let m1 = s.next_message().unwrap().unwrap();
+        match m1 {
+            SyncMessage::FileChunk { offset, ref data, .. } => {
+                assert_eq!(offset, 0);
+                assert_eq!(data.len(), CHUNK_SIZE);
+            }
+            _ => panic!("首条应为数据块"),
+        }
+
+        let m2 = s.next_message().unwrap().unwrap();
+        match m2 {
+            SyncMessage::FileChunk { offset, ref data, .. } => {
+                assert_eq!(offset, CHUNK_SIZE as u64);
+                assert_eq!(data.len(), 100);
+            }
+            _ => panic!("次条应为剩余数据块"),
+        }
+
+        let m3 = s.next_message().unwrap().unwrap();
+        assert!(matches!(m3, SyncMessage::FileDone { .. }), "末条应为完成消息");
+    }
+
+    /// 续传：从指定偏移开始只发送剩余部分。
+    #[test]
+    fn stream_resumes_from_offset() {
+        let data = b"0123456789".to_vec();
+        let p = write_temp("resume.bin", &data);
+        let mut s = OutgoingStream::start(1, 1, p, 6).unwrap();
+
+        match s.next_message().unwrap().unwrap() {
+            SyncMessage::FileChunk { offset, data, .. } => {
+                assert_eq!(offset, 6);
+                assert_eq!(data, b"6789".to_vec(), "只应发送断点之后的内容");
+            }
+            _ => panic!("应为数据块"),
+        }
+    }
+
+    #[test]
+    fn stale_generation_request_is_aborted() {
+        let o = OutgoingFiles::new();
+        o.register(1, vec![(1, write_temp("stale.bin", b"z"))]);
+        o.advance(2); // 剪贴板已更新
+
+        match begin_stream(&o, 1, 1, 0) {
+            Err(SyncMessage::FileAbort { generation }) => assert_eq!(generation, 1),
+            _ => panic!("过期代际的请求应被中止"),
+        }
+    }
+
+    #[test]
+    fn missing_file_reports_unavailable() {
+        let o = OutgoingFiles::new();
+        o.register(3, vec![(1, PathBuf::from("/definitely/missing/file.bin"))]);
+
+        match begin_stream(&o, 3, 1, 0) {
+            Err(SyncMessage::FileUnavailable { file_id, .. }) => assert_eq!(file_id, 1),
+            _ => panic!("不可读的文件应报告 FileUnavailable"),
+        }
+    }
+
+    #[test]
+    fn unknown_file_id_reports_unavailable() {
+        let o = OutgoingFiles::new();
+        o.register(4, vec![]);
+        assert!(matches!(
+            begin_stream(&o, 4, 12345, 0),
+            Err(SyncMessage::FileUnavailable { .. })
+        ));
+    }
+}

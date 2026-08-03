@@ -1,0 +1,70 @@
+//! 剪贴板抽象层：读写系统剪贴板、监听变化、判定敏感内容。
+//!
+//! 本 crate 定义平台无关的 trait，具体后端在各里程碑填充：
+//!   - M1：`arboard` 文本/图片 + 平台原生监听（Win 事件 / macOS changeCount）
+//!         + 敏感内容探测。
+//!   - M4：文件列表（Win CF_HDROP / macOS file-url）。
+//!
+//! 当前提供接口定义与一个内存 stub 后端（`stub` 模块），使上层可先行
+//! 组装与测试，不阻塞在平台细节上。
+
+use anyhow::Result;
+use clipsync_core::ClipContent;
+
+pub mod arboard_backend;
+pub mod change_token;
+pub mod filelist;
+pub mod formats;
+pub mod sensitive;
+pub mod stub;
+
+pub use arboard_backend::{ArboardClipboard, PollingWatcher};
+pub use sensitive::clipboard_is_sensitive;
+
+/// 一次剪贴板读取结果：内容 + 是否敏感 + （文件情形下的）本机路径。
+#[derive(Debug, Clone)]
+pub struct ClipRead {
+    pub content: ClipContent,
+    /// 平台层判定为敏感/瞬态（如密码管理器标记），上层据此跳过同步。
+    pub sensitive: bool,
+    /// 内容为文件时，各文件在本机的绝对路径（顺序与 `ClipContent::Files` 一致）。
+    ///
+    /// 两个用途：
+    ///   1. 对端索取内容时，据此流式读取文件字节。
+    ///   2. 识别"这是我们自己刚落地的接收文件"，避免把收到的文件又广播回去。
+    pub file_paths: Vec<std::path::PathBuf>,
+}
+
+impl ClipRead {
+    /// 构造一个非文件的读取结果。
+    pub fn simple(content: ClipContent, sensitive: bool) -> Self {
+        Self {
+            content,
+            sensitive,
+            file_paths: Vec::new(),
+        }
+    }
+}
+
+/// 剪贴板后端：读写系统剪贴板。
+pub trait Clipboard: Send {
+    /// 读取当前剪贴板内容。返回 `Ok(None)` 表示剪贴板为空或内容不支持。
+    fn read(&mut self) -> Result<Option<ClipRead>>;
+
+    /// 将内容写入系统剪贴板。
+    ///
+    /// 注意：调用方应在写入前通过引擎登记预期回声哈希（防回环）。
+    fn write(&mut self, content: &ClipContent) -> Result<()>;
+}
+
+/// 剪贴板变化监听：当系统剪贴板发生变化时通过回调通知。
+///
+/// 平台实现：
+///   - Windows：`AddClipboardFormatListener` + 隐藏消息窗口（事件驱动）。
+///   - macOS：轮询 `NSPasteboard.changeCount`（仅比较整型，开销可忽略）。
+pub trait ClipboardWatcher: Send {
+    /// 阻塞运行监听循环，每次变化调用一次 `on_change`。
+    ///
+    /// `on_change` 返回 `false` 时退出循环（用于优雅关闭）。
+    fn run(&mut self, on_change: &mut dyn FnMut() -> bool) -> Result<()>;
+}

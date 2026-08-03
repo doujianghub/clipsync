@@ -1,0 +1,27 @@
+[package]
+name = "clipsync-clip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clipsync-core = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+# 跨平台剪贴板读写（文本 + 图片 RGBA）。图片支持来自默认的 image-data feature。
+# 文件列表 arboard 不覆盖，留待 M4 用平台特定代码实现。
+arboard = "3"
+
+# Windows 平台能力：
+#   - 敏感内容探测与剪贴板格式查询（DataExchange）
+#   - 文件列表读写 CF_HDROP（UI_Shell 的 DragQueryFileW + Memory 的 GlobalAlloc）
+# windows-sys 已随 arboard 缓存，此处仅增加 feature，不引入新下载。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+    "Win32_Foundation",
+] }

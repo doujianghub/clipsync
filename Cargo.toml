@@ -1,0 +1,54 @@
+# ClipSync — 跨设备剪贴板同步（Windows / macOS）
+#
+# 采用 Cargo workspace 组织：
+#   clipsync-core  平台无关的核心类型与逻辑（可单测）
+#   clipsync-clip  剪贴板读写/监听/敏感探测（平台特定）
+#   clipsync-net   发现(mDNS+Tailscale) + 传输(Noise) + 配对
+#   clipsync-app   托盘 UI + 组装 + 自启 + 配置（可执行文件）
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/clipsync-core",
+    "crates/clipsync-clip",
+    "crates/clipsync-net",
+    "crates/clipsync-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = ""
+
+# 统一依赖版本，避免各 crate 版本漂移。
+# 约束采用宽松写法，由 Cargo 解析到兼容的最新补丁版本。
+[workspace.dependencies]
+# —— 序列化 / 错误处理 —— #
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+anyhow = "1"
+thiserror = "1"
+
+# —— 日志 —— #
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# —— 配置目录 / 系统 —— #
+directories = "5"
+ctrlc = "3"
+
+# —— 内部 crate —— #
+clipsync-core = { path = "crates/clipsync-core" }
+clipsync-clip = { path = "crates/clipsync-clip" }
+clipsync-net = { path = "crates/clipsync-net" }
+
+# 发布档：优化体积与运行占用（契合"低占用"目标）。
+[profile.release]
+opt-level = "z"     # 优化体积
+lto = true          # 链接期优化
+codegen-units = 1
+panic = "abort"     # 去掉 unwind，进一步减小体积
+strip = true        # 去除符号

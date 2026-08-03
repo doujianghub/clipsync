@@ -1,0 +1,17 @@
+# 统一换行符，避免 Windows/macOS 之间因 CRLF/LF 差异产生整文件 diff。
+# 仓库内一律存 LF；Windows 检出时由 git 自行处理。
+* text=auto eol=lf
+
+# 明确指定文本类型，便于 diff 与合并。
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.lock    text eol=lf
+*.json    text eol=lf
+*.plist   text eol=lf
+*.sh      text eol=lf
+
+# 二进制资源不做换行转换。
+*.png     binary
+*.ico     binary
+*.icns    binary

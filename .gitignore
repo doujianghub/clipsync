@@ -1,0 +1,15 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# 配置/密钥（本地生成，勿入库）
+*.local.json
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# IDE
+/.idea
+/.vscode

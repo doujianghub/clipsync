@@ -1,0 +1,32 @@
+[package]
+name = "clipsync-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "clipsync"
+path = "src/main.rs"
+
+[dependencies]
+clipsync-core = { workspace = true }
+clipsync-clip = { workspace = true }
+clipsync-net = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }
+ctrlc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# 系统托盘图标与菜单（跨 Windows/macOS）。
+tray-icon = "0.19"
+
+# 托盘需要在主线程上跑平台消息循环。windows-sys 已缓存，仅增 feature。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_UI_WindowsAndMessaging"] }
+
+# 说明：托盘 UI（tray-icon）与异步运行时（tokio）将分别在能编译验证后
+# 与 M2 引入。M0 为最小可运行骨架：配置 + 日志 + 优雅退出 + stub 演示。

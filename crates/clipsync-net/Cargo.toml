@@ -1,0 +1,31 @@
+[package]
+name = "clipsync-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clipsync-core = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+
+# 端到端加密：Noise 协议（默认纯 Rust resolver，无需 C 编译器/ring）。
+snow = "0.9"
+# 一次性配对码的 PAKE 密钥协商（magic-wormhole 同款，抗中间人）。
+spake2 = "0.4"
+# 随机源：生成配对码熵、Noise 静态密钥等。
+rand = "0.8"
+# 配对握手的身份认证标签（BLAKE2s 前缀-MAC）。blake2 已随 snow 缓存，
+# 作为直接依赖不引入新下载。
+blake2 = "0.10"
+# 枚举本机网卡地址。用于通用地识别所有可达路径——不论是物理网卡、
+# Tailscale/ZeroTier/Netbird/WireGuard 等覆盖网虚拟网卡，一律作为候选地址，
+# 无需针对特定组网产品写适配。
+if-addrs = "0.13"
+
+[features]
+default = []
