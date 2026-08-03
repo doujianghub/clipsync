@@ -25,3 +25,16 @@ windows-sys = { version = "0.60", features = [
     "Win32_UI_Shell",
     "Win32_Foundation",
 ] }
+
+# macOS 平台能力：
+#   - 敏感内容探测（NSPasteboard 的 ConcealedType/TransientType）
+#   - 变化令牌 changeCount 与图片格式查询（均只读 NSPasteboard，不打开剪贴板）
+#   - 文件列表读写 public.file-url
+# 版本对齐 arboard 3.6 与 tray-icon 0.19 实际使用的 objc2 0.6 / app-kit 0.3
+# （见 Cargo.lock）。工作区内另有一份 objc2 0.5 是 muda 的传递依赖，与此无关；
+# 选 0.6 可与 arboard 共用同一份编译产物，不引入额外下载。
+# NSPasteboard feature 已连带启用 NSArray/NSString/NSURL 等所需 Foundation 类型。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }
+objc2-foundation = "0.3"

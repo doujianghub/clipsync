@@ -36,10 +36,30 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 mod platform {
-    // macOS 可用 NSPasteboard.types 做同等判断（objc2-app-kit 已随 arboard 引入），
-    // 待具备 macOS 环境时补齐。返回 None 表示按原逻辑尝试读取，功能不受影响。
+    use objc2_app_kit::NSPasteboard;
+
+    /// 截图、预览等写入的标准图片类型（UTI）。
+    /// TIFF 是 macOS 的传统位图类型，多数程序都会提供；PNG 次之。
+    const PNG: &str = "public.png";
+    const TIFF: &str = "public.tiff";
+
+    pub fn has_image() -> Option<bool> {
+        // 只查类型列表，不取内容——不打开剪贴板，不与其它程序抢锁。
+        let pb = NSPasteboard::generalPasteboard();
+        let types = pb.types()?; // None：剪贴板为空，无从判断，交回调用方按原逻辑处理
+        Some(
+            types
+                .iter()
+                .any(|t| matches!(t.to_string().as_str(), PNG | TIFF)),
+        )
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod platform {
+    // 其它平台暂无廉价查询手段。返回 None 表示按原逻辑尝试读取，功能不受影响。
     pub fn has_image() -> Option<bool> {
         None
     }

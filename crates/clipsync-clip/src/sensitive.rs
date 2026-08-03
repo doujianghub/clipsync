@@ -10,10 +10,10 @@
 //!     KeePass、1Password 等均遵循。我们只需检测这些格式是否存在。
 //!   - **macOS**：应用在 `NSPasteboard` 上写入 `org.nspasteboard.ConcealedType`
 //!     或 `org.nspasteboard.TransientType` 类型（nspasteboard.com 社区约定）。
-//!     此检测需 AppKit 调用，将在具备 macOS 环境时补齐（见下方回退）。
+//!     1Password、KeePassXC 等均遵循。
 //!
 //! 非上述平台，或平台检测未实现时，一律返回 `false`（视为非敏感），保证功能
-//! 可用且不误伤——宁可漏判也不阻断正常同步；密码类工具在 Windows 上有可靠标记。
+//! 可用且不误伤——宁可漏判也不阻断正常同步；密码类工具在两个主平台上都有可靠标记。
 
 /// 判断当前系统剪贴板内容是否被标记为敏感/瞬态（应跳过同步）。
 ///
@@ -58,15 +58,30 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 mod platform {
-    // macOS 的 NSPasteboard ConcealedType/TransientType 检测将在具备 macOS
-    // 编译环境时实现（objc2-app-kit 已作为 arboard 依赖存在）。当前回退为
-    // 非敏感，保证跨平台可编译运行且不阻断同步。
-    //
-    // TODO(macos): 读取 NSPasteboard.general.types，若包含
-    //   "org.nspasteboard.ConcealedType" 或 "org.nspasteboard.TransientType"
-    //   则返回 true。
+    use objc2_app_kit::NSPasteboard;
+
+    /// 密码管理器标记"内容已隐藏"（1Password、KeePassXC 等遵循）。
+    const CONCEALED: &str = "org.nspasteboard.ConcealedType";
+    /// 标记"瞬态内容"，约定剪贴板历史类工具不应记录。
+    const TRANSIENT: &str = "org.nspasteboard.TransientType";
+
+    pub fn is_sensitive() -> bool {
+        // 只读取类型列表，不取内容：无需 declareTypes，也不会影响 changeCount。
+        let pb = NSPasteboard::generalPasteboard();
+        let Some(types) = pb.types() else {
+            return false; // 剪贴板为空：无标记，视为非敏感。
+        };
+        types
+            .iter()
+            .any(|t| matches!(t.to_string().as_str(), CONCEALED | TRANSIENT))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod platform {
+    // 其它平台（如 Linux）暂无统一约定，回退为非敏感，保证可编译且不阻断同步。
     pub fn is_sensitive() -> bool {
         false
     }

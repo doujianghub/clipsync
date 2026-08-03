@@ -6,9 +6,10 @@
 //!
 //!   - **Windows**：`GetClipboardSequenceNumber()` 返回会话级单调计数，
 //!     无参数、无需打开剪贴板，开销极小。
+//!   - **macOS**：`NSPasteboard.general.changeCount`，同样是单调递增整数，
+//!     任何剪贴板变化都会使其 +1，读取无需打开剪贴板。
 //!   - **其他平台**：暂无统一的廉价计数器，返回 `None`，由调用方回退到
-//!     "读取内容并比较哈希"。macOS 可在后续用 `NSPasteboard.changeCount`
-//!     补充（objc2-app-kit 已作为依赖存在）。
+//!     "读取内容并比较哈希"。
 
 /// 返回当前剪贴板的变化令牌。
 ///
@@ -30,9 +31,22 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 mod platform {
-    // TODO(macos): 用 NSPasteboard.general.changeCount 提供廉价令牌。
+    use objc2_app_kit::NSPasteboard;
+
+    pub fn change_token() -> Option<u64> {
+        // changeCount 是纯读取，不打开剪贴板、不改变其状态，可在任意线程调用。
+        let pb = NSPasteboard::generalPasteboard();
+        // NSInteger（isize）单调递增。理论上不为负；用 as u64 保留全部位模式，
+        // 令牌只做相等比较，不参与算术，故即便回绕也不影响正确性。
+        Some(pb.changeCount() as u64)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod platform {
+    // 其它平台暂无统一的廉价计数器，回退到内容哈希比较。
     pub fn change_token() -> Option<u64> {
         None
     }
