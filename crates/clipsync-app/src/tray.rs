@@ -220,6 +220,10 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
     use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::TrayIconBuilder;
 
+    // 平台初始化需先于托盘构建：macOS 上 NSApp 未完成启动时创建的状态项
+    // 不会响应点击。
+    init_platform_app();
+
     let menu = Menu::new();
     // 首项显示状态，不可点击，仅作信息展示。
     let status_item = MenuItem::new(status.summary(), false, None);
@@ -317,10 +321,57 @@ fn pump_platform_events() {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn pump_platform_events() {
-    // macOS 上 tray-icon 依赖 NSApplication 的运行循环。待具备 macOS 环境时
-    // 接入（通常做法是驱动一次 NSApp 的事件循环）。当前留空不影响后台同步。
+    use objc2_app_kit::{NSApplication, NSEventMask};
+    use objc2_foundation::{MainThreadMarker, NSDate, NSDefaultRunLoopMode};
+
+    // 托盘必须在主线程运行（见 `run` 的文档）。非主线程时静默返回而不 panic：
+    // 事件泵取不到事件只会让菜单无响应，不该让整个程序崩溃。
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+
+    // distantPast 作为超时点表示"绝不等待"：有事件就取走，没有立即返回 None。
+    // 这样循环不会阻塞，主线程仍能按 200ms 节奏刷新图标与处理菜单事件。
+    // SAFETY: NSDefaultRunLoopMode 是 AppKit 导出的常量字符串，读取始终有效。
+    let mode = unsafe { NSDefaultRunLoopMode };
+    while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+        NSEventMask::Any,
+        Some(&NSDate::distantPast()),
+        mode,
+        true,
+    ) {
+        app.sendEvent(&event);
+    }
+}
+
+/// macOS 专用：进入事件循环前初始化 NSApp。
+///
+/// 两件事缺一不可：
+///   - `Accessory` 激活策略——托盘程序不应在 Dock 里占一个图标。
+///   - `finishLaunching`——不调用则 AppKit 未完成启动流程，菜单点击无响应。
+#[cfg(target_os = "macos")]
+fn init_platform_app() {
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    use objc2_foundation::MainThreadMarker;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        tracing::warn!("托盘未在主线程启动，菜单可能无响应");
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.finishLaunching();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn init_platform_app() {}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn pump_platform_events() {
+    // 其它平台无需额外的消息泵。
 }
 
 #[cfg(test)]

@@ -28,5 +28,12 @@ tray-icon = "0.19"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_UI_WindowsAndMessaging"] }
 
+# macOS 上 tray-icon 依赖 NSApplication 的事件循环才能响应菜单点击。
+# 版本对齐 tray-icon 0.19 实际使用的 objc2 0.6 / app-kit 0.3（见 Cargo.lock）。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSEvent"] }
+objc2-foundation = { version = "0.3", features = ["NSDate", "NSRunLoop"] }
+
 # 说明：托盘 UI（tray-icon）与异步运行时（tokio）将分别在能编译验证后
 # 与 M2 引入。M0 为最小可运行骨架：配置 + 日志 + 优雅退出 + stub 演示。
