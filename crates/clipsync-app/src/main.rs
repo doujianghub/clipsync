@@ -52,20 +52,34 @@ fn main() -> Result<()> {
                 let settings = config::load_or_init_settings(&dir)?;
                 pairing_cli::host(&dir, &identity, &device_name, settings.listen_port)
             }
-            Some(ip) => {
+            Some(first) => {
                 let settings = config::load_or_init_settings(&dir)?;
-                let code = args.get(2).map(|s| s.as_str()).unwrap_or("");
-                pairing_cli::join(
-                    &dir,
-                    &identity,
-                    &device_name,
-                    ip,
-                    code,
-                    settings.listen_port,
-                )
+                // 两种用法：
+                //   clipsync pair <配对码>          局域网自动发现对方
+                //   clipsync pair <对方IP> <配对码>  跨网络时显式指定
+                // 靠"能否解析为合法配对码"区分——配对码字符集不含点与冒号，
+                // 与 IP 地址天然不会混淆。
+                if clipsync_net::pairing::PairingCode::parse(first).is_some()
+                    && args.get(2).is_none()
+                {
+                    pairing_cli::join(&dir, &identity, &device_name, None, first, settings.listen_port)
+                } else {
+                    let code = args.get(2).map(|s| s.as_str()).unwrap_or("");
+                    pairing_cli::join(
+                        &dir,
+                        &identity,
+                        &device_name,
+                        Some(first),
+                        code,
+                        settings.listen_port,
+                    )
+                }
             }
             None => {
-                eprintln!("用法: clipsync pair --host | clipsync pair <ip> <配对码>");
+                eprintln!("用法:");
+                eprintln!("  clipsync pair --host             主持配对，显示配对码");
+                eprintln!("  clipsync pair <配对码>            局域网内自动找到对方");
+                eprintln!("  clipsync pair <对方IP> <配对码>   跨网络时显式指定");
                 Ok(())
             }
         },

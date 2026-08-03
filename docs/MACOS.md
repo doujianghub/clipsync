@@ -299,7 +299,9 @@ cargo run -- addrs            # 列出本机地址，含 Tailscale/ZeroTier 等�
 ```bash
 # Mac 上
 cargo run -- pair --host      # 显示 6 位配对码
-# Windows 上
+# Windows 上（同一局域网，无需输入 IP）
+clipsync pair <配对码>
+# 若不在同一局域网，用 Mac 上打印出的地址：
 clipsync pair <Mac的IP> <配对码>
 ```
 配对成功后双方 `list` 应能看到对方及其地址。

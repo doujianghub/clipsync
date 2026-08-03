@@ -32,8 +32,18 @@ pub const BEACON_PORT: u16 = 47_690;
 /// 信标发送间隔。
 pub const BEACON_INTERVAL: Duration = Duration::from_secs(5);
 
+/// **配对**专用的发现端口。
+///
+/// 刻意与 [`BEACON_PORT`] 分开：常驻守护进程会长期占用 47690，而配对是独立
+/// 的短命进程；用不同端口就不会互相抢占，用户可以在守护进程运行时随时发起配对。
+pub const PAIRING_BEACON_PORT: u16 = 47_691;
+/// 配对期间的宣告间隔（比常规信标频繁，让对方尽快发现）。
+pub const PAIRING_BEACON_INTERVAL: Duration = Duration::from_millis(800);
+
 /// 信标包魔数与版本，防止误解析其它协议的组播流量。
 const MAGIC: [u8; 4] = *b"CSY1";
+/// 配对信标的魔数，与常规信标区分。
+const PAIRING_MAGIC: [u8; 4] = *b"CSYP";
 
 /// 一条信标：宣告本机身份与可达地址。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,13 +165,130 @@ pub fn spawn_listener(
     Ok(handle)
 }
 
+// ———————————————————————————————————————————————————————————————
+// 配对发现：让"加入方"无需手输 IP
+// ———————————————————————————————————————————————————————————————
+
+/// 一台正在等待配对的设备所宣告的信息。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingBeacon {
+    magic: [u8; 4],
+    /// 主持方设备名，供用户确认连的是不是自己那台机器。
+    pub device_name: String,
+    /// 主持方的配对监听端口。
+    pub pairing_port: u16,
+}
+
+impl PairingBeacon {
+    fn is_valid(&self) -> bool {
+        self.magic == PAIRING_MAGIC
+    }
+}
+
+/// 发现到的一台待配对设备。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingHost {
+    pub device_name: String,
+    /// 可直接连接的配对地址（信标来源 IP + 其宣告的配对端口）。
+    pub addr: SocketAddr,
+}
+
+/// 在配对期间持续向局域网宣告"我在等待配对"。
+///
+/// 返回的句柄被丢弃时线程仍继续运行——配对进程本身是短命的，进程退出即停止。
+pub fn spawn_pairing_announcer(
+    device_name: String,
+    pairing_port: u16,
+) -> Result<std::thread::JoinHandle<()>> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).context("绑定配对宣告套接字失败")?;
+    socket
+        .set_multicast_loop_v4(true)
+        .context("设置组播回环失败")?;
+
+    let target = SocketAddr::new(IpAddr::V4(BEACON_GROUP), PAIRING_BEACON_PORT);
+    let beacon = PairingBeacon {
+        magic: PAIRING_MAGIC,
+        device_name,
+        pairing_port,
+    };
+    let bytes = postcard::to_allocvec(&beacon).context("编码配对信标失败")?;
+
+    let handle = std::thread::Builder::new()
+        .name("pair-announce".into())
+        .spawn(move || loop {
+            if let Err(e) = socket.send_to(&bytes, target) {
+                debug!("发送配对信标失败: {e}");
+            }
+            std::thread::sleep(PAIRING_BEACON_INTERVAL);
+        })?;
+    Ok(handle)
+}
+
+/// 在局域网中查找正在等待配对的设备。
+///
+/// 监听至多 `timeout`；一旦发现设备就提前返回（无需等满）。同一设备只返回一次。
+pub fn discover_pairing_hosts(timeout: Duration) -> Result<Vec<PairingHost>> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, PAIRING_BEACON_PORT))
+        .with_context(|| format!("绑定配对发现端口 {PAIRING_BEACON_PORT} 失败"))?;
+    socket
+        .join_multicast_v4(&BEACON_GROUP, &Ipv4Addr::UNSPECIFIED)
+        .context("加入组播组失败")?;
+    // 分段等待，便于发现后尽早返回。
+    socket
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .context("设置接收超时失败")?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut found: Vec<PairingHost> = Vec::new();
+    let mut buf = [0u8; 1024];
+
+    while std::time::Instant::now() < deadline {
+        let (n, src) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(_) => continue, // 超时或瞬时错误，继续等
+        };
+        let beacon: PairingBeacon = match postcard::from_bytes(&buf[..n]) {
+            Ok(b) => b,
+            Err(_) => continue, // 非本协议流量
+        };
+        if !beacon.is_valid() {
+            continue;
+        }
+        let host = PairingHost {
+            device_name: beacon.device_name,
+            addr: SocketAddr::new(src.ip(), beacon.pairing_port),
+        };
+        if !found.iter().any(|h| h.addr == host.addr) {
+            found.push(host);
+            // 已找到设备，再稍等片刻收集可能的其它设备后返回。
+            let grace = std::time::Instant::now() + Duration::from_millis(600);
+            while std::time::Instant::now() < grace {
+                if let Ok((n2, src2)) = socket.recv_from(&mut buf) {
+                    if let Ok(b2) = postcard::from_bytes::<PairingBeacon>(&buf[..n2]) {
+                        if b2.is_valid() {
+                            let h2 = PairingHost {
+                                device_name: b2.device_name,
+                                addr: SocketAddr::new(src2.ip(), b2.pairing_port),
+                            };
+                            if !found.iter().any(|h| h.addr == h2.addr) {
+                                found.push(h2);
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn beacon_roundtrips_through_postcard() {
-        let dev = DeviceId::from_public_key(b"test-device");
+    fn beacon_roundtrips_through_postcard() {        let dev = DeviceId::from_public_key(b"test-device");
         let b = Beacon::new(
             &dev,
             47684,
