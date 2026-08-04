@@ -112,20 +112,65 @@ pub fn save_settings(dir: &Path, settings: &Settings) -> Result<()> {
 
 /// 加载本机静态身份；不存在则生成并保存。
 ///
-/// 私钥文件仅本地存放。M5 将在 Windows/macOS 上收紧文件权限（如 macOS 0600）。
+/// `identity.json` 含 Noise 静态私钥（设备长期身份），在 Unix 上以 0600 创建，
+/// 仅本用户可读写。
 pub fn load_or_init_identity(dir: &Path) -> Result<clipsync_net::crypto::StaticIdentity> {
     let path = dir.join("identity.json");
     if path.exists() {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("读取身份失败: {}", path.display()))?;
         let id = serde_json::from_str(&text).context("解析 identity.json 失败")?;
+        // 旧版本可能以默认权限创建过该文件，这里顺带收紧一次。
+        #[cfg(unix)]
+        restrict_to_owner(&path)?;
         Ok(id)
     } else {
         let id = clipsync_net::crypto::StaticIdentity::generate()?;
         let text = serde_json::to_string_pretty(&id).context("序列化身份失败")?;
-        std::fs::write(&path, text).with_context(|| format!("写入身份失败: {}", path.display()))?;
+        write_private(&path, &text)
+            .with_context(|| format!("写入身份失败: {}", path.display()))?;
         Ok(id)
     }
+}
+
+/// 写入仅属主可读写的文件。
+///
+/// Unix 上在**创建时**就带 0600 打开，而不是先按默认权限写好再 chmod——
+/// 后者会留下一个私钥短暂可被其它用户读取的窗口。
+#[cfg(unix)]
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    // Windows 下 ACL 默认继承用户目录权限，其它用户无法读取。
+    std::fs::write(path, contents)
+}
+
+/// 把既有文件的权限收紧为 0600（仅属主可读写）。
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = std::fs::metadata(path)
+        .with_context(|| format!("读取文件权限失败: {}", path.display()))?
+        .permissions();
+    if perms.mode() & 0o777 != 0o600 {
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("收紧文件权限失败: {}", path.display()))?;
+    }
+    Ok(())
 }
 
 // ————————————————————————————————————————————————————————————————

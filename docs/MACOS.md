@@ -5,6 +5,35 @@
 > **5 处平台特定代码**在 macOS 侧只留了空实现，需要在 Mac 上补齐并验证。
 >
 > 本文逐项说明：**在哪、要做什么、用什么 API、怎么验证**。
+>
+> ---
+>
+> ## ✅ 补齐状态（2026-08-04，Apple Silicon / macOS 15.5 / rustc 1.97.1）
+>
+> 下列 7 项均已实现并在本机实测通过，`cargo test` 98 项全过。
+> 本文档下方各节保留原始设计说明，但**代码已与其有若干出入**，以代码为准；
+> 出入之处已在对应小节标注「实现修正」。
+>
+> | # | 项目 | 状态 |
+> |---|---|---|
+> | 2 | 敏感内容探测 | ✅ 已补齐并实测 |
+> | 1 | changeCount 令牌 | ✅ 已补齐并实测 |
+> | 5 | 托盘事件循环 | ✅ 已补齐并实测 |
+> | 4 | 文件列表读写 | ✅ 已补齐，并修复一处静默丢数据问题 |
+> | 3 | 图片格式查询 | ✅ 已补齐并实测 |
+> | 6 | 开机自启 | ✅ 已实测（此前从未验证过） |
+> | 7 | 私钥权限 0600 | ✅ 已加固 |
+>
+> **依赖版本修正（重要）**：本文下方建议 `objc2 = "0.5"` / `objc2-app-kit = "0.2"`，
+> 但 `Cargo.lock` 显示 `arboard` 3.6 与 `tray-icon` 0.19 实际使用的是
+> **objc2 0.6 / objc2-app-kit 0.3**。工作区里那份 0.5 是 `muda`（tray-icon 的
+> 菜单依赖）的传递依赖。按 0.5 写会引入第二份编译产物，故实际采用 0.6/0.3。
+> 两者 API 有差异：0.6 中 `generalPasteboard()`、`changeCount()`、`types()`
+> 等均为**安全**函数，不需要 `unsafe`。
+>
+> **尚未验证**：第 4 项的 Mac↔Windows 双机端到端验证（本机只有 Mac，
+> 需要 Windows 侧配合），以及验证清单中的 1–10 项双机测试。单机侧的
+> 剪贴板读写、探测、托盘、自启均已验证。
 
 ---
 
@@ -20,19 +49,19 @@ cargo run -- addrs    # 应列出本机地址（含 Tailscale 等虚拟网卡）
 
 **预期现状**（补齐前）：
 
-| 功能 | macOS 现状 |
-|---|---|
-| 文本同步 | ✅ 可用（`arboard` 跨平台） |
-| 图片同步 | ✅ 可用 |
-| 配对 / 加密 / 自动发现 | ✅ 可用（纯网络逻辑） |
-| 文件同步 | ❌ 读不到文件列表，收到文件时报错 |
-| 敏感内容跳过 | ⚠️ 永远返回"非敏感"（密码会被同步！） |
-| 剪贴板变更检测 | ⚠️ 退化为读取内容比哈希（能用但更费资源） |
-| 托盘菜单 | ⚠️ 图标可能出现但点击无响应 |
-| 开机自启 | ⚠️ 已写 LaunchAgent 实现，但**从未验证** |
+| 功能 | 补齐前 | 补齐后（现状） |
+|---|---|---|
+| 文本同步 | ✅ 可用（`arboard` 跨平台） | ✅ |
+| 图片同步 | ✅ 可用 | ✅ |
+| 配对 / 加密 / 自动发现 | ✅ 可用（纯网络逻辑） | ✅ |
+| 文件同步 | ❌ 读不到文件列表，收到文件时报错 | ✅ 读写均可用 |
+| 敏感内容跳过 | ⚠️ 永远返回"非敏感"（密码会被同步！） | ✅ 已探测并跳过 |
+| 剪贴板变更检测 | ⚠️ 退化为读取内容比哈希 | ✅ 用 changeCount 廉价令牌 |
+| 托盘菜单 | ⚠️ 图标可能出现但点击无响应 | ✅ 事件循环已接入 |
+| 开机自启 | ⚠️ 已写 LaunchAgent，但**从未验证** | ✅ 已实测可用 |
 
-> ⚠️ **安全提示**：在补齐第 2 项（敏感内容探测）之前，请不要在有密码管理器的
-> 环境长期运行——密码复制会被同步到其它设备。
+> ⚠️ **原安全提示（已解决）**：补齐第 2 项之前，密码复制会被同步到其它设备。
+> 该缺口已于 2026-08-04 补齐，见下方第 2 节。
 
 ---
 
@@ -191,6 +220,19 @@ pub fn write_file_paths(paths: &[PathBuf]) -> Result<()> {
 
 同时把 `SUPPORTED` 改为 `true`。
 
+> **实现修正（务必注意）**：`writeObjects` 向 pasteboard 服务的提交是**异步**的。
+> 若写完就让进程退出，**除第一条以外的条目会来不及落地**——多文件复制到对端
+> 只会剩下第一个文件，而 `writeObjects` 仍然返回 `true`，没有任何报错。
+>
+> 修复办法：写入后回读一次 `pb.types()` 强制完成往返。注意：
+> - 只数 `pasteboardItems()` 的**条数**不行（本地应答，起不到同步作用）；
+> - 读 `changeCount()` 也不行（同上）；
+> - 必须真的取数据（`pb.types()` 最便宜）。
+>
+> 这一点只能**跨进程**验证：同一进程内即便没有回读也能看到全部条目，
+> 只有另一个进程（真实的粘贴方）才会看到被截断的结果。回归测试
+> `written_files_survive_writer_exit` 因此要 spawn 一个写完即退出的子进程。
+
 **怎么验证**：见下方"验证清单"的文件同步部分。Finder 里复制一个文件，
 应在对端 Finder 中可粘贴出同名同内容的文件。
 
@@ -238,8 +280,24 @@ fn pump_platform_events() {
 
 2. 若打包成 `.app`，在 `Info.plist` 中设 `LSUIElement = true`，同样是隐藏 Dock 图标。
 
+> **实现修正（objc2 0.6）**：
+> - `nextEventMatchingMask_...`、`sendEvent`、`setActivationPolicy`、
+>   `finishLaunching` 都是**安全**函数，写 `unsafe {}` 会触发 `unused_unsafe` 警告。
+> - 反过来，`NSDefaultRunLoopMode` 是 extern static，**读取它需要 `unsafe`**
+>   （`let mode = unsafe { NSDefaultRunLoopMode };`）。
+> - `MainThreadMarker::new()` 返回 `None`（非主线程）时不要 `expect` 直接 panic：
+>   取不到事件只会让菜单无响应，不该让整个同步程序崩溃，记一条 warn 返回即可。
+
 **怎么验证**：菜单栏出现剪贴板图标；点击能弹出菜单；"暂停同步"能勾选并生效
 （日志出现"同步已暂停"）；"退出"能真正退出。
+
+> 若无法用 Accessibility 权限自动点击菜单，可改为验证事件泵本身：
+> `cargo run -p clipsync-app --example pump_check` 会投递一个
+> `ApplicationDefined` 事件并确认能被取出派发，同时验证空队列时立即返回
+> （实测 ~200µs，不阻塞 200ms 的托盘循环）。
+> 另外 `CGWindowListCopyWindowInfo` 可看到 clipsync 在 layer 101 的菜单窗口；
+> `osascript` 查 `background only is false` 的进程列表里不应有 clipsync
+> （即 Accessory 策略生效、无 Dock 图标）。
 
 ---
 
@@ -261,6 +319,14 @@ ls ~/Library/LaunchAgents/com.clipsync.plist     # 应已删除
 可能需要调整的点：plist 里的可执行路径在开发期指向 `target/debug/clipsync`，
 正式使用应指向安装后的位置或 `.app` 内的可执行文件。
 
+> **实测结果（此前从未验证）**：全部通过。`plutil -lint` 语法正确；
+> `launchctl load` 成功并真实拉起进程（PPID 1、`LastExitStatus = 0`）；
+> `unload` 后进程停止；`autostart off` 删除 plist。
+>
+> 已按上述"可能需要调整的点"加了防护：`set_enabled(true)` 时若可执行文件
+> 位于 `target/` 或 `deps/` 下会打一条 warn——`cargo clean` 或移动仓库会让
+> 自启静默失效，而这种失败要到下次开机才会被发现。
+
 ---
 
 ## 7. 私钥文件权限（安全加固）
@@ -280,6 +346,11 @@ macOS/Unix 上建议收紧为 `0600`：
 }
 ```
 
+> **实现修正**：上面这种"先按默认权限创建、再 chmod"的写法会留下一个私钥
+> 短暂可被其它用户读取的窗口。实际实现改为在**创建时**就带 0600 打开：
+> `OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)`。
+> 加载既有文件时另外收紧一次，覆盖旧版本已用默认权限创建的情况。
+
 ---
 
 ## 验证清单（与 Windows 侧已通过的项目对齐）
@@ -289,8 +360,32 @@ macOS/Unix 上建议收紧为 `0600`：
 ### 单机
 
 ```bash
-cargo test                    # 97 项应全过
+cargo test                    # 98 项应全过（含新增的跨进程文件列表回归测试）
 cargo run -- addrs            # 列出本机地址，含 Tailscale/ZeroTier 等虚拟网卡
+```
+
+补齐过程中新增了两个手动验证小工具：
+
+```bash
+# 打印当前剪贴板的敏感标记 / 变化令牌 / 是否含图片 / 文件列表
+cargo run -p clipsync-clip --example probe
+
+# 把路径写入剪贴板（用于验证写入后能否被别的进程粘贴）
+cargo run -p clipsync-clip --example write_files -- /path/a /path/b
+
+# 验证 macOS 事件泵能取出并派发事件、且空队列不阻塞
+cargo run -p clipsync-app --example pump_check
+```
+
+配合 Swift 单行脚本可覆盖各类剪贴板状态，例如构造带敏感标记的内容：
+
+```bash
+swift -e 'import AppKit
+let pb = NSPasteboard.general
+pb.clearContents()
+pb.setString("fake-password", forType: .string)
+pb.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))'
+cargo run -p clipsync-clip --example probe   # sensitive 应为 true
 ```
 
 ### 双机（Mac ↔ Windows）
@@ -356,8 +451,28 @@ CLIPSYNC_CONFIG_DIR=/tmp/dev-b CLIPSYNC_NO_WATCH=1 CLIPSYNC_NO_TRAY=1 cargo run
 
 ## macOS 特有注意事项
 
+- **工具链安装**：若 `static.rust-lang.org` 连不上（TLS handshake eof，国内常见），
+  用镜像装 rustup 并配置 cargo 源，否则 `cargo build` 会卡在拉取 crates.io：
+  ```bash
+  export RUSTUP_DIST_SERVER=https://rsproxy.cn RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  # ~/.cargo/config.toml
+  # [source.crates-io]
+  # replace-with = "rsproxy-sparse"
+  # [source.rsproxy-sparse]
+  # registry = "sparse+https://rsproxy.cn/index/"
+  ```
+- **`timeout` 命令不存在**：macOS 自带的 coreutils 没有 `timeout`。在脚本里用它
+  包裹命令会得到 "command not found"，而**被包裹的命令根本没执行**——很容易
+  把这个错误当成命令本身失败（例如误判"仓库是空的"）。需要时装
+  `brew install coreutils` 用 `gtimeout`。
 - **防火墙**：首次监听端口时系统会弹窗询问是否允许接受连接，需点允许。
 - **剪贴板权限**：读写剪贴板本身不需要特殊授权（不同于辅助功能/屏幕录制）。
+- **截图验证的坑**：用 `screencapture -c` 往剪贴板抓图需要"屏幕录制"权限，
+  未授权时报 "could not create image from rect"。验证图片探测不必依赖它——
+  用 Swift 往 pasteboard 写一个 `NSImage` 即可，无需任何权限。
+  另外实测发现：写入 PNG 后 macOS 会**自动合成** `public.tiff`，所以
+  `has_image()` 判断 PNG/TIFF 与 arboard 只读 TIFF 并不冲突。
 - **打包 `.app`**：托盘程序应设 `LSUIElement = true` 隐藏 Dock 图标；分发给他人
   需要签名与公证，自用可在"隐私与安全性"中放行。
 - **架构**：Apple Silicon 上默认编译 `aarch64-apple-darwin`；若需通用二进制，

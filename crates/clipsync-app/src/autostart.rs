@@ -19,7 +19,26 @@ pub fn is_enabled() -> bool {
 /// 开启或关闭开机自启。
 pub fn set_enabled(enable: bool) -> Result<()> {
     let exe = std::env::current_exe().context("获取当前程序路径失败")?;
+    if enable {
+        warn_if_transient(&exe);
+    }
     platform::set_enabled(enable, &exe)
+}
+
+/// 自启记录的是当前可执行文件的绝对路径。若它位于构建产物目录，
+/// `cargo clean` 或移动仓库都会让自启指向一个不存在的文件而静默失效——
+/// 这种失败要到下次开机才会被发现，所以在设置时就提示。
+fn warn_if_transient(exe: &std::path::Path) {
+    let in_build_dir = exe
+        .components()
+        .any(|c| c.as_os_str() == "target" || c.as_os_str() == "deps");
+    if in_build_dir {
+        tracing::warn!(
+            "自启将指向构建产物 {}，cargo clean 或移动目录后会失效；\
+             正式使用请指向安装后的位置或 .app 内的可执行文件",
+            exe.display()
+        );
+    }
 }
 
 #[cfg(windows)]
