@@ -497,7 +497,7 @@ impl HubState {
                 if let Err(e) = cb.write(content) {
                     warn!("写入本地剪贴板失败: {e:#}");
                 } else {
-                    info!("已应用来自 {} 的剪贴板内容", from);
+                    info!("已应用来自 {} 的 [{}] {} 字节", from, kind_label(content), content.byte_size());
                 }
             }
             Err(e) => warn!("获取剪贴板锁失败: {e}"),
