@@ -38,6 +38,7 @@ impl NoiseConnection {
         local_private: &[u8],
         remote_public: &[u8],
     ) -> Result<Self> {
+        tune_socket(&stream);
         let handshake = snow::Builder::new(NOISE_PARAMS.parse()?)
             .local_private_key(local_private)
             .remote_public_key(remote_public)
@@ -56,6 +57,7 @@ impl NoiseConnection {
     /// 响应方在握手中获得发起方静态公钥，返回时通过 [`Self::remote_static`]
     /// 暴露，供上层比对配对记录（认证对端身份）。
     pub fn accept(stream: TcpStream, local_private: &[u8]) -> Result<Self> {
+        tune_socket(&stream);
         let handshake = snow::Builder::new(NOISE_PARAMS.parse()?)
             .local_private_key(local_private)
             .build_responder()
@@ -217,6 +219,20 @@ fn is_timeout(err: &std::io::Error) -> bool {
 enum Role {
     Initiator,
     Responder,
+}
+
+/// 调整套接字参数以适配本协议的收发模式。
+///
+/// **关闭 Nagle 算法**：本协议是"一帧接一帧"的请求/流式模式，Nagle 会为了合并
+/// 小包而等待对端 ACK；与接收端的延迟确认叠加时，可能造成数十毫秒的停顿——
+/// 对文件传输吞吐和剪贴板同步延迟都是明显损害。我们自己已经把长度前缀与负载
+/// 合并成单次写出，不需要内核再代为合并。
+///
+/// 设置失败不致命（个别平台/虚拟网卡可能不支持），仅记录后继续。
+fn tune_socket(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!("设置 TCP_NODELAY 失败（不影响功能，可能略增延迟）: {e}");
+    }
 }
 
 /// 执行 Noise_IK 握手（两条消息：-> e, es, s, ss ; <- e, ee, se），完成后转入

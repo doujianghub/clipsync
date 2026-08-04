@@ -52,3 +52,10 @@ lto = true          # 链接期优化
 codegen-units = 1
 panic = "abort"     # 去掉 unwind，进一步减小体积
 strip = true        # 去除符号
+
+# 性能对照档：与 release 同为优化构建，但按速度而非体积优化。
+# 用于量化 opt-level 对加密/哈希吞吐的影响。
+[profile.fast]
+inherits = "release"
+opt-level = 3
+strip = true

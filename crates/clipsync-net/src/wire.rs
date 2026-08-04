@@ -18,6 +18,10 @@ pub const MAX_FRAME_PAYLOAD: usize = 64_000;
 const MAX_FRAME_ON_WIRE: u32 = 65_535;
 
 /// 写入一帧：4 字节大端长度前缀 + 负载。
+///
+/// **一次性写出**：长度前缀与负载合并到同一次 `write_all`。分两次写会形成
+/// "小包紧跟大包"的模式，在启用 Nagle 算法的连接上可能让 4 字节前缀滞留在
+/// 内核缓冲里等待对端 ACK，与延迟确认叠加后造成数十毫秒的停顿。
 pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     if payload.len() > MAX_FRAME_ON_WIRE as usize {
         return Err(io::Error::new(
@@ -25,9 +29,10 @@ pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
             "帧负载超过线缆上限",
         ));
     }
-    let len = (payload.len() as u32).to_be_bytes();
-    w.write_all(&len)?;
-    w.write_all(payload)?;
+    let mut framed = Vec::with_capacity(4 + payload.len());
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(payload);
+    w.write_all(&framed)?;
     w.flush()
 }
 
