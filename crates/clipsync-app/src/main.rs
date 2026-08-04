@@ -15,12 +15,14 @@
 
 mod addrbook;
 mod autostart;
+mod compress;
 mod config;
 mod filecache;
 mod filetransfer;
 mod hub;
 mod net_manager;
 mod pairing_cli;
+mod ratelimit;
 mod tray;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -257,6 +259,8 @@ fn run_sync(
         registry: net_manager::ConnRegistry::new(),
         addrbook: addrbook.clone(),
         outgoing,
+        upload_limit: Some(settings.upload_limit_bytes_per_sec),
+        compress_transfers: settings.compress_transfers,
         sync_port: settings.listen_port,
     };
     net_manager::spawn_listener(ctx.clone())?;

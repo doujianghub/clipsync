@@ -26,6 +26,7 @@ use clipsync_net::transport::{NoiseConnection, RecvOutcome};
 use tracing::{debug, info, warn};
 
 use crate::addrbook::AddrBook;
+use crate::filecache::CHUNK_SIZE;
 use crate::filetransfer::{begin_stream, OutgoingFiles, OutgoingStream};
 use crate::hub::{HubEvent, HubHandle};
 
@@ -102,6 +103,10 @@ pub struct NetCtx {
     pub addrbook: AddrBook,
     /// 本机待发文件登记表（供对端索取内容）与当前代际号。
     pub outgoing: OutgoingFiles,
+    /// 文件发送速率上限（字节/秒），0 表示不限速。
+    pub upload_limit: Option<u64>,
+    /// 是否允许传输前自适应压缩。
+    pub compress_transfers: bool,
     /// 本机同步监听端口（用于向对端通告自身地址）。
     pub sync_port: u16,
 }
@@ -288,17 +293,25 @@ fn pump(
     ctx: &NetCtx,
     out_rx: std::sync::mpsc::Receiver<SyncMessage>,
 ) -> Result<()> {
-    // 空闲时用较长读超时（省 CPU）；传文件时用极短超时（保吞吐）。
-    let mut fast_mode = false;
-    conn.set_read_timeout(Some(IDLE_READ_TIMEOUT))?;
+    // 空闲时用较长读超时（省 CPU）；传文件时用极短超时（保吞吐）；
+    // 被限速时按限速器建议等待（避免空转）。
+    let mut current_timeout = IDLE_READ_TIMEOUT;
+    conn.set_read_timeout(Some(current_timeout))?;
 
     announce_addresses(&mut conn, ctx)?;
     let mut last_announce = Instant::now();
 
     // 当前正在发送的文件流（同一时刻至多一个）。
     let mut stream: Option<OutgoingStream> = None;
+    // 发送限速器：只作用于文件内容，不影响文本/图片同步。
+    let mut limiter = crate::ratelimit::RateLimiter::new(ctx.upload_limit);
+    if limiter.is_limited() {
+        debug!("文件发送限速已启用");
+    }
 
     loop {
+        // 本轮是否因限速而未能发满。
+        let mut throttled = false;
         // 1) 优先发出中枢的待发消息，确保文本同步不被文件传输拖延。
         loop {
             match out_rx.try_recv() {
@@ -321,7 +334,14 @@ fn pump(
             } else {
                 let mut finished = false;
                 for _ in 0..CHUNKS_PER_ROUND {
-                    match s.next_message() {
+                    // 限速：问一次本轮允许发多少。令牌不足则本轮不发文件，
+                    // 但循环继续——文本同步与取代响应不受限速影响。
+                    let budget = limiter.take(CHUNK_SIZE as u64) as usize;
+                    if budget == 0 {
+                        throttled = true;
+                        break;
+                    }
+                    match s.next_message(budget) {
                         Ok(Some(msg)) => {
                             let done = matches!(msg, SyncMessage::FileDone { .. });
                             conn.send(&msg).context("发送文件分块失败")?;
@@ -347,15 +367,20 @@ fn pump(
             }
         }
 
-        // 传输中需要高频轮转以保证吞吐；空闲时放慢以省 CPU。
-        let want_fast = stream.is_some();
-        if want_fast != fast_mode {
-            conn.set_read_timeout(Some(if want_fast {
-                ACTIVE_READ_TIMEOUT
-            } else {
-                IDLE_READ_TIMEOUT
-            }))?;
-            fast_mode = want_fast;
+        // 读超时同时充当"节奏控制"：
+        //   传输中     → 极短，保吞吐
+        //   被限速     → 按限速器建议等待，避免空转耗 CPU
+        //   空闲       → 较长，省 CPU
+        let desired_timeout = if throttled {
+            limiter.suggested_wait().max(ACTIVE_READ_TIMEOUT)
+        } else if stream.is_some() {
+            ACTIVE_READ_TIMEOUT
+        } else {
+            IDLE_READ_TIMEOUT
+        };
+        if desired_timeout != current_timeout {
+            conn.set_read_timeout(Some(desired_timeout))?;
+            current_timeout = desired_timeout;
         }
 
         // 3) 周期性通告地址（覆盖网上线/IP 变化后对端能及时学到）。
@@ -375,7 +400,13 @@ fn pump(
                     offset,
                 } = msg
                 {
-                    match begin_stream(&ctx.outgoing, generation, file_id, offset) {
+                    match begin_stream(
+                        &ctx.outgoing,
+                        generation,
+                        file_id,
+                        offset,
+                        ctx.compress_transfers,
+                    ) {
                         Ok(s) => {
                             debug!("开始发送文件 {file_id:016x}（自偏移 {offset}）");
                             stream = Some(s);

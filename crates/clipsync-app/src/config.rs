@@ -36,10 +36,32 @@ pub struct Settings {
     /// 当前剪贴板引用的内容不会被淘汰。
     #[serde(default = "default_file_cache_bytes")]
     pub file_cache_bytes: u64,
+
+    /// 文件传输的发送速率上限（字节/秒）。`0` 表示不限速。
+    ///
+    /// 仅限制文件内容——文本/图片同步不受影响，因此限速状态下复制文字
+    /// 依然瞬时同步。传大文件会占满链路时可设个值（如 20MB/s = 20971520）。
+    #[serde(default = "default_upload_limit")]
+    pub upload_limit_bytes_per_sec: u64,
+
+    /// 是否在传输文件前自适应压缩。
+    ///
+    /// 会先取文件开头试压，压不动（如 jpg/mp4/zip）则自动跳过，不浪费 CPU。
+    /// 文本/代码/日志类文件通常能显著提速并省带宽。
+    #[serde(default = "default_compress")]
+    pub compress_transfers: bool,
 }
 
 fn default_file_cache_bytes() -> u64 {
     1024 * 1024 * 1024 // 1 GiB
+}
+
+fn default_upload_limit() -> u64 {
+    0 // 0 = 不限速
+}
+
+fn default_compress() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -50,6 +72,8 @@ impl Default for Settings {
             allow_files: true,
             listen_port: 47_684, // 固定默认端口，便于 mDNS 之外的直连调试
             file_cache_bytes: default_file_cache_bytes(),
+            upload_limit_bytes_per_sec: default_upload_limit(),
+            compress_transfers: default_compress(),
         }
     }
 }
