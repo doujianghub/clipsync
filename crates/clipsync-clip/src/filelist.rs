@@ -6,8 +6,9 @@
 //!
 //!   - **Windows**：`CF_HDROP` 格式。读用 `DragQueryFileW` 枚举；写需构造
 //!     `DROPFILES` 头 + 双 NUL 结尾的宽字符路径表，放入全局内存交给系统。
-//!   - **macOS**：`NSPasteboard` 的 `public.file-url`（待具备 macOS 环境时补齐；
-//!     当前返回"无文件"，文本与图片同步不受影响）。
+//!   - **macOS**：`NSPasteboard` 的 `public.file-url`。读用
+//!     `readObjectsForClasses:options:` 取 `NSURL`（须加 FileURLsOnly 选项，
+//!     否则网页链接也会被当成文件）；写用 `writeObjects` 放入 `NSURL` 数组。
 
 use std::path::{Path, PathBuf};
 
@@ -220,14 +221,118 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod platform {
+    use std::path::PathBuf;
+
+    use anyhow::{anyhow, Result};
+    use objc2::runtime::AnyObject;
+    use objc2::ClassType;
+    use objc2_app_kit::{NSPasteboard, NSPasteboardURLReadingFileURLsOnlyKey};
+    use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
+
+    pub const SUPPORTED: bool = true;
+
+    /// Finder 复制文件时放入剪贴板的类型。仅用于"是否有文件"的廉价预判。
+    const FILE_URL: &str = "public.file-url";
+
+    pub fn read_file_paths() -> Result<Option<Vec<PathBuf>>> {
+        let pb = NSPasteboard::generalPasteboard();
+
+        // 先用类型列表廉价预判，没有文件就不必构造读取参数。
+        match pb.types() {
+            Some(types) => {
+                if !types.iter().any(|t| t.to_string() == FILE_URL) {
+                    return Ok(None);
+                }
+            }
+            None => return Ok(None), // 剪贴板为空
+        }
+
+        // 只要文件 URL：不加此选项时，网页里复制的普通链接也会被当成文件读出来。
+        let only_files = NSNumber::new_bool(true);
+        // SAFETY: AppKit 导出的常量键，读取始终有效。
+        let key = unsafe { NSPasteboardURLReadingFileURLsOnlyKey };
+        let options: objc2::rc::Retained<NSDictionary<NSString, AnyObject>> =
+            NSDictionary::from_slices(&[key], &[&*only_files as &AnyObject]);
+        let classes = NSArray::from_slice(&[NSURL::class()]);
+
+        // SAFETY: classes 只含 NSURL 类对象，options 的键值类型与 AppKit 约定一致，
+        // 满足 readObjectsForClasses:options: 的两项要求。
+        let objects = unsafe { pb.readObjectsForClasses_options(&classes, Some(&options)) };
+        let Some(objects) = objects else {
+            return Ok(None);
+        };
+
+        let mut paths = Vec::with_capacity(objects.len());
+        for obj in objects.iter() {
+            // 依据 classes 参数，返回的元素必为 NSURL。
+            // SAFETY: 元素类型由上面的 class_array 限定为 NSURL。
+            let url: &NSURL = unsafe { &*(&*obj as *const AnyObject as *const NSURL) };
+            // 非文件 URL 会返回 None；已用 FileURLsOnly 过滤，这里再兜一层。
+            if let Some(p) = url.path() {
+                paths.push(PathBuf::from(p.to_string()));
+            }
+        }
+
+        if paths.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(paths))
+        }
+    }
+
+    pub fn write_file_paths(paths: &[PathBuf]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        // NSURL 需要持有到 writeObjects 调用结束，故先收集再借用。
+        let urls: Vec<_> = paths
+            .iter()
+            .map(|p| {
+                let s = NSString::from_str(&p.to_string_lossy());
+                NSURL::fileURLWithPath(&s)
+            })
+            .collect();
+        let refs: Vec<_> = urls
+            .iter()
+            .map(|u| objc2::runtime::ProtocolObject::from_ref(&**u))
+            .collect();
+        let array = NSArray::from_slice(&refs);
+
+        let pb = NSPasteboard::generalPasteboard();
+        // 必须先清空：writeObjects 只追加，残留的旧类型会让粘贴方读到过期内容。
+        pb.clearContents();
+        if !pb.writeObjects(&array) {
+            return Err(anyhow!("写入剪贴板文件列表失败"));
+        }
+
+        // writeObjects 向 pasteboard 服务的提交是异步的：进程若在提交完成前退出，
+        // 除第一条以外的条目会来不及落地——多文件同步会静默只剩一个文件。
+        // 回读一次类型列表可强制完成这次往返。注意必须真的取数据：
+        // 只数 pasteboardItems 的条数由本地应答，起不到同步作用。
+        let _ = pb.types();
+
+        // 确认条目数与预期一致，避免"写成功但内容不全"被静默接受。
+        let written = pb.pasteboardItems().map(|i| i.len()).unwrap_or(0);
+        if written < paths.len() {
+            return Err(anyhow!(
+                "写入剪贴板文件列表不完整：期望 {} 条，实际 {written} 条",
+                paths.len()
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod platform {
     use std::path::PathBuf;
 
     use anyhow::Result;
 
-    // macOS 的 NSPasteboard public.file-url 读写待具备编译环境时实现。
-    // 当前返回"无文件"，不影响文本与图片同步。
+    // 其它平台暂不支持文件列表，文本与图片同步不受影响。
     pub const SUPPORTED: bool = false;
 
     pub fn read_file_paths() -> Result<Option<Vec<PathBuf>>> {
@@ -290,5 +395,60 @@ mod tests {
     fn missing_file_reports_error() {
         let path = std::env::temp_dir().join("clipsync_definitely_missing_12345.bin");
         assert!(meta_for_path(&path).is_err());
+    }
+
+    /// 多文件写入必须在**写入进程退出后**仍然完整。
+    ///
+    /// macOS 上 `writeObjects` 向 pasteboard 服务的提交是异步的：若不回读强制
+    /// 完成往返，进程一退出就只有第一条能存活，多文件复制会静默只剩一个文件。
+    /// 关键是必须跨进程验证——同一进程内即便没有回读也能看到全部条目，
+    /// 只有另一个进程（真实的粘贴方）才会看到被截断的结果。
+    ///
+    /// 用 `write_files` 示例作为"写入后立即退出"的子进程。示例不存在时跳过。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn written_files_survive_writer_exit() {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        // 测试二进制在 target/<profile>/deps/ 下，示例在 target/<profile>/examples/。
+        let helper = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("examples").join("write_files"));
+        let Some(helper) = helper.filter(|p| p.exists()) else {
+            eprintln!("跳过：未找到 write_files 示例（先跑 cargo build --examples）");
+            return;
+        };
+
+        let dir = std::env::temp_dir().join("clipsync_filelist_exit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<_> = (0..4)
+            .map(|i| {
+                let p = dir.join(format!("e{i}.txt"));
+                std::fs::write(&p, format!("file {i}")).unwrap();
+                p
+            })
+            .collect();
+
+        let status = std::process::Command::new(&helper)
+            .args(&paths)
+            .status()
+            .expect("运行 write_files 示例失败");
+        assert!(status.success(), "写入子进程应成功退出");
+
+        // 子进程已退出，此时读到的就是真实粘贴方会看到的内容。
+        let read = read_file_paths()
+            .expect("读取不应出错")
+            .expect("写入进程退出后仍应读到文件列表");
+        assert_eq!(
+            read.len(),
+            paths.len(),
+            "写入进程退出后条目被截断——writeObjects 的异步提交未被强制完成"
+        );
+        for p in &paths {
+            assert!(read.contains(p), "缺少 {}", p.display());
+        }
     }
 }

@@ -36,5 +36,5 @@ windows-sys = { version = "0.60", features = [
 # NSPasteboard feature 已连带启用 NSArray/NSString/NSURL 等所需 Foundation 类型。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
 objc2-foundation = "0.3"
