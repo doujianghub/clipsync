@@ -271,7 +271,13 @@ mod platform {
             let url: &NSURL = unsafe { &*(&*obj as *const AnyObject as *const NSURL) };
             // 非文件 URL 会返回 None；已用 FileURLsOnly 过滤，这里再兜一层。
             if let Some(p) = url.path() {
-                paths.push(PathBuf::from(p.to_string()));
+                // NSURL 往返会把文件名规范化成 NFD（`é` 由单码位 U+00E9 拆成
+                // `e` + U+0301），而磁盘上、Windows 上都是 NFC。若原样使用，
+                // 同一个文件在"直接读磁盘"与"经剪贴板读取"两条路径下会算出
+                // 不同的 id（id 由文件名派生），导致跨平台缓存命中与断点续传
+                // 对含重音字符的文件静默失效——不报错，只是每次都重传。
+                // 这里归一化回 NFC，与磁盘和 Windows 侧保持一致。
+                paths.push(PathBuf::from(p.precomposedStringWithCanonicalMapping().to_string()));
             }
         }
 
@@ -395,6 +401,47 @@ mod tests {
     fn missing_file_reports_error() {
         let path = std::env::temp_dir().join("clipsync_definitely_missing_12345.bin");
         assert!(meta_for_path(&path).is_err());
+    }
+
+    /// 经剪贴板读回的文件名必须与磁盘上的字节一致（NFC）。
+    ///
+    /// `NSURL` 往返会把文件名规范化成 NFD（`é` 从单码位 U+00E9 拆成
+    /// `e` + U+0301）。若不归一化回 NFC，同一个文件在"直接读磁盘"与
+    /// "经剪贴板读取"两条路径下会算出不同的 `id`（`id` 由文件名派生），
+    /// 跨平台缓存命中与断点续传对含重音字符的文件就会**静默失效**——
+    /// 不报错，只表现为每次都重传。
+    ///
+    /// 这个差异是 Windows 侧联调时发现的：Windows 源端 `café.txt` 是
+    /// `c3a9`(NFC)，从 Mac 收到的却是 `65cc81`(NFD)。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clipboard_roundtrip_preserves_nfc_filename() {
+        let dir = std::env::temp_dir().join("clipsync_nfc_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 显式用 NFC 形式的 é（U+00E9 单码位）建文件。
+        let path = dir.join("caf\u{e9}.txt");
+        std::fs::write(&path, b"nfc").unwrap();
+
+        let on_disk = meta_for_path(&path).unwrap();
+        assert_eq!(
+            on_disk.name, "caf\u{e9}.txt",
+            "磁盘上的文件名应为 NFC（前置条件）"
+        );
+
+        write_file_paths(&[path.clone()]).expect("写入剪贴板应成功");
+        let read = read_file_paths()
+            .expect("读取不应出错")
+            .expect("应读到文件");
+        let via_clipboard = meta_for_path(&read[0]).unwrap();
+
+        assert_eq!(
+            via_clipboard.name, on_disk.name,
+            "经剪贴板读回的文件名被规范化成了 NFD，与磁盘不一致"
+        );
+        assert_eq!(
+            via_clipboard.id, on_disk.id,
+            "同一文件经两条路径算出不同 id——缓存命中与断点续传会失效"
+        );
     }
 
     /// 多文件写入必须在**写入进程退出后**仍然完整。
