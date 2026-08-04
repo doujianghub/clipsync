@@ -89,7 +89,24 @@ pub struct SyncEngine {
     ///
     /// 用集合而非单值，容忍平台监听的轻微乱序/延迟。
     pending_echo: std::collections::HashSet<u64>,
+
+    /// 曾被判定为敏感的内容哈希。
+    ///
+    /// **为什么需要记住**：敏感标记可能在内容仍留在剪贴板时消失——例如密码
+    /// 管理器写入"密码 + 排除标记"后退出，系统 flush 剪贴板时会丢弃空数据的
+    /// 自定义格式，文本却仍在。此时剪贴板序列号变化，我们重新读到的是"无标记
+    /// 的密码"，若不记住就会把它广播出去。实测确认过这个泄漏路径。
+    ///
+    /// 因此一旦判定敏感，就按内容记住；即便标记后来消失也继续跳过。
+    sensitive_hashes: std::collections::HashSet<u64>,
+    /// 敏感哈希的加入顺序，用于按容量淘汰最旧的，避免无限增长。
+    sensitive_order: std::collections::VecDeque<u64>,
 }
+
+/// 记住多少条敏感内容哈希。
+///
+/// 足够覆盖"标记消失后重新出现"的窗口，又不会无限增长；超出后淘汰最旧的。
+const SENSITIVE_MEMORY: usize = 64;
 
 impl SyncEngine {
     pub fn new(device_id: DeviceId, limits: Limits) -> Self {
@@ -100,6 +117,8 @@ impl SyncEngine {
             next_seq: 0,
             last_hash: None,
             pending_echo: std::collections::HashSet::new(),
+            sensitive_hashes: std::collections::HashSet::new(),
+            sensitive_order: std::collections::VecDeque::new(),
         }
     }
 
@@ -134,7 +153,12 @@ impl SyncEngine {
         }
 
         // 2) 敏感内容不外传。
-        if sensitive {
+        //
+        // 除了平台层当下的判定，还要查"曾经判定过敏感"的记录——标记可能在
+        // 内容仍在剪贴板时消失（如密码管理器退出触发系统 flush），此时若只看
+        // 当下标记就会把密码泄漏出去。
+        if sensitive || self.sensitive_hashes.contains(&hash) {
+            self.remember_sensitive(hash);
             return LocalDecision::Skip(SkipReason::Sensitive);
         }
 
@@ -209,6 +233,18 @@ impl SyncEngine {
     pub fn forget_current(&mut self) {
         self.last_hash = None;
     }
+
+    /// 记住一个敏感内容哈希，按容量淘汰最旧的。
+    fn remember_sensitive(&mut self, hash: u64) {
+        if self.sensitive_hashes.insert(hash) {
+            self.sensitive_order.push_back(hash);
+            while self.sensitive_order.len() > SENSITIVE_MEMORY {
+                if let Some(old) = self.sensitive_order.pop_front() {
+                    self.sensitive_hashes.remove(&old);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +304,57 @@ mod tests {
         let mut e = engine();
         assert_eq!(
             e.on_local_change(&text("secret"), true),
+            LocalDecision::Skip(SkipReason::Sensitive)
+        );
+    }
+
+    /// 回归测试：敏感标记消失后，同一内容仍不得外传。
+    ///
+    /// 真实泄漏路径（Windows 上实测确认）：密码管理器写入"密码 + 排除标记"，
+    /// 进程退出时系统 flush 剪贴板丢弃了空数据的自定义格式，文本却仍在。
+    /// 剪贴板序列号随之变化，监听器重新读到的是"无标记的密码"——若只看当下
+    /// 标记就会把它广播出去。
+    #[test]
+    fn sensitive_content_stays_blocked_after_marker_disappears() {
+        let mut e = engine();
+        let secret = text("my-password-123");
+
+        // 第一次：带标记，正确跳过。
+        assert_eq!(
+            e.on_local_change(&secret, true),
+            LocalDecision::Skip(SkipReason::Sensitive)
+        );
+
+        // 第二次：标记已消失（sensitive=false），但内容相同——必须继续跳过。
+        assert_eq!(
+            e.on_local_change(&secret, false),
+            LocalDecision::Skip(SkipReason::Sensitive),
+            "标记消失后密码不得被广播"
+        );
+
+        // 其它内容不受影响，正常同步。
+        assert!(matches!(
+            e.on_local_change(&text("normal text"), false),
+            LocalDecision::Broadcast { .. }
+        ));
+    }
+
+    /// 敏感哈希记录有容量上限，不会无限增长。
+    #[test]
+    fn sensitive_memory_is_bounded() {
+        let mut e = engine();
+        for i in 0..(SENSITIVE_MEMORY + 10) {
+            let _ = e.on_local_change(&text(&format!("secret-{i}")), true);
+        }
+        assert!(
+            e.sensitive_hashes.len() <= SENSITIVE_MEMORY,
+            "敏感哈希集合应受容量限制，实际 {}",
+            e.sensitive_hashes.len()
+        );
+        // 最近的仍应被记住。
+        let recent = text(&format!("secret-{}", SENSITIVE_MEMORY + 9));
+        assert_eq!(
+            e.on_local_change(&recent, false),
             LocalDecision::Skip(SkipReason::Sensitive)
         );
     }
