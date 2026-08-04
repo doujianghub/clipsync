@@ -34,6 +34,9 @@
 > **尚未验证**：第 4 项的 Mac↔Windows 双机端到端验证（本机只有 Mac，
 > 需要 Windows 侧配合），以及验证清单中的 1–10 项双机测试。单机侧的
 > 剪贴板读写、探测、托盘、自启均已验证。
+>
+> **另发现一处遗留缺口**（不在这 7 项内，未修）：16-bit 浮点 TIFF 图片
+> 无法解码，导致该类图片同步失败。8-bit 图片正常。详见第 3 节末尾。
 
 ---
 
@@ -172,6 +175,33 @@ pub fn has_image() -> Option<bool> {
 ```
 
 **怎么验证**：截图（`Cmd+Shift+4`）后日志应识别为图片；复制文本后不应尝试读图片。
+
+> **⚠️ 发现一处遗留缺口（不在本次 7 项范围内，未修）**：macOS 上部分程序产生的
+> 是 **16-bit 浮点 RGBA TIFF**，`arboard` 内部调用的 `image` 0.25 无法解码，
+> 报 `Unhandled TIFF sample format 3 for 16 bits`（SampleFormat 3 = IEEE 浮点），
+> 日志表现为 `读取剪贴板失败: 读取剪贴板图片失败: ... could not be converted`，
+> **该图片同步失败**。
+>
+> - **影响范围**：8-bit 图片（含 Display P3 宽色域）一切正常，已实测可同步；
+>   只有 16-bit 浮点 TIFF 失败。
+> - **触发条件**：Retina 屏（backingScaleFactor 2.0）上用 `NSImage.lockFocus`
+>   绘制并复制的图片会得到 `bps=16 bitmapFormat=4`（浮点标志）。
+> - **复现**：
+>   ```bash
+>   swift -e 'import AppKit
+>   let i = NSImage(size: NSSize(width:40,height:30))
+>   i.lockFocus(); NSColor.systemBlue.setFill()
+>   NSRect(x:0,y:0,width:40,height:30).fill(); i.unlockFocus()
+>   NSPasteboard.general.clearContents()
+>   NSPasteboard.general.writeObjects([i])'
+>   ```
+> - **性质**：`arboard` / `image` 的上游限制，与本次 macOS 补齐无关（补齐前后
+>   行为一致）。
+> - **可选修法**：① 在读图片前先用 `NSBitmapImageRep` 把 pasteboard 的 TIFF
+>   规范化为 8-bit 再交给 arboard；② 绕过 arboard 的 `get_image`，自己用
+>   `NSBitmapImageRep` 直接取 RGBA（顺带也解决 PNG-only 的情形）；
+>   ③ 等 `image` 支持浮点 TIFF。①② 都需要动 `arboard_backend.rs` 的读图路径，
+>   属于独立改动，建议单独评估。
 
 ---
 
