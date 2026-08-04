@@ -222,7 +222,9 @@ impl HubState {
                 file_id,
                 offset,
                 data,
-            } => self.on_file_chunk(&from, generation, file_id, offset, &data),
+                compressed,
+                plain_len,
+            } => self.on_file_chunk(&from, generation, file_id, offset, &data, compressed, plain_len),
 
             SyncMessage::FileDone {
                 generation,
@@ -360,6 +362,7 @@ impl HubState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_file_chunk(
         &mut self,
         from: &DeviceId,
@@ -367,12 +370,30 @@ impl HubState {
         file_id: u64,
         offset: u64,
         data: &[u8],
+        compressed: bool,
+        plain_len: u32,
     ) {
         // 过期代际的分块直接丢弃——剪贴板已经是别的内容了。
         if !self.matches_incoming(generation) {
             return;
         }
-        if let Err(e) = self.deps.cache.append(file_id, offset, data) {
+
+        // 压缩块先还原；`offset` 指的是原始文件位置，与是否压缩无关。
+        let plain: std::borrow::Cow<[u8]> = if compressed {
+            match crate::compress::decompress(data, plain_len as usize) {
+                Ok(d) => std::borrow::Cow::Owned(d),
+                Err(e) => {
+                    warn!("解压文件分块失败，放弃本次传输: {e:#}");
+                    self.incoming = None;
+                    self.engine.forget_current();
+                    return;
+                }
+            }
+        } else {
+            std::borrow::Cow::Borrowed(data)
+        };
+
+        if let Err(e) = self.deps.cache.append(file_id, offset, &plain) {
             // 偏移不连续通常意味着与另一次传输交错，放弃本次并让对端重来。
             warn!("写入文件分块失败: {e:#}");
             self.incoming = None;

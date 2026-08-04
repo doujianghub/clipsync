@@ -62,11 +62,21 @@ pub enum SyncMessage {
         offset: u64,
     },
     /// 一个文件数据块。
+    ///
+    /// `offset` 始终指**原始文件**中的位置，与是否压缩无关——这保证了
+    /// 断点续传与分段并行传输在开启压缩后仍然成立。
     FileChunk {
         generation: u64,
         file_id: u64,
         offset: u64,
         data: Vec<u8>,
+        /// `data` 是否为压缩后的字节。接收方据此决定是否解压。
+        /// 旧版本消息没有此字段，默认按未压缩处理。
+        #[serde(default)]
+        compressed: bool,
+        /// 该块解压后的字节数（用于预分配与校验）。压缩时必填。
+        #[serde(default)]
+        plain_len: u32,
     },
     /// 某文件全部内容已发送完毕，附内容校验哈希。
     ///

@@ -24,6 +24,10 @@ serde_json = { workspace = true }
 # 系统托盘图标与菜单（跨 Windows/macOS）。
 tray-icon = "0.19"
 
+# 文件传输的自适应压缩。flate2 已随 arboard→image→png 缓存，
+# 作为直接依赖不引入新下载。
+flate2 = "1"
+
 # 托盘需要在主线程上跑平台消息循环。windows-sys 已缓存，仅增 feature。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_UI_WindowsAndMessaging"] }

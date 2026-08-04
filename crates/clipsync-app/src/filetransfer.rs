@@ -87,15 +87,32 @@ pub struct OutgoingStream {
     file: std::fs::File,
     offset: u64,
     buf: Vec<u8>,
+    /// 本文件是否值得压缩（开流时采样判定一次，之后各块沿用）。
+    compress: bool,
 }
 
 impl OutgoingStream {
     /// 应对端请求开始发送某文件的 `offset` 之后的内容。
-    pub fn start(generation: u64, file_id: u64, path: PathBuf, offset: u64) -> Result<Self> {
+    ///
+    /// `allow_compress` 为用户配置；实际是否压缩还要看内容采样结果——
+    /// 已压缩的内容（jpg/mp4/zip）会自动跳过，不浪费 CPU。
+    pub fn start(
+        generation: u64,
+        file_id: u64,
+        path: PathBuf,
+        offset: u64,
+        allow_compress: bool,
+    ) -> Result<Self> {
         let mut file = std::fs::File::open(&path)
             .with_context(|| format!("打开待发送文件失败: {}", path.display()))?;
         file.seek(SeekFrom::Start(offset))
             .context("定位到续传偏移失败")?;
+
+        let compress = allow_compress && crate::compress::is_worth_compressing(&path);
+        if compress {
+            debug!("文件 {} 判定为可压缩，将压缩后传输", path.display());
+        }
+
         Ok(Self {
             generation,
             file_id,
@@ -103,6 +120,7 @@ impl OutgoingStream {
             file,
             offset,
             buf: vec![0u8; CHUNK_SIZE],
+            compress,
         })
     }
 
@@ -112,10 +130,15 @@ impl OutgoingStream {
 
     /// 产出下一条待发消息。返回 `None` 表示本文件已发送完毕。
     ///
+    /// `budget` 为本次允许读取的字节数上限（限速用）；传 `CHUNK_SIZE` 即不额外限制。
     /// 每次只读一个块，因此单次调用的内存与耗时都有界，便于在块之间响应
     /// 取代请求与其它剪贴板同步。
-    pub fn next_message(&mut self) -> Result<Option<SyncMessage>> {
-        let n = self.file.read(&mut self.buf).context("读取待发送文件失败")?;
+    pub fn next_message(&mut self, budget: usize) -> Result<Option<SyncMessage>> {
+        let want = budget.min(self.buf.len()).max(1);
+        let n = self
+            .file
+            .read(&mut self.buf[..want])
+            .context("读取待发送文件失败")?;
         if n == 0 {
             // 读到结尾：计算整份内容的哈希供对端校验。
             // 此处才计算是有意为之——续传时我们只读了文件的后半段，无法边读边算
@@ -127,11 +150,25 @@ impl OutgoingStream {
                 content_hash,
             }));
         }
+
+        let plain = &self.buf[..n];
+        let (data, compressed) = if self.compress {
+            match crate::compress::compress(plain) {
+                // 压完反而更大就退回原始字节（极少见，但没必要白费带宽）。
+                Ok(c) if c.len() < n => (c, true),
+                _ => (plain.to_vec(), false),
+            }
+        } else {
+            (plain.to_vec(), false)
+        };
+
         let msg = SyncMessage::FileChunk {
             generation: self.generation,
             file_id: self.file_id,
             offset: self.offset,
-            data: self.buf[..n].to_vec(),
+            data,
+            compressed,
+            plain_len: n as u32,
         };
         self.offset += n as u64;
         Ok(Some(msg))
@@ -146,6 +183,7 @@ pub fn begin_stream(
     generation: u64,
     file_id: u64,
     offset: u64,
+    allow_compress: bool,
 ) -> std::result::Result<OutgoingStream, SyncMessage> {
     // 请求的代际已被新剪贴板内容取代：告知对端放弃，不再浪费带宽。
     if !outgoing.is_current(generation) {
@@ -162,7 +200,7 @@ pub fn begin_stream(
             })
         }
     };
-    OutgoingStream::start(generation, file_id, path.clone(), offset).map_err(|e| {
+    OutgoingStream::start(generation, file_id, path.clone(), offset, allow_compress).map_err(|e| {
         SyncMessage::FileUnavailable {
             generation,
             file_id,
@@ -222,9 +260,10 @@ mod tests {
         // 构造略大于一个块的数据，确保产生多块。
         let data = vec![9u8; CHUNK_SIZE + 100];
         let p = write_temp("stream.bin", &data);
-        let mut s = OutgoingStream::start(1, 55, p, 0).unwrap();
+        // 关闭压缩，便于直接断言原始长度。
+        let mut s = OutgoingStream::start(1, 55, p, 0, false).unwrap();
 
-        let m1 = s.next_message().unwrap().unwrap();
+        let m1 = s.next_message(CHUNK_SIZE).unwrap().unwrap();
         match m1 {
             SyncMessage::FileChunk { offset, ref data, .. } => {
                 assert_eq!(offset, 0);
@@ -233,7 +272,7 @@ mod tests {
             _ => panic!("首条应为数据块"),
         }
 
-        let m2 = s.next_message().unwrap().unwrap();
+        let m2 = s.next_message(CHUNK_SIZE).unwrap().unwrap();
         match m2 {
             SyncMessage::FileChunk { offset, ref data, .. } => {
                 assert_eq!(offset, CHUNK_SIZE as u64);
@@ -242,7 +281,7 @@ mod tests {
             _ => panic!("次条应为剩余数据块"),
         }
 
-        let m3 = s.next_message().unwrap().unwrap();
+        let m3 = s.next_message(CHUNK_SIZE).unwrap().unwrap();
         assert!(matches!(m3, SyncMessage::FileDone { .. }), "末条应为完成消息");
     }
 
@@ -251,12 +290,78 @@ mod tests {
     fn stream_resumes_from_offset() {
         let data = b"0123456789".to_vec();
         let p = write_temp("resume.bin", &data);
-        let mut s = OutgoingStream::start(1, 1, p, 6).unwrap();
+        let mut s = OutgoingStream::start(1, 1, p, 6, false).unwrap();
 
-        match s.next_message().unwrap().unwrap() {
+        match s.next_message(CHUNK_SIZE).unwrap().unwrap() {
             SyncMessage::FileChunk { offset, data, .. } => {
                 assert_eq!(offset, 6);
                 assert_eq!(data, b"6789".to_vec(), "只应发送断点之后的内容");
+            }
+            _ => panic!("应为数据块"),
+        }
+    }
+
+    /// 限速：`budget` 限制单次读取量，偏移随实际发送量推进。
+    #[test]
+    fn budget_limits_chunk_size() {
+        let data = vec![7u8; 10_000];
+        let p = write_temp("budget.bin", &data);
+        let mut s = OutgoingStream::start(1, 1, p, 0, false).unwrap();
+
+        match s.next_message(1000).unwrap().unwrap() {
+            SyncMessage::FileChunk { offset, data, .. } => {
+                assert_eq!(offset, 0);
+                assert_eq!(data.len(), 1000, "单次发送量应受 budget 限制");
+            }
+            _ => panic!("应为数据块"),
+        }
+        // 下一块应接在前一块之后。
+        match s.next_message(1000).unwrap().unwrap() {
+            SyncMessage::FileChunk { offset, .. } => assert_eq!(offset, 1000),
+            _ => panic!("应为数据块"),
+        }
+    }
+
+    /// 可压缩内容应被压缩发送，且标记正确、原始长度如实上报。
+    #[test]
+    fn compressible_content_is_compressed() {
+        let data = vec![b'A'; 100_000]; // 高度重复，必然可压
+        let p = write_temp("compressible.bin", &data);
+        let mut s = OutgoingStream::start(1, 1, p, 0, true).unwrap();
+
+        match s.next_message(CHUNK_SIZE).unwrap().unwrap() {
+            SyncMessage::FileChunk {
+                data: sent,
+                compressed,
+                plain_len,
+                ..
+            } => {
+                assert!(compressed, "重复内容应被压缩");
+                assert_eq!(plain_len, 100_000, "应如实上报解压后长度");
+                assert!(sent.len() < 100_000 / 10, "压缩后应显著变小");
+                // 解压应还原原始内容。
+                let back = crate::compress::decompress(&sent, plain_len as usize).unwrap();
+                assert_eq!(back, data);
+            }
+            _ => panic!("应为数据块"),
+        }
+    }
+
+    /// 关闭压缩配置时，即使内容可压也按原样发送。
+    #[test]
+    fn compression_can_be_disabled() {
+        let data = vec![b'B'; 50_000];
+        let p = write_temp("nocompress.bin", &data);
+        let mut s = OutgoingStream::start(1, 1, p, 0, false).unwrap();
+
+        match s.next_message(CHUNK_SIZE).unwrap().unwrap() {
+            SyncMessage::FileChunk {
+                data: sent,
+                compressed,
+                ..
+            } => {
+                assert!(!compressed);
+                assert_eq!(sent.len(), 50_000, "关闭压缩时应原样发送");
             }
             _ => panic!("应为数据块"),
         }
@@ -268,7 +373,7 @@ mod tests {
         o.register(1, vec![(1, write_temp("stale.bin", b"z"))]);
         o.advance(2); // 剪贴板已更新
 
-        match begin_stream(&o, 1, 1, 0) {
+        match begin_stream(&o, 1, 1, 0, false) {
             Err(SyncMessage::FileAbort { generation }) => assert_eq!(generation, 1),
             _ => panic!("过期代际的请求应被中止"),
         }
@@ -279,7 +384,7 @@ mod tests {
         let o = OutgoingFiles::new();
         o.register(3, vec![(1, PathBuf::from("/definitely/missing/file.bin"))]);
 
-        match begin_stream(&o, 3, 1, 0) {
+        match begin_stream(&o, 3, 1, 0, false) {
             Err(SyncMessage::FileUnavailable { file_id, .. }) => assert_eq!(file_id, 1),
             _ => panic!("不可读的文件应报告 FileUnavailable"),
         }
@@ -290,7 +395,7 @@ mod tests {
         let o = OutgoingFiles::new();
         o.register(4, vec![]);
         assert!(matches!(
-            begin_stream(&o, 4, 12345, 0),
+            begin_stream(&o, 4, 12345, 0, false),
             Err(SyncMessage::FileUnavailable { .. })
         ));
     }

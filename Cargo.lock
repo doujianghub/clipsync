@@ -286,6 +286,7 @@ dependencies = [
  "clipsync-net",
  "ctrlc",
  "directories",
+ "flate2",
  "serde",
  "serde_json",
  "tracing",
