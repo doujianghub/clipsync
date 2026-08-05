@@ -103,12 +103,17 @@ pub struct NetCtx {
     pub addrbook: AddrBook,
     /// 本机待发文件登记表（供对端索取内容）与当前代际号。
     pub outgoing: OutgoingFiles,
-    /// 文件发送速率上限（字节/秒），0 表示不限速。
-    pub upload_limit: Option<u64>,
-    /// 是否允许传输前自适应压缩。
-    pub compress_transfers: bool,
+    /// 用户设置（限速、压缩开关等）。运行期可被托盘改动，故每次读取快照
+    /// 而非在启动时定格——否则用户改了设置要重启才生效。
+    pub settings: crate::config::SettingsHandle,
     /// 本机同步监听端口（用于向对端通告自身地址）。
     pub sync_port: u16,
+}
+
+/// 从设置取发送限速。`0` 表示不限速（`RateLimiter` 自身也把 0 当无限制，
+/// 这里包一层只为让调用点读起来清楚）。
+fn upload_limit_of(s: &crate::config::Settings) -> Option<u64> {
+    Some(s.upload_limit_bytes_per_sec)
 }
 
 /// 启动入站监听线程。收到连接后作为 Noise 响应方握手并接入中枢。
@@ -304,12 +309,23 @@ fn pump(
     // 当前正在发送的文件流（同一时刻至多一个）。
     let mut stream: Option<OutgoingStream> = None;
     // 发送限速器：只作用于文件内容，不影响文本/图片同步。
-    let mut limiter = crate::ratelimit::RateLimiter::new(ctx.upload_limit);
+    // 用户可能在托盘里改限速，故记住已应用的设置版本，变化时重建限速器。
+    let mut applied_settings = ctx.settings.version();
+    let mut limiter =
+        crate::ratelimit::RateLimiter::new(upload_limit_of(&ctx.settings.snapshot()));
     if limiter.is_limited() {
         debug!("文件发送限速已启用");
     }
 
     loop {
+        // 限速设置变了就换一个限速器（令牌桶重新计时，不沿用旧配额）。
+        let sv = ctx.settings.version();
+        if sv != applied_settings {
+            limiter = crate::ratelimit::RateLimiter::new(upload_limit_of(&ctx.settings.snapshot()));
+            applied_settings = sv;
+            debug!("发送限速设置已更新");
+        }
+
         // 本轮是否因限速而未能发满。
         let mut throttled = false;
         // 1) 优先发出中枢的待发消息，确保文本同步不被文件传输拖延。
@@ -405,7 +421,7 @@ fn pump(
                         generation,
                         file_id,
                         offset,
-                        ctx.compress_transfers,
+                        ctx.settings.snapshot().compress_transfers,
                     ) {
                         Ok(s) => {
                             debug!("开始发送文件 {file_id:016x}（自偏移 {offset}）");

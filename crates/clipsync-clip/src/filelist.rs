@@ -428,7 +428,7 @@ mod tests {
             "磁盘上的文件名应为 NFC（前置条件）"
         );
 
-        write_file_paths(&[path.clone()]).expect("写入剪贴板应成功");
+        write_file_paths(std::slice::from_ref(&path)).expect("写入剪贴板应成功");
         let read = read_file_paths()
             .expect("读取不应出错")
             .expect("应读到文件");

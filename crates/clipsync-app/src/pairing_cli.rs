@@ -26,11 +26,16 @@ pub const PAIRING_PORT: u16 = 47_685;
 ///
 /// 同时向局域网宣告"我在等待配对"，使对方**无需手输 IP**——直接
 /// `clipsync pair <配对码>` 即可。跨网络时才需要用到下方打印的地址。
+///
+/// `show_dialog`：是否额外弹窗显示配对码。从托盘触发时必须为 `true`
+/// （GUI 启动没有终端，`println!` 的内容用户看不到）；命令行下为 `false`，
+/// 避免多弹一个窗打断用户。
 pub fn host(
     dir: &Path,
     identity: &StaticIdentity,
     device_name: &str,
     sync_port: u16,
+    show_dialog: bool,
 ) -> Result<()> {
     let code = PairingCode::generate();
 
@@ -52,6 +57,19 @@ pub fn host(
 
     let listener = TcpListener::bind(("0.0.0.0", PAIRING_PORT))
         .with_context(|| format!("监听配对端口 {PAIRING_PORT} 失败"))?;
+
+    // 从托盘启动时没有终端，上面的 println! 用户一个字也看不到——不弹窗
+    // 等于"点了菜单没反应"。故在**开始监听之后**再弹：弹窗会阻塞本线程直到
+    // 用户点掉，此时监听已就绪，对方可以随时连入，不会错过连接。
+    //
+    // 注意这里在后台线程调用，不涉及主线程 UI 约束（见 dialog 模块说明）。
+    if show_dialog {
+        crate::dialog::show_info_and_copy(
+            "ClipSync 配对",
+            &dialog_body(&code, sync_port, announcing),
+            &code.to_string(),
+        );
+    }
 
     // 循环接受，直到配对成功——避免一次失败尝试（如误连或配对码输错）
     // 就让主持方退出，用户还得重来一遍。
@@ -83,8 +101,7 @@ fn print_manual_hint(code: &PairingCode, sync_port: u16) {
     }
     println!("  若两台设备不在同一局域网，在对方设备上运行：");
     for sa in &addrs {
-        println!("      clipsync pair {} {}", fmt_host(sa), code);
-    }
+        println!("      clipsync pair {} {}", fmt_host(sa), code);    }
     println!();
 }
 
@@ -95,6 +112,34 @@ fn fmt_host(sa: &std::net::SocketAddr) -> String {
         std::net::IpAddr::V6(v6) => format!("[{v6}]"),
         std::net::IpAddr::V4(v4) => v4.to_string(),
     }
+}
+
+/// 弹窗正文。内容与终端输出一致，但更紧凑——弹窗放不下太多行。
+///
+/// 跨网地址最多列 3 条：多数机器有一堆虚拟网卡（Tailscale、Docker、
+/// 各种 utun），全列出来会把窗口撑得很长，反而让人找不到重点。
+fn dialog_body(code: &PairingCode, sync_port: u16, announcing: bool) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = write!(s, "配对码：{code}\n（已复制到剪贴板）\n\n");
+
+    if announcing {
+        let _ = write!(s, "在另一台设备上运行，无需输入 IP：\n    clipsync pair {code}\n");
+    }
+
+    let addrs = clipsync_net::local::local_candidates(sync_port);
+    if !addrs.is_empty() {
+        let _ = write!(s, "\n若不在同一局域网，改用：\n");
+        for sa in addrs.iter().take(3) {
+            let _ = writeln!(s, "    clipsync pair {} {}", fmt_host(sa), code);
+        }
+        if addrs.len() > 3 {
+            let _ = writeln!(s, "    （另有 {} 个地址，见终端输出）", addrs.len() - 3);
+        }
+    }
+
+    let _ = write!(s, "\n正在等待对方连接…");
+    s
 }
 
 /// 作为发起方完成配对。

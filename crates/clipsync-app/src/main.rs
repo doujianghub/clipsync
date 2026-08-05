@@ -17,6 +17,7 @@ mod addrbook;
 mod autostart;
 mod compress;
 mod config;
+mod dialog;
 mod filecache;
 mod filetransfer;
 mod hub;
@@ -52,7 +53,8 @@ fn main() -> Result<()> {
         Some("pair") => match args.get(1).map(|s| s.as_str()) {
             Some("--host") | Some("-h") => {
                 let settings = config::load_or_init_settings(&dir)?;
-                pairing_cli::host(&dir, &identity, &device_name, settings.listen_port)
+                // 命令行下终端可见，不弹窗打断。
+                pairing_cli::host(&dir, &identity, &device_name, settings.listen_port, false)
             }
             Some(first) => {
                 let settings = config::load_or_init_settings(&dir)?;
@@ -238,6 +240,8 @@ fn run_sync(
     let clipboard = Arc::new(Mutex::new(ArboardClipboard::new()?));
     // 托盘状态：中枢更新连接数，托盘读取展示；暂停标志双方共享。
     let status = tray::TrayStatus::new(pairings.len());
+    // 设置句柄：托盘改动后中枢立即读到新值，无需重启。
+    let settings_handle = config::SettingsHandle::new(dir.clone(), settings.clone());
     let (hub, _hub_thread) = hub::start_hub(
         engine,
         hub::HubDeps {
@@ -246,6 +250,7 @@ fn run_sync(
             cache: cache.clone(),
             outgoing: outgoing.clone(),
             status: status.clone(),
+            settings: settings_handle.clone(),
         },
     );
 
@@ -259,8 +264,7 @@ fn run_sync(
         registry: net_manager::ConnRegistry::new(),
         addrbook: addrbook.clone(),
         outgoing,
-        upload_limit: Some(settings.upload_limit_bytes_per_sec),
-        compress_transfers: settings.compress_transfers,
+        settings: settings_handle.clone(),
         sync_port: settings.listen_port,
     };
     net_manager::spawn_listener(ctx.clone())?;
@@ -293,7 +297,15 @@ fn run_sync(
     }
 
     // 托盘必须在主线程运行；同步逻辑已全部在后台线程中。
-    run_tray(status, running, dir, identity_for_tray, device_name, settings.listen_port)
+    run_tray(
+        status,
+        running,
+        dir,
+        identity_for_tray,
+        device_name,
+        settings.listen_port,
+        settings_handle,
+    )
 }
 
 /// 在主线程运行托盘，处理菜单动作直到用户退出。
@@ -304,9 +316,12 @@ fn run_tray(
     identity: clipsync_net::crypto::StaticIdentity,
     device_name: String,
     sync_port: u16,
+    settings: config::SettingsHandle,
 ) -> Result<()> {
     let status_for_cb = status.clone();
     let running_for_cb = running.clone();
+    let settings_for_cb = settings.clone();
+    let settings_for_read = settings.clone();
 
     let callbacks = tray::TrayCallbacks {
         on_action: Box::new(move |action| match action {
@@ -330,8 +345,10 @@ fn run_tray(
                 let identity = identity.clone();
                 let name = device_name.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = pairing_cli::host(&dir, &identity, &name, sync_port) {
+                    // 托盘启动通常没有终端，必须弹窗，否则用户看不到配对码。
+                    if let Err(e) = pairing_cli::host(&dir, &identity, &name, sync_port, true) {
                         warn!("配对失败: {e:#}");
+                        crate::dialog::show_info("ClipSync 配对失败", &format!("{e:#}"));
                     }
                 });
                 true
@@ -340,6 +357,52 @@ fn run_tray(
                 info!("正在退出…");
                 running_for_cb.store(false, Ordering::SeqCst);
                 false
+            }
+            tray::TrayAction::ToggleSendImages => {
+                let now = !settings_for_cb.snapshot().allow_image;
+                settings_for_cb.update(|s| s.allow_image = now);
+                info!("发送图片已{}", if now { "开启" } else { "关闭" });
+                true
+            }
+            tray::TrayAction::ToggleSendFiles => {
+                let now = !settings_for_cb.snapshot().allow_files;
+                settings_for_cb.update(|s| s.allow_files = now);
+                info!("发送文件已{}", if now { "开启" } else { "关闭" });
+                true
+            }
+            tray::TrayAction::ToggleCompress => {
+                let now = !settings_for_cb.snapshot().compress_transfers;
+                settings_for_cb.update(|s| s.compress_transfers = now);
+                info!("传输前自动压缩已{}", if now { "开启" } else { "关闭" });
+                true
+            }
+            tray::TrayAction::SetMaxBytes(v) => {
+                settings_for_cb.update(|s| s.max_bytes = v);
+                if v == usize::MAX {
+                    info!("单次大小上限：不限制");
+                } else {
+                    info!("单次大小上限：{} MiB", v / (1024 * 1024));
+                }
+                true
+            }
+            tray::TrayAction::SetUploadLimit(v) => {
+                settings_for_cb.update(|s| s.upload_limit_bytes_per_sec = v);
+                if v == 0 {
+                    info!("发送限速：不限速");
+                } else {
+                    info!("发送限速：{} MB/s", v / 1_000_000);
+                }
+                true
+            }
+        }),
+        current_settings: Box::new(move || {
+            let s = settings_for_read.snapshot();
+            tray::TraySettings {
+                send_images: s.allow_image,
+                send_files: s.allow_files,
+                compress: s.compress_transfers,
+                max_bytes: s.max_bytes,
+                upload_limit: s.upload_limit_bytes_per_sec,
             }
         }),
     };

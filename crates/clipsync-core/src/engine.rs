@@ -134,6 +134,20 @@ impl SyncEngine {
         self.paused
     }
 
+    /// 替换大小上限与类型开关（用户在界面上改设置时调用）。
+    ///
+    /// 只影响此后的判定，不追溯已广播的内容。注意这些开关只作用于**发送**
+    /// 路径（见 `on_local_change`）；接收侧不做限制，因此关掉"发送图片"后
+    /// 对端发来的图片仍会被接受。
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
+    }
+
+    /// 当前生效的上限与开关。
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
     /// 处理本地剪贴板变化。
     ///
     /// `sensitive` 由平台层判定（macOS ConcealedType / Windows 排除标记等）。

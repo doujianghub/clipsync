@@ -204,12 +204,54 @@ pub enum TrayAction {
     ToggleAutostart,
     ShowPairingCode,
     Quit,
+    /// 切换"发送图片到其它设备"。
+    ToggleSendImages,
+    /// 切换"发送文件到其它设备"。
+    ToggleSendFiles,
+    /// 切换传输前自动压缩。
+    ToggleCompress,
+    /// 设置单次内容大小上限（字节）。
+    SetMaxBytes(usize),
+    /// 设置发送限速（字节/秒，0 为不限速）。
+    SetUploadLimit(u64),
+}
+
+/// 单次大小上限的预设档。`usize::MAX` 表示不限制。
+///
+/// 只给几个常用档而非任意输入：托盘菜单没有输入框，且这几档已覆盖绝大多数
+/// 场景；需要精确值的用户仍可直接改 `settings.json`。
+const MAX_BYTES_PRESETS: &[(&str, usize)] = &[
+    ("10 MiB", 10 * 1024 * 1024),
+    ("100 MiB（默认）", 100 * 1024 * 1024),
+    ("500 MiB", 500 * 1024 * 1024),
+    ("2 GiB", 2 * 1024 * 1024 * 1024),
+    ("不限制", usize::MAX),
+];
+
+/// 发送限速的预设档。`0` 表示不限速。
+const UPLOAD_LIMIT_PRESETS: &[(&str, u64)] = &[
+    ("不限速（默认）", 0),
+    ("10 MB/s", 10 * 1000 * 1000),
+    ("20 MB/s", 20 * 1000 * 1000),
+    ("50 MB/s", 50 * 1000 * 1000),
+];
+
+/// 托盘需要展示的当前设置值（用于菜单初始勾选状态）。
+#[derive(Debug, Clone, Copy)]
+pub struct TraySettings {
+    pub send_images: bool,
+    pub send_files: bool,
+    pub compress: bool,
+    pub max_bytes: usize,
+    pub upload_limit: u64,
 }
 
 /// 托盘运行所需的回调。
 pub struct TrayCallbacks {
     /// 处理一次菜单动作；返回 false 表示应退出程序。
     pub on_action: Box<dyn FnMut(TrayAction) -> bool>,
+    /// 读取当前设置，用于点击后刷新勾选状态（以实际结果为准，避免脱节）。
+    pub current_settings: Box<dyn Fn() -> TraySettings>,
 }
 
 /// 在**主线程**上创建托盘并运行事件循环，直到用户选择退出。
@@ -217,17 +259,57 @@ pub struct TrayCallbacks {
 /// 必须在主线程运行：macOS 要求 UI 操作在主线程，Windows 也要求托盘图标所属
 /// 线程持有消息循环。因此同步逻辑全部放在后台线程，主线程专职跑这个循环。
 pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<()> {
-    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
     use tray_icon::TrayIconBuilder;
 
     // 平台初始化需先于托盘构建：macOS 上 NSApp 未完成启动时创建的状态项
     // 不会响应点击。
     init_platform_app();
 
+    let s0 = (callbacks.current_settings)();
+
     let menu = Menu::new();
     // 首项显示状态，不可点击，仅作信息展示。
     let status_item = MenuItem::new(status.summary(), false, None);
     let pair_item = MenuItem::new("显示配对码…", true, None);
+
+    // 开关文案强调"发送"：这两项只拦截发出，收到的内容不受影响
+    // （引擎只在 on_local_change 检查，on_remote 不检查）。写成"同步图片"
+    // 会让人以为关掉后也不再接收。
+    let send_images_item = CheckMenuItem::new("发送图片到其它设备", true, s0.send_images, None);
+    let send_files_item = CheckMenuItem::new("发送文件到其它设备", true, s0.send_files, None);
+    let compress_item = CheckMenuItem::new("传输前自动压缩", true, s0.compress, None);
+
+    // 预设档用一组 CheckMenuItem 手工做成单选：muda 没有原生 radio 项，
+    // 点击后由我们把同组其它项取消勾选。
+    let max_items: Vec<CheckMenuItem> = MAX_BYTES_PRESETS
+        .iter()
+        .map(|(label, v)| CheckMenuItem::new(*label, true, s0.max_bytes == *v, None))
+        .collect();
+    let max_menu = Submenu::new("单次大小上限", true);
+    max_menu
+        .append_items(
+            &max_items
+                .iter()
+                .map(|i| i as &dyn tray_icon::menu::IsMenuItem)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| anyhow::anyhow!("构建上限子菜单失败: {e}"))?;
+
+    let rate_items: Vec<CheckMenuItem> = UPLOAD_LIMIT_PRESETS
+        .iter()
+        .map(|(label, v)| CheckMenuItem::new(*label, true, s0.upload_limit == *v, None))
+        .collect();
+    let rate_menu = Submenu::new("发送限速", true);
+    rate_menu
+        .append_items(
+            &rate_items
+                .iter()
+                .map(|i| i as &dyn tray_icon::menu::IsMenuItem)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| anyhow::anyhow!("构建限速子菜单失败: {e}"))?;
+
     let pause_item = CheckMenuItem::new("暂停同步", true, status.is_paused(), None);
     let autostart_item =
         CheckMenuItem::new("开机自启", true, crate::autostart::is_enabled(), None);
@@ -237,6 +319,12 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
         &status_item,
         &PredefinedMenuItem::separator(),
         &pair_item,
+        &PredefinedMenuItem::separator(),
+        &send_images_item,
+        &send_files_item,
+        &max_menu,
+        &rate_menu,
+        &compress_item,
         &PredefinedMenuItem::separator(),
         &pause_item,
         &autostart_item,
@@ -270,17 +358,46 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
                 Some(TrayAction::ShowPairingCode)
             } else if event.id == quit_item.id() {
                 Some(TrayAction::Quit)
+            } else if event.id == send_images_item.id() {
+                Some(TrayAction::ToggleSendImages)
+            } else if event.id == send_files_item.id() {
+                Some(TrayAction::ToggleSendFiles)
+            } else if event.id == compress_item.id() {
+                Some(TrayAction::ToggleCompress)
             } else {
-                None
+                // 两组预设档：按 id 找到被点的那一项。
+                max_items
+                    .iter()
+                    .position(|i| i.id() == &event.id)
+                    .map(|idx| TrayAction::SetMaxBytes(MAX_BYTES_PRESETS[idx].1))
+                    .or_else(|| {
+                        rate_items
+                            .iter()
+                            .position(|i| i.id() == &event.id)
+                            .map(|idx| TrayAction::SetUploadLimit(UPLOAD_LIMIT_PRESETS[idx].1))
+                    })
             };
 
             if let Some(a) = action {
                 let keep_running = (callbacks.on_action)(a);
-                // 勾选状态以实际结果为准，避免与真实状态脱节。
-                pause_item.set_checked(status.is_paused());
-                autostart_item.set_checked(crate::autostart::is_enabled());
                 if !keep_running {
                     return Ok(());
+                }
+                // 勾选状态一律以**实际生效值**为准，而不是按点击取反：
+                // 保存失败或值被夹取时，界面不会与真实状态脱节。
+                pause_item.set_checked(status.is_paused());
+                autostart_item.set_checked(crate::autostart::is_enabled());
+
+                let s = (callbacks.current_settings)();
+                send_images_item.set_checked(s.send_images);
+                send_files_item.set_checked(s.send_files);
+                compress_item.set_checked(s.compress);
+                // 预设档做成单选：只勾中与当前值相等的那项。
+                for (item, (_, v)) in max_items.iter().zip(MAX_BYTES_PRESETS) {
+                    item.set_checked(s.max_bytes == *v);
+                }
+                for (item, (_, v)) in rate_items.iter().zip(UPLOAD_LIMIT_PRESETS) {
+                    item.set_checked(s.upload_limit == *v);
                 }
             }
         }

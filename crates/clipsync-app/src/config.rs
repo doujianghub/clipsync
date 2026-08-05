@@ -131,6 +131,62 @@ pub fn save_settings(dir: &Path, settings: &Settings) -> Result<()> {
 }
 
 // ————————————————————————————————————————————————————————————————
+// 运行期可变设置
+// ————————————————————————————————————————————————————————————————
+
+/// 托盘与中枢之间共享的设置句柄。
+///
+/// 用户在托盘菜单改设置后需要**立即生效**，不该要求重启。做法与已有的
+/// `TrayStatus`（暂停开关）一致：托盘写、中枢读。
+///
+/// `version` 是变更计数：中枢每轮比对一次整数即可知道要不要重读设置，
+/// 无需每轮都去拿锁拷贝整个 `Settings`。
+#[derive(Clone)]
+pub struct SettingsHandle {
+    inner: std::sync::Arc<std::sync::Mutex<Settings>>,
+    dir: std::sync::Arc<PathBuf>,
+    version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SettingsHandle {
+    pub fn new(dir: PathBuf, settings: Settings) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(settings)),
+            dir: std::sync::Arc::new(dir),
+            version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    pub fn snapshot(&self) -> Settings {
+        self.inner.lock().unwrap().clone()
+    }
+
+    /// 变更计数。值改变即表示设置被动过。
+    pub fn version(&self) -> u64 {
+        self.version.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 修改设置并立即落盘。
+    ///
+    /// 落盘失败只记 warn、**不回滚内存值**：用户在菜单上的操作应当立刻见效，
+    /// 若因磁盘只读之类的原因存不下，也好过界面点了没反应；代价是重启后
+    /// 恢复旧值，日志里有据可查。
+    pub fn update(&self, f: impl FnOnce(&mut Settings)) {
+        let snapshot = {
+            let mut g = self.inner.lock().unwrap();
+            f(&mut g);
+            g.clone()
+        };
+        // 先递增版本再落盘：即便落盘卡住，中枢也已能读到新值。
+        self.version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        if let Err(e) = save_settings(&self.dir, &snapshot) {
+            tracing::warn!("设置已生效但保存失败（重启后会恢复旧值）: {e:#}");
+        }
+    }
+}
+
+// ————————————————————————————————————————————————————————————————
 // 本机加密身份（Noise 静态密钥）持久化
 // ————————————————————————————————————————————————————————————————
 

@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use clipsync_clip::{ArboardClipboard, Clipboard};
 use clipsync_core::{
-    ClipContent, DeviceId, FileMeta, LocalDecision, RemoteDecision, SyncEngine, SyncMessage,
+    ClipContent, DeviceId, FileMeta, LocalDecision, RemoteDecision, SkipReason, SyncEngine,
+    SyncMessage,
 };
 use tracing::{debug, info, warn};
 
@@ -94,6 +95,8 @@ pub struct HubDeps {
     pub outgoing: OutgoingFiles,
     /// 托盘状态：中枢更新连接数，并读取用户设置的暂停开关。
     pub status: crate::tray::TrayStatus,
+    /// 用户设置：托盘改动后中枢据此更新引擎限制。
+    pub settings: crate::config::SettingsHandle,
 }
 
 /// 启动中枢线程，返回投递句柄。
@@ -114,6 +117,8 @@ struct HubState {
     deps: HubDeps,
     peers: HashMap<DeviceId, Peer>,
     incoming: Option<IncomingTransfer>,
+    /// 上一次跳过的原因，用于抑制重复的 INFO 提示（见 `log_skip`）。
+    last_skip: Option<SkipReason>,
 }
 
 fn hub_loop(engine: SyncEngine, deps: HubDeps, rx: Receiver<HubEvent>) {
@@ -122,13 +127,27 @@ fn hub_loop(engine: SyncEngine, deps: HubDeps, rx: Receiver<HubEvent>) {
         deps,
         peers: HashMap::new(),
         incoming: None,
+        last_skip: None,
     };
+    // 已应用的设置版本；与句柄里的版本不同即说明用户改过设置。
+    let mut applied_settings = st.deps.settings.version();
 
     for event in rx {
         // 用户可能通过托盘切换了暂停开关；每轮同步给引擎。
         let paused = st.deps.status.is_paused();
         if st.engine.is_paused() != paused {
             st.engine.set_paused(paused);
+        }
+
+        // 同理，设置也可能被托盘改过。只比对一个整数，未变则不拿锁。
+        //
+        // 这里是事件驱动的：空闲时不会执行到这一句，因此改设置后要等下一次
+        // 剪贴板变化才应用。这不成问题——检查位于处理 event **之前**，
+        // 任何内容被处理前设置一定已是最新；空闲时也没有内容需要它生效。
+        let sv = st.deps.settings.version();
+        if sv != applied_settings {
+            st.engine.set_limits(st.deps.settings.snapshot().to_limits());
+            applied_settings = sv;
         }
 
         match event {
@@ -202,8 +221,41 @@ impl HubState {
                 info!("已同步 [{kind}] {size} 字节 → {} 台设备", self.peers.len());
             }
             LocalDecision::Skip(reason) => {
-                debug!("本地变化跳过 ({:?})", reason);
+                self.log_skip(reason, &content);
             }
+        }
+    }
+
+    /// 记录一次跳过。
+    ///
+    /// `TooLarge` 与 `KindDisabled` 是**用户需要知道**的——内容没同步过去，
+    /// 而原因是可调的设置，若只写在 DEBUG 里，用户只会觉得"东西怎么没过去"
+    /// 却无从查起（我们自己联调时就在 TooLarge 上栽过一次）。
+    ///
+    /// 但它们也可能连续触发（关掉图片同步后每次截图都会命中），所以同一原因
+    /// 只在**第一次**打 INFO，重复时降到 DEBUG，原因变化后重新计数。
+    /// `Echo`/`Duplicate` 每次复制都会出现，始终留在 DEBUG。
+    fn log_skip(&mut self, reason: SkipReason, content: &ClipContent) {
+        let noteworthy = matches!(reason, SkipReason::TooLarge | SkipReason::KindDisabled);
+        let repeated = self.last_skip == Some(reason);
+        self.last_skip = Some(reason);
+
+        if !noteworthy || repeated {
+            debug!("本地变化跳过 ({reason:?})");
+            return;
+        }
+
+        match reason {
+            SkipReason::TooLarge => info!(
+                "内容 {} 字节，超过单次上限 {} 字节，未同步（可在托盘菜单调整上限）",
+                content.byte_size(),
+                self.engine.limits().max_bytes
+            ),
+            SkipReason::KindDisabled => info!(
+                "[{}] 未同步：该类型的发送已在托盘菜单中关闭",
+                kind_label(content)
+            ),
+            _ => unreachable!("noteworthy 已限定分支"),
         }
     }
 
