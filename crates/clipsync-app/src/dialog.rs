@@ -82,18 +82,21 @@ mod platform {
     use anyhow::{Context, Result};
     use std::process::Command;
 
-    /// 同样把内容经参数传入（PowerShell 的 `-File -` 读 stdin 脚本，
-    /// 参数由 `param()` 接收），脚本体不做字符串拼接。
-    const SCRIPT: &str = r#"param([string]$Title, [string]$Body)
-Add-Type -AssemblyName System.Windows.Forms | Out-Null
-[System.Windows.Forms.MessageBox]::Show($Body, $Title, 'OK', 'Information') | Out-Null
+    /// 内容经**环境变量**传入，脚本体不做任何字符串拼接。
+    ///
+    /// 不用位置参数：`-Command -` 从 stdin 读脚本，**不会**把尾随参数传给
+    /// `param()`——实测确认该写法会让弹窗内容为空（配对码看不见，正是本次
+    /// 要修的症状）。环境变量既避开这一点，也同样不存在注入面：值永远不会
+    /// 被当作脚本文本解析。
+    const SCRIPT: &str = r#"Add-Type -AssemblyName System.Windows.Forms | Out-Null
+[System.Windows.Forms.MessageBox]::Show($env:CLIPSYNC_DLG_BODY, $env:CLIPSYNC_DLG_TITLE, 'OK', 'Information') | Out-Null
 "#;
 
     pub fn show(title: &str, body: &str) -> Result<()> {
         let mut child = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
-            .arg(title)
-            .arg(body)
+            .env("CLIPSYNC_DLG_TITLE", title)
+            .env("CLIPSYNC_DLG_BODY", body)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -101,13 +104,11 @@ Add-Type -AssemblyName System.Windows.Forms | Out-Null
             .context("启动 powershell 失败")?;
 
         use std::io::Write;
-        // `-Command -` 从 stdin 读脚本；用 param 接收上面的两个参数。
-        let full = format!("{SCRIPT}\n");
         child
             .stdin
             .take()
             .context("取 powershell stdin 失败")?
-            .write_all(full.as_bytes())
+            .write_all(SCRIPT.as_bytes())
             .context("写入 powershell 脚本失败")?;
         child.wait().context("等待 powershell 结束失败")?;
         Ok(())
