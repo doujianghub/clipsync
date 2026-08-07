@@ -28,7 +28,11 @@ pub mod stub;
 ///
 /// 锁中毒（某个测试 panic）时取回内部值继续：一个测试失败不应把其余全部
 /// 拖成连锁失败，那会掩盖真实的失败点。
-#[cfg(test)]
+///
+/// 只在 macOS 上编译：眼下所有"写入再读回"的测试都是 macOS 限定的
+/// （Windows 侧的剪贴板行为靠交叉检查与实机验证），在别的目标上留着它
+/// 只会得到一条 dead_code 告警。
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn clipboard_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))

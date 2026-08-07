@@ -11,12 +11,13 @@ use crate::device::DeviceId;
 /// 协议版本，握手后校验，避免不兼容版本互联出错。
 /// 协议版本。
 ///
+/// **3**：新增 [`SyncMessage::Removed`]（把某台移出设备组）。
 /// **2**：新增 [`SyncMessage::Peers`]（设备互相介绍）。旧版本的枚举里没有这个
 /// 变体，收到会解码失败并断开重连，陷入死循环——所以发它之前必须先确认对端
 /// 版本。确认手段就是 `Hello`：它在 v1 就已定义，旧版本能正常解码后忽略，
 /// 因此对老对端发 `Hello` 是安全的；而老对端不会回 `Hello`，我们据此判定
 /// "对方是旧版"，从而不发 `Peers`。
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// 把一台设备介绍给另一台所需的全部信息。
 ///
@@ -135,6 +136,22 @@ pub enum SyncMessage {
     ///
     /// 只在对端协议版本 ≥ 2 时发送（见 [`PROTOCOL_VERSION`]）。
     Peers { peers: Vec<PeerIntro> },
+
+    /// 把某台设备**移出设备组**，收到的一方应当忘掉它。
+    ///
+    /// 引荐让若干设备构成了一个组（A 认识 B、B 认识 C，最终全互联）。既然
+    /// 数据模型是组，退出也该是组语义——否则就会出现"我在这台上解除了它，
+    /// 别的成员又把它引荐回来"，只能靠一份看不见的拒绝名单去堵，而那份名单
+    /// 本身又成了新的困惑来源。
+    ///
+    /// 一条消息表达两件事，区别只在 `device` 是谁：
+    ///   - **别人** → "把它踢出组"，收到的一方删除该设备；
+    ///   - **发送者自己** → "我退出了"，收到的一方把发送者删掉。
+    ///
+    /// 组内任何成员都可以踢任何人——这些本就是同一个人的设备，不必设管理员。
+    ///
+    /// 只在对端协议版本 ≥ 3 时发送（见 [`PROTOCOL_VERSION`]）。
+    Removed { device: DeviceId },
 }
 
 impl SyncMessage {
@@ -189,5 +206,43 @@ mod tests {
         };
         let bytes = msg.encode().unwrap();
         assert_eq!(SyncMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn removed_message_roundtrips() {
+        let msg = SyncMessage::Removed {
+            device: DeviceId::from_public_key(b"gone"),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(SyncMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    /// `Removed` 必须排在枚举**末尾**。
+    ///
+    /// postcard 按变体下标编码，往中间插一个变体会让所有后续变体的下标整体
+    /// 后移——旧版本收到新版本的消息会解码成完全不相干的类型，而且不报错。
+    /// 这个断言把"新变体一律追加在最后"这条纪律钉死在测试里。
+    #[test]
+    fn removed_is_the_last_variant() {
+        let last = SyncMessage::Removed {
+            device: DeviceId::from_public_key(b"x"),
+        };
+        let idx = last.encode().unwrap()[0];
+        // 逐个编码其余变体，确认没有谁的下标比它还大。
+        let others = [
+            SyncMessage::Hello {
+                protocol: PROTOCOL_VERSION,
+                device: DeviceId::from_public_key(b"x"),
+                device_name: String::new(),
+            },
+            SyncMessage::Addresses { addrs: vec![] },
+            SyncMessage::Peers { peers: vec![] },
+        ];
+        for m in others {
+            assert!(
+                m.encode().unwrap()[0] < idx,
+                "新变体必须追加在枚举末尾，否则会错开旧版本的变体下标"
+            );
+        }
     }
 }

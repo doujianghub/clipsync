@@ -292,6 +292,7 @@ fn run_sync(
         host_slot: pairing_ui::PairingHostSlot::default(),
         hub: hub.clone(),
         dir: dir.clone(),
+        local_device: device_id.clone(),
     };
     tray_bridge::run_tray(
         status,

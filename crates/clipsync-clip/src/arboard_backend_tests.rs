@@ -4,6 +4,9 @@
 //! 它仍是 `arboard_backend` 的子模块（由 `#[path]` 引入），`use super::*`
 //! 照常可用，与写在原文件里没有区别。
 
+// 本文件里的测试目前全是 macOS 限定的，导入也随之限定，否则在别的目标上
+// 会剩一条 unused_imports 告警。
+#[cfg(target_os = "macos")]
 use super::*;
 
 /// 端到端回归：arboard 解不了的图片，整条读取链路也必须能拿到。

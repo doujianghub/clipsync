@@ -127,10 +127,17 @@ pub(crate) fn run_tray(
                 }
                 true
             }
-            tray::TrayAction::Unpair(device_id) => {
+            tray::TrayAction::RemovePeer(device_id) => {
                 // 确认框会阻塞到用户点掉，丢到后台线程免得卡住托盘。
                 let pairing = pairing.clone();
-                std::thread::spawn(move || pairing_ui::unpair_interactive(&pairing, &device_id));
+                std::thread::spawn(move || {
+                    pairing_ui::remove_peer_interactive(&pairing, &device_id)
+                });
+                true
+            }
+            tray::TrayAction::LeaveGroup => {
+                let pairing = pairing.clone();
+                std::thread::spawn(move || pairing_ui::leave_group_interactive(&pairing));
                 true
             }
         }),
@@ -162,7 +169,7 @@ pub(crate) fn run_tray(
     Ok(())
 }
 
-/// 托盘里点某台设备 → 确认 → 解除配对。
+/// 托盘里点某台设备 → 确认 → 把它移出设备组。
 ///
 
 /// 常用档 + 自定义：先让用户点选，选了「自定义…」再弹输入框。

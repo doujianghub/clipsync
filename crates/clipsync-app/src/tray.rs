@@ -24,9 +24,9 @@ use tray_platform::{init_platform_app, pump_platform_events};
 mod tray_menu;
 
 pub(crate) use tray_menu::human_bytes;
-use tray_menu::{max_bytes_label, port_label, rate_label, rebuild_peer_menu};
+use tray_menu::{max_bytes_label, port_label, rate_label, rebuild_peer_menu, LEAVE_GROUP_ID};
 
-// 不再是 Copy：`Unpair` 携带 device id。
+// 不再是 Copy：`RemovePeer` 携带 device id。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayAction {
     TogglePause,
@@ -48,8 +48,10 @@ pub enum TrayAction {
     PromptUploadLimit,
     /// 弹输入框改同步监听端口。
     PromptListenPort,
-    /// 解除与某台设备的配对（携带其 device id）。
-    Unpair(String),
+    /// 把某台设备移出设备组（携带其 device id），全组生效。
+    RemovePeer(String),
+    /// 本机退出设备组：清空全部配对，并告知其它成员。
+    LeaveGroup,
     /// 打开日志所在文件夹。
     OpenLogDir,
     /// 切换详细日志（info ↔ debug）。
@@ -112,7 +114,7 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
     let pair_item = MenuItem::new("显示配对码…", true, None);
     let join_item = MenuItem::new("输入配对码…", true, None);
     let peers_menu = Submenu::new("已配对设备", true);
-    let mut peer_items = rebuild_peer_menu(&peers_menu, &[], &(callbacks.current_peers)())?;
+    let mut peer_items = rebuild_peer_menu(&peers_menu, &(callbacks.current_peers)())?;
 
     // 开关收发两侧都生效，所以可以就叫"同步图片"（见 engine 的 kind_disabled）。
     let images_item = CheckMenuItem::new("同步图片", true, s0.sync_images, None);
@@ -216,7 +218,13 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
                 peer_items
                     .iter()
                     .find(|(i, _)| i.id() == &event.id)
-                    .map(|(_, device)| TrayAction::Unpair(device.clone()))
+                    .map(|(_, device)| {
+                        if device == LEAVE_GROUP_ID {
+                            TrayAction::LeaveGroup
+                        } else {
+                            TrayAction::RemovePeer(device.clone())
+                        }
+                    })
             };
 
             if let Some(a) = action {
@@ -238,9 +246,8 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
                 max_item.set_text(max_bytes_label(s.max_bytes));
                 rate_item.set_text(rate_label(s.upload_limit));
                 port_item.set_text(port_label(s.listen_port));
-                // 解除配对会改变设备列表，重建一次。
-                peer_items =
-                    rebuild_peer_menu(&peers_menu, &peer_items, &(callbacks.current_peers)())?;
+                // 移出设备会改变列表，重建一次。
+                peer_items = rebuild_peer_menu(&peers_menu, &(callbacks.current_peers)())?;
             }
         }
 
@@ -257,7 +264,7 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
             let _ = tray.set_tooltip(Some(&summary));
             last_summary = summary;
             // 汇总变了意味着连接数变了，设备子菜单里的 ●/○ 也该跟着变。
-            peer_items = rebuild_peer_menu(&peers_menu, &peer_items, &(callbacks.current_peers)())?;
+            peer_items = rebuild_peer_menu(&peers_menu, &(callbacks.current_peers)())?;
         }
         let icon_state = IconState::of(&status);
         if icon_state != current_icon {
