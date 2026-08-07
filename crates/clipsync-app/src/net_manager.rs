@@ -173,6 +173,9 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
                 let version_before = ctx.known.version();
 
                 let mut any_connected = false;
+                // 有设备还一个地址都没有——多半是引荐刚到、地址正在路上。
+                // 这不算"连不上"，不该让退避跟着翻倍。
+                let mut awaiting_addrs = false;
                 for peer in ctx.known.snapshot() {
                     // 方向去重：仅由 id 较小的一方主动拨号。
                     if ctx.local_device.as_str() >= peer.device.as_str() {
@@ -181,12 +184,17 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
                     if ctx.registry.contains(&peer.device) {
                         continue;
                     }
+                    if ctx.addrbook.count(&peer.device) == 0 {
+                        awaiting_addrs = true;
+                        continue;
+                    }
                     if dial_peer(&peer, &ctx) {
                         any_connected = true;
                     }
                 }
 
-                backoff = next_backoff(backoff, any_connected);
+                let table_changed = ctx.known.version() != version_before;
+                backoff = next_backoff(backoff, any_connected, awaiting_addrs, table_changed);
                 // 睡到退避到期，或设备表一变就提前醒——配对、引荐登记完
                 // 立即开拨，不用干等一个退避周期。
                 ctx.known.wait_for_change(version_before, backoff);
@@ -195,12 +203,24 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
         .expect("启动拨号线程失败")
 }
 
-/// 推进重试间隔：连上过就复位，否则加倍到上限。
+/// 推进重试间隔。
+///
+/// 只有**真的试过且没连上**才加倍；下面三种情况一律复位到起始间隔：
+///   - `any_connected`：这轮连上了，说明网络是通的；
+///   - `awaiting_addrs`：有设备还没拿到地址（引荐刚到、地址在路上）。这不是
+///     "连不上"，把它算作失败会让刚认识的设备白等最长 60 秒；
+///   - `table_changed`：设备表变过。新设备是新的机会，不该继承此前"连不上"
+///     攒下来的长间隔。
 ///
 /// 单独成函数只为能直接测——退避写错（比如忘了复位）的表现是"断网一次之后
 /// 就再也不积极重连了"，属于那种平时看不出、真出事才发现的问题。
-fn next_backoff(current: Duration, any_connected: bool) -> Duration {
-    if any_connected {
+fn next_backoff(
+    current: Duration,
+    any_connected: bool,
+    awaiting_addrs: bool,
+    table_changed: bool,
+) -> Duration {
+    if any_connected || awaiting_addrs || table_changed {
         DIAL_RETRY_INTERVAL
     } else {
         (current * 2).min(DIAL_RETRY_MAX)
@@ -368,7 +388,7 @@ mod tests {
         let mut d = DIAL_RETRY_INTERVAL;
         let mut seen = vec![d];
         for _ in 0..10 {
-            d = next_backoff(d, false);
+            d = next_backoff(d, false, false, false);
             seen.push(d);
         }
         assert!(
@@ -383,14 +403,48 @@ mod tests {
     fn backoff_resets_after_success() {
         let mut d = DIAL_RETRY_INTERVAL;
         for _ in 0..8 {
-            d = next_backoff(d, false);
+            d = next_backoff(d, false, false, false);
         }
         assert!(d > DIAL_RETRY_INTERVAL, "前置条件：已退避到较大间隔");
 
         assert_eq!(
-            next_backoff(d, true),
+            next_backoff(d, true, false, false),
             DIAL_RETRY_INTERVAL,
             "连上后应立刻回到起始间隔"
         );
+    }
+
+    /// 刚认识、地址还没到的设备不该拖长退避。
+    ///
+    /// 回归自实机：`经 KPC 认识了 MacBook Pro` 到真正连上隔了 **60.019 秒**，
+    /// 正好是 `DIAL_RETRY_MAX`。根因是引荐登记时先动设备表、后写地址簿，
+    /// 而设备表一变就唤醒拨号线程——它醒来看到一台没有任何地址的设备，
+    /// 拨不出去，就把这一轮记成"连不上"，退避翻倍直到上限。
+    ///
+    /// 顺序已经改对（地址先落地址簿），这条断言是第二道防线：就算将来又有谁
+    /// 把顺序写反，最坏也只是慢一个起始间隔，而不是慢一分钟。
+    #[test]
+    fn backoff_does_not_grow_while_waiting_for_addresses() {
+        let mut d = DIAL_RETRY_INTERVAL;
+        for _ in 0..8 {
+            d = next_backoff(d, false, false, false);
+        }
+        assert!(d > DIAL_RETRY_INTERVAL, "前置条件：已退避到较大间隔");
+
+        assert_eq!(
+            next_backoff(d, false, true, false),
+            DIAL_RETRY_INTERVAL,
+            "地址还没到不是连不上，不该继续拉长间隔"
+        );
+    }
+
+    /// 设备表变过就复位：新设备是新的机会，不该继承此前攒下的长间隔。
+    #[test]
+    fn backoff_resets_when_the_device_table_changes() {
+        let mut d = DIAL_RETRY_INTERVAL;
+        for _ in 0..8 {
+            d = next_backoff(d, false, false, false);
+        }
+        assert_eq!(next_backoff(d, false, false, true), DIAL_RETRY_INTERVAL);
     }
 }
