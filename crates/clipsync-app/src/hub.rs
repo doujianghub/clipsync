@@ -309,11 +309,7 @@ impl HubState {
                 data,
                 compressed,
                 plain_len,
-            } => {
-                // 收发两侧都记：托盘图标据此脉冲，让"正在传大文件"一眼可辨。
-                self.deps.status.note_transfer();
-                self.on_file_chunk(&from, generation, file_id, offset, &data, compressed, plain_len)
-            }
+            } => self.on_file_chunk(&from, generation, file_id, offset, &data, compressed, plain_len),
 
             SyncMessage::FileDone {
                 generation,
