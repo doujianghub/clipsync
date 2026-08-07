@@ -39,6 +39,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Controls",
     "Win32_Foundation",
+    "Win32_System_LibraryLoader",
 ] }
 
 # macOS 上 tray-icon 依赖 NSApplication 的事件循环才能响应菜单点击。

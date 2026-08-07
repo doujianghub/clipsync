@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+
+  <!--
+    通用控件 v6。
+
+    没有这段声明，Windows 给进程加载的是 System32\comctl32.dll（5.82 兼容版），
+    里面**没有** TaskDialogIndirect——那正是我们要用的现代对话框。
+    顺带一提，v6 也是控件"长得像当代 Windows"的前提，v5 的按钮还是 XP 之前
+    的样子。
+  -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+          type="win32"
+          name="Microsoft.Windows.Common-Controls"
+          version="6.0.0.0"
+          processorArchitecture="*"
+          publicKeyToken="6595b64144ccf1df"
+          language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <!--
+    DPI 感知。
+
+    用清单声明比运行时调 API 更早也更可靠：进程一启动就生效，托盘图标与
+    对话框都不会再被系统按位图拉伸（那正是"标题清晰、内容发虚"的成因）。
+    PerMonitorV2 让窗口跨不同缩放的显示器时能重新按目标屏渲染；老系统读不懂
+    这个值会退回 true（系统级 DPI 感知），也够用。
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2,PerMonitor</dpiAwareness>
+      <!-- UTF-8 代码页：让 Win32 的 *A 系列 API 按 UTF-8 解释，避免中文路径
+           与文件名在某些第三方库里被按 GBK 处理而乱码。 -->
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+
+  <!-- 声明兼容的 Windows 版本，否则系统会按 Vista 兼容模式对待某些 API。 -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/><!-- Win10/11 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/><!-- Win8.1 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/><!-- Win8 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/><!-- Win7 -->
+    </application>
+  </compatibility>
+
+</assembly>
