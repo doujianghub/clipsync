@@ -17,12 +17,52 @@
 //! 低频操作用得上。
 
 use anyhow::{anyhow, Result};
-use windows_sys::core::PCWSTR;
+use windows_sys::core::{BOOL, HRESULT, PCWSTR};
 use windows_sys::Win32::UI::Controls::{
-    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
+    TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
     TDF_POSITION_RELATIVE_TO_WINDOW, TDF_USE_COMMAND_LINKS,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{IDCANCEL, IDNO, IDYES};
+
+/// `TaskDialogIndirect` 的签名，供运行时取址后调用。
+type TaskDialogIndirectFn = unsafe extern "system" fn(
+    *const TASKDIALOGCONFIG,
+    *mut i32,
+    *mut i32,
+    *mut BOOL,
+) -> HRESULT;
+
+/// 运行时解析 `TaskDialogIndirect`，**绝不静态链接**。
+///
+/// 这个函数只存在于 **comctl32 v6**，而 Windows 默认加载给进程的是
+/// `System32\comctl32.dll`（5.82 兼容版），里面没有它。静态导入的后果不是
+/// "功能不可用"，而是**程序根本起不来**——加载器在启动时解析不到符号就直接
+/// 报「无法定位程序输入点」。为一个锦上添花的对话框赔上整个程序的启动，
+/// 完全不划算。
+///
+/// v6 要靠应用清单声明才能拿到（见 `clipsync.manifest`）。清单万一没生效，
+/// 这里取址失败，调用方回退到 PowerShell 弹窗——程序照常运行。
+///
+/// 解析一次即缓存：失败也缓存，免得每次弹窗都白试一遍。
+fn task_dialog_fn() -> Option<TaskDialogIndirectFn> {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+
+    static RESOLVED: OnceLock<Option<usize>> = OnceLock::new();
+    let addr = *RESOLVED.get_or_init(|| {
+        let name: Vec<u16> = "comctl32.dll\0".encode_utf16().collect();
+        // SAFETY: 名字是以 NUL 结尾的 UTF-16；失败返回空句柄。
+        let lib = unsafe { LoadLibraryW(name.as_ptr()) };
+        if lib.is_null() {
+            return None;
+        }
+        // SAFETY: lib 有效；符号名是以 NUL 结尾的 ASCII。
+        let proc = unsafe { GetProcAddress(lib, c"TaskDialogIndirect".as_ptr() as *const u8) };
+        proc.map(|f| f as usize)
+    });
+    // SAFETY: 取到的地址确实是 TaskDialogIndirect，签名与上面的类型一致。
+    addr.map(|a| unsafe { std::mem::transmute::<usize, TaskDialogIndirectFn>(a) })
+}
 
 /// 自定义按钮的起始 ID。
 ///
@@ -116,17 +156,12 @@ fn base_config() -> TASKDIALOGCONFIG {
 
 /// 真正调用系统 API，返回被按下的按钮 ID。
 fn run(cfg: &TASKDIALOGCONFIG) -> Result<i32> {
+    let f = task_dialog_fn()
+        .ok_or_else(|| anyhow!("comctl32 未提供 TaskDialogIndirect（缺少 v6 清单）"))?;
     let mut pressed: i32 = 0;
     // SAFETY: cfg 内的所有字符串指针都指向调用方仍持有的 Vec；
     // pnRadioButton / pfVerificationFlagChecked 传空表示不使用这两项功能。
-    let hr = unsafe {
-        TaskDialogIndirect(
-            cfg,
-            &mut pressed,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
+    let hr = unsafe { f(cfg, &mut pressed, std::ptr::null_mut(), std::ptr::null_mut()) };
     if hr < 0 {
         return Err(anyhow!("TaskDialog 调用失败（HRESULT 0x{hr:08X}）"));
     }
