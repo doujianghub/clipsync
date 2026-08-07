@@ -181,8 +181,8 @@ ClipSync — 已连接 1 / 2 台
 > 注意：**必须用优化构建**。`cargo build`（debug）下同一传输需 15.5 秒（5.9 MB/s）——
 > 加密与哈希在 debug 下慢一个数量级。日常使用请用 `cargo build --release`。
 
-配置目录：
-- Windows：`%APPDATA%\ClipSync\`
+配置目录（日志在其下的 `logs/`）：
+- Windows：`%APPDATA%\ClipSync\` —— 即 `C:\Users\<你>\AppData\Roaming\ClipSync\`
 - macOS：`~/Library/Application Support/ClipSync/`
 
 ## 开发路线（里程碑）
