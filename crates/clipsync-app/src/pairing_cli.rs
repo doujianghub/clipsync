@@ -173,16 +173,23 @@ pub fn host(
     // 用户点掉，此时监听已就绪，对方可以随时连入，不会错过连接。
     //
     // 注意这里在后台线程调用，不涉及主线程 UI 约束（见 dialog 模块说明）。
+    // 弹窗必须与下面的 accept 循环**并行**。
+    //
+    // 它会一直阻塞到用户点掉，而配对握手需要我们主动 accept 并收发——先弹窗
+    // 再 accept 的后果是：对方 TCP 连上了（内核替我们完成三次握手，连接躺在
+    // backlog 里），发来 PAKE 消息却没人读，于是他那边一直等到超时。用户看到
+    // 的现象就是"必须先点掉配对码窗口，别人才连得上"。
+    //
+    // 早先注释说"先监听再弹才不会错过连接"——只对了一半：连接确实不会丢，
+    // 但握手不是内核能替我们完成的。
     if show_dialog {
-        crate::dialog::show_info_and_copy(
-            "ClipSync 配对",
-            &dialog_body(&code, sync_port, announcing),
-            &code.to_string(),
-        );
+        let body = dialog_body(&code, sync_port, announcing);
+        let code_str = code.to_string();
+        std::thread::spawn(move || {
+            crate::dialog::show_info_and_copy("ClipSync 配对", &body, &code_str);
+        });
     }
 
-    // 计时从**弹窗关闭后**开始：弹窗会阻塞本线程，用户盯着码看多久都不该
-    // 算进有效期里，否则慢慢念给对方听的过程能把会话耗光。
     let deadline = Instant::now() + HOST_SESSION_TIMEOUT;
     let mut failures = 0u32;
 

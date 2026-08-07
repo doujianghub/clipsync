@@ -117,3 +117,35 @@ fn repeated_introduction_is_idempotent() {
     known.upsert(peer("c", 3));
     assert_eq!(known.len(), 2, "同一设备被反复引荐仍只有一条");
 }
+
+/// 设备表一变，版本号就得变——各连接靠它知道"该重新引荐了"。
+///
+/// 没有它就只能定时轮询：A 与 B 连上时 B 还只认识 A，等 B 后来配了 C，
+/// 那条已建立的连接不会再引荐，A 要等一整个周期才知道 C 的存在。用户的
+/// 感受是"刚配完却没生效"。
+#[test]
+fn version_changes_on_every_mutation() {
+    let known = KnownPeers::new(vec![peer("a", 1)]);
+    let v0 = known.version();
+
+    known.upsert(peer("b", 2));
+    let v1 = known.version();
+    assert_ne!(v1, v0, "新增设备应推进版本");
+
+    // 覆盖已有设备（比如重新配对）同样是变化。
+    known.upsert(peer("b", 9));
+    let v2 = known.version();
+    assert_ne!(v2, v1, "更新已有设备也应推进版本");
+
+    assert!(known.remove(&peer("b", 9).device));
+    assert_ne!(known.version(), v2, "移除设备应推进版本");
+}
+
+/// 没真的改动时不该推进版本，否则每轮都会白引荐一次。
+#[test]
+fn version_stays_put_when_nothing_removed() {
+    let known = KnownPeers::new(vec![peer("a", 1)]);
+    let v = known.version();
+    assert!(!known.remove(&peer("ghost", 9).device));
+    assert_eq!(known.version(), v, "移除不存在的设备不算变化");
+}
