@@ -210,10 +210,17 @@ fn pick_setting<T: Copy>(
 }
 
 /// 单次上限的常用档。`usize::MAX` 表示不限。
+///
+/// 档位排得密一些是有意的：「自定义…」要弹文本输入框，而输入框是目前唯一
+/// 还依赖 PowerShell 子进程的路径，在某些 Windows 上并不可靠。档位覆盖得越
+/// 全，需要走那条路的人越少。
 const MAX_BYTES_PRESETS: &[(&str, usize)] = &[
     ("10 MiB", 10 << 20),
+    ("50 MiB", 50 << 20),
     ("100 MiB（默认）", 100 << 20),
+    ("200 MiB", 200 << 20),
     ("500 MiB", 500 << 20),
+    ("1 GiB", 1 << 30),
     ("2 GiB", 2 << 30),
     ("不限", usize::MAX),
 ];
@@ -221,10 +228,12 @@ const MAX_BYTES_PRESETS: &[(&str, usize)] = &[
 /// 发送限速的常用档。`0` 表示不限。
 const RATE_PRESETS: &[(&str, u64)] = &[
     ("不限（默认）", 0),
+    ("2 MB/s", 2_000_000),
     ("5 MB/s", 5_000_000),
     ("10 MB/s", 10_000_000),
     ("20 MB/s", 20_000_000),
     ("50 MB/s", 50_000_000),
+    ("100 MB/s", 100_000_000),
 ];
 
 fn prompt_max_bytes(settings: &config::SettingsHandle) {
@@ -299,18 +308,37 @@ mod tests {
     ///
     /// 这类常量表最容易手滑写错数量级（把 MiB 写成 MB、少一个零），而错了
     /// 之后界面显示的是"100 MiB"、实际生效的却是别的数——用户没法察觉。
+    ///
+    /// **按标签查而不是按下标**：加减档位是常事，按下标写死的断言会在每次
+    /// 增删时误报，最后只能靠改测试来"修"，久而久之就没人信它了。
     #[test]
     fn presets_match_their_labels() {
-        assert_eq!(MAX_BYTES_PRESETS[0], ("10 MiB", 10 * 1024 * 1024));
-        assert_eq!(MAX_BYTES_PRESETS[1].1, 100 * 1024 * 1024);
-        assert_eq!(MAX_BYTES_PRESETS[2].1, 500 * 1024 * 1024);
-        assert_eq!(MAX_BYTES_PRESETS[3].1, 2 * 1024 * 1024 * 1024);
-        assert_eq!(MAX_BYTES_PRESETS[4].1, usize::MAX, "「不限」应为最大值");
+        let by_label = |label: &str| -> usize {
+            MAX_BYTES_PRESETS
+                .iter()
+                .find(|(l, _)| *l == label)
+                .unwrap_or_else(|| panic!("找不到档位 {label}"))
+                .1
+        };
+        assert_eq!(by_label("10 MiB"), 10 * 1024 * 1024);
+        assert_eq!(by_label("100 MiB（默认）"), 100 * 1024 * 1024);
+        assert_eq!(by_label("500 MiB"), 500 * 1024 * 1024);
+        assert_eq!(by_label("1 GiB"), 1024 * 1024 * 1024);
+        assert_eq!(by_label("2 GiB"), 2 * 1024 * 1024 * 1024);
+        assert_eq!(by_label("不限"), usize::MAX);
 
         // 速率按 1000 进制（网络惯例，与 MB/s 的通常含义一致）。
-        assert_eq!(RATE_PRESETS[0].1, 0, "「不限」应为 0");
-        assert_eq!(RATE_PRESETS[2], ("10 MB/s", 10_000_000));
-        assert_eq!(RATE_PRESETS[4].1, 50_000_000);
+        let rate = |label: &str| -> u64 {
+            RATE_PRESETS
+                .iter()
+                .find(|(l, _)| *l == label)
+                .unwrap_or_else(|| panic!("找不到限速档 {label}"))
+                .1
+        };
+        assert_eq!(rate("不限（默认）"), 0);
+        assert_eq!(rate("10 MB/s"), 10_000_000);
+        assert_eq!(rate("50 MB/s"), 50_000_000);
+        assert_eq!(rate("100 MB/s"), 100_000_000);
     }
 
     /// 档位应当递增，否则列表读起来很怪。
