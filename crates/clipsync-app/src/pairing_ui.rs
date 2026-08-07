@@ -166,12 +166,16 @@ pub(crate) fn unpair_interactive(pairing: &PairingDeps, device_id: &str) {
         .map(|p| p.name)
         .unwrap_or_else(|| device_id.to_string());
 
+    // 后果必须说全。解除不只是"断开这一次"——它还会把设备记进拒绝名单，
+    // 此后别的设备再引荐它也一概不收。不写出来的话，用户日后会遇到
+    // "引荐怎么不工作了"，而完全想不到是自己点过这里。
     if !dialog::confirm(
-        "ClipSync 解除配对",
+        "解除配对",
         &format!(
             "确定要解除与「{name}」的配对吗？\n\n\
-             解除后双方将立即断开、不再同步。\n\
-             要恢复需要重新走一次配对流程。"
+             解除后立即断开、不再同步，\n\
+             也不会再经由其它设备自动加回。\n\
+             想恢复的话，重新配对一次即可。"
         ),
     ) {
         return;
