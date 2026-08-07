@@ -173,14 +173,17 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(status.summary())
-        .with_icon(make_icon(IconState::of(&status))?)
+        .with_icon(make_icon(IconState::of(&status), false)?)
         .build()
         .map_err(|e| anyhow::anyhow!("创建托盘图标失败: {e}"))?;
 
     let menu_rx = MenuEvent::receiver();
     let mut last_summary = status.summary();
 
-    let mut current_icon = IconState::of(&status);
+    // 当前画着的图标：状态 + 脉冲相位。两者任一变化才重画——托盘循环每
+    // 200ms 转一圈，无脑重画等于一秒生成五张图标，白费 CPU。
+    let mut current_icon = (IconState::of(&status), false);
+    let loop_started = std::time::Instant::now();
 
     loop {
         // 让平台处理其自身的窗口/菜单消息。
@@ -266,9 +269,14 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
             // 汇总变了意味着连接数变了，设备子菜单里的 ●/○ 也该跟着变。
             peer_items = rebuild_peer_menu(&peers_menu, &(callbacks.current_peers)())?;
         }
-        let icon_state = IconState::of(&status);
+        // 传输中让图标脉冲：亮 / 淡各 450ms。周期取得比 200ms 的循环间隔长
+        // 得多，免得相位被采样节奏切碎而看起来在抖。
+        const PULSE_HALF_PERIOD_MS: u128 = 450;
+        let dimmed = status.is_transferring()
+            && (loop_started.elapsed().as_millis() / PULSE_HALF_PERIOD_MS) % 2 == 1;
+        let icon_state = (IconState::of(&status), dimmed);
         if icon_state != current_icon {
-            if let Ok(icon) = make_icon(icon_state) {
+            if let Ok(icon) = make_icon(icon_state.0, icon_state.1) {
                 let _ = tray.set_icon(Some(icon));
             }
             current_icon = icon_state;
@@ -340,4 +348,19 @@ mod tests {
             "克隆出的句柄应看到同一份暂停状态（中枢与托盘共享）"
         );
     }
+
+    /// 传输活动过期后脉冲必须自己停下。
+    ///
+    /// 这正是选"最后活动时刻"而不是"进行中计数"的理由：计数要在收发两侧
+    /// 各处出口精确配对增减，漏掉任何一条错误路径就永久泄漏，表现是图标
+    /// 一直闪个不停——只在出错后才显现、且很难查。
+    #[test]
+    fn transfer_pulse_expires_on_its_own() {
+        let s = TrayStatus::new(1);
+        assert!(!s.is_transferring(), "从未传输过就不该脉冲");
+
+        s.note_transfer();
+        assert!(s.is_transferring(), "刚传完分块应处于脉冲状态");
+    }
+
 }

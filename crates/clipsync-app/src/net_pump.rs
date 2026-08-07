@@ -112,6 +112,7 @@ pub(super) fn pump(
                         Ok(Some(msg)) => {
                             let done = matches!(msg, SyncMessage::FileDone { .. });
                             conn.send(&msg).context("发送文件分块失败")?;
+                            ctx.status.note_transfer();
                             if done {
                                 finished = true;
                                 break;

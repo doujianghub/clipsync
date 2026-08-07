@@ -108,6 +108,8 @@ pub struct NetCtx {
     pub sync_port: u16,
     /// 配置目录：把对端引荐来的新设备落盘，否则重启就忘了。
     pub config_dir: std::path::PathBuf,
+    /// 托盘状态：发文件分块时打个点，图标据此脉冲。
+    pub status: crate::tray::TrayStatus,
 }
 
 /// 从设置取发送限速。`0` 表示不限速（`RateLimiter` 自身也把 0 当无限制，

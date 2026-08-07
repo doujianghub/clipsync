@@ -246,6 +246,7 @@ fn run_sync(
     let identity_for_tray = identity.clone();
     let ctx = net_manager::NetCtx {
         local_device: device_id.clone(),
+        status: status.clone(),
         identity: Arc::new(identity),
         known: known.clone(),
         hub: hub.clone(),
