@@ -121,6 +121,74 @@ $r = [System.Windows.Forms.MessageBox]::Show(
 if ($r -eq [System.Windows.Forms.DialogResult]::Yes) { [Console]::Out.Write("yes") }
 "#;
 
+/// 列表选择。选项经环境变量以换行分隔传入，脚本体不做拼接。
+///
+/// 与输入框同样的字体与 DPI 处理：Segoe UI + PerMonitorV2，否则高缩放屏上
+/// 文字会因位图拉伸而发虚。
+const CHOOSE_SCRIPT: &str = r#"Add-Type -AssemblyName System.Windows.Forms, System.Drawing | Out-Null
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = $env:CLIPSYNC_DLG_TITLE
+$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$form.ClientSize = New-Object System.Drawing.Size(340, 260)
+
+$label = New-Object System.Windows.Forms.Label
+$label.Text = $env:CLIPSYNC_DLG_BODY
+$label.SetBounds(16, 14, 308, 32)
+$form.Controls.Add($label)
+
+$list = New-Object System.Windows.Forms.ListBox
+$list.SetBounds(16, 50, 308, 160)
+$list.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+foreach ($item in $env:CLIPSYNC_DLG_ITEMS -split "`n") {
+  if ($item -ne '') { [void]$list.Items.Add($item) }
+}
+if ($list.Items.Count -gt 0) { $list.SelectedIndex = 0 }
+$form.Controls.Add($list)
+
+$ok = New-Object System.Windows.Forms.Button
+$ok.Text = '确定'
+$ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$ok.SetBounds(156, 222, 80, 26)
+$form.Controls.Add($ok)
+
+$cancel = New-Object System.Windows.Forms.Button
+$cancel.Text = '取消'
+$cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$cancel.SetBounds(244, 222, 80, 26)
+$form.Controls.Add($cancel)
+
+$form.AcceptButton = $ok
+$form.CancelButton = $cancel
+$form.Topmost = $true
+# 双击列表项等同于确定——省一次点击。
+$list.Add_DoubleClick({ $form.DialogResult = [System.Windows.Forms.DialogResult]::OK })
+
+if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK -and $list.SelectedIndex -ge 0) {
+  [Console]::Out.Write($list.SelectedIndex)
+}
+"#;
+
+pub fn choose(title: &str, body: &str, items: &[String]) -> Result<Option<usize>> {
+    let joined = items.join("\n");
+    let out = run_powershell_env(
+        CHOOSE_SCRIPT,
+        &[
+            ("CLIPSYNC_DLG_TITLE", title),
+            ("CLIPSYNC_DLG_BODY", body),
+            ("CLIPSYNC_DLG_ITEMS", &joined),
+        ],
+        true,
+    )?;
+    Ok(out.and_then(|s| s.trim().parse::<usize>().ok()).filter(|i| *i < items.len()))
+}
+
 pub fn confirm(title: &str, body: &str) -> Result<bool> {
     Ok(run_powershell(CONFIRM_SCRIPT, title, body, true)?
         .map(|s| s.trim() == "yes")
@@ -137,6 +205,19 @@ fn run_powershell(
     body: &str,
     capture: bool,
 ) -> Result<Option<String>> {
+    run_powershell_env(
+        script,
+        &[("CLIPSYNC_DLG_TITLE", title), ("CLIPSYNC_DLG_BODY", body)],
+        capture,
+    )
+}
+
+/// 运行一段 PowerShell 脚本，用户内容经环境变量传入（脚本体不做拼接）。
+fn run_powershell_env(
+    script: &str,
+    env: &[(&str, &str)],
+    capture: bool,
+) -> Result<Option<String>> {
     use std::io::Write;
 
     let stdout = if capture {
@@ -144,10 +225,12 @@ fn run_powershell(
     } else {
         std::process::Stdio::null()
     };
-    let mut child = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
-        .env("CLIPSYNC_DLG_TITLE", title)
-        .env("CLIPSYNC_DLG_BODY", body)
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", "-"]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .stdin(std::process::Stdio::piped())
         .stdout(stdout)
         .stderr(std::process::Stdio::null())
