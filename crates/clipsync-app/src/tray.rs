@@ -19,6 +19,8 @@ pub struct StatusData {
     pub connected: usize,
     /// 已配对设备总数。
     pub paired: usize,
+    /// 当前在线的设备 ID 集合，用于在设备列表里标出 ●/○。
+    pub connected_ids: std::collections::HashSet<String>,
 }
 
 /// 线程安全的状态句柄：中枢更新，托盘读取。
@@ -26,6 +28,8 @@ pub struct StatusData {
 pub struct TrayStatus {
     data: Arc<Mutex<StatusData>>,
     paused: Arc<AtomicBool>,
+    /// 同步中枢是否已停止工作（异常退出）。
+    hub_dead: Arc<AtomicBool>,
 }
 
 impl TrayStatus {
@@ -34,13 +38,23 @@ impl TrayStatus {
             data: Arc::new(Mutex::new(StatusData {
                 connected: 0,
                 paired,
+                connected_ids: std::collections::HashSet::new(),
             })),
             paused: Arc::new(AtomicBool::new(false)),
+            hub_dead: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub fn set_connected(&self, n: usize) {
-        self.data.lock().unwrap().connected = n;
+    /// 更新在线设备集合（同时刷新计数，避免两者脱节）。
+    pub fn set_connected_ids(&self, ids: std::collections::HashSet<String>) {
+        let mut g = self.data.lock().unwrap();
+        g.connected = ids.len();
+        g.connected_ids = ids;
+    }
+
+    /// 当前在线的设备 ID。
+    pub fn connected_devices(&self) -> std::collections::HashSet<String> {
+        self.data.lock().unwrap().connected_ids.clone()
     }
 
     /// 更新已配对设备总数。
@@ -63,8 +77,24 @@ impl TrayStatus {
         self.paused.store(paused, Ordering::SeqCst);
     }
 
+    /// 标记同步中枢已停止工作。
+    ///
+    /// 中枢线程若因意外退出，所有同步都会静默停止，而托盘图标还是绿的、
+    /// 菜单还写着"已连接 N 台"——用户根本无从察觉，只会觉得"复制了怎么没
+    /// 过去"。宁可明确显示故障，也不要给一个骗人的正常状态。
+    pub fn set_hub_dead(&self) {
+        self.hub_dead.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_hub_dead(&self) -> bool {
+        self.hub_dead.load(Ordering::SeqCst)
+    }
+
     /// 一句话状态描述，用于托盘提示文本。
     pub fn summary(&self) -> String {
+        if self.is_hub_dead() {
+            return "ClipSync — 同步已停止（请重启程序）".to_string();
+        }
         if self.is_paused() {
             return "ClipSync — 已暂停".to_string();
         }
@@ -88,11 +118,16 @@ pub enum IconState {
     Disconnected,
     /// 用户主动暂停。
     Paused,
+    /// 同步中枢已停止——功能实际不可用。
+    Broken,
 }
 
 impl IconState {
     pub fn of(status: &TrayStatus) -> Self {
-        if status.is_paused() {
+        // 故障优先于一切：这时候显示"已连接"是彻头彻尾的误导。
+        if status.is_hub_dead() {
+            IconState::Broken
+        } else if status.is_paused() {
             IconState::Paused
         } else if status.snapshot().connected > 0 {
             IconState::Connected
@@ -110,6 +145,8 @@ impl IconState {
             IconState::Disconnected => (0x8A, 0x8A, 0x8A),
             // 琥珀：已暂停
             IconState::Paused => (0xE0, 0xA0, 0x30),
+            // 红：出故障了，与"暂停"的琥珀明确区分开
+            IconState::Broken => (0xD0, 0x3A, 0x3A),
         }
     }
 }
@@ -206,7 +243,8 @@ impl Rect {
 }
 
 /// 托盘菜单被点击后需要主程序执行的动作。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// 不再是 Copy：`Unpair` 携带 device id。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayAction {
     TogglePause,
     ToggleAutostart,
@@ -225,12 +263,36 @@ pub enum TrayAction {
     SetMaxBytes(usize),
     /// 设置发送限速（字节/秒，0 为不限速）。
     SetUploadLimit(u64),
+    /// 弹输入框自定义单次大小上限。
+    PromptMaxBytes,
+    /// 弹输入框自定义发送限速。
+    PromptUploadLimit,
+    /// 弹输入框修改同步监听端口。
+    PromptListenPort,
+    /// 解除与某台设备的配对（携带其 device id）。
+    Unpair(String),
+    /// 打开日志所在文件夹。
+    OpenLogDir,
+    /// 切换详细日志（info ↔ debug）。
+    ToggleVerboseLog,
+}
+
+/// 托盘要展示的一台已配对设备。
+#[derive(Debug, Clone)]
+pub struct TrayPeer {
+    pub device: String,
+    pub name: String,
+    pub online: bool,
 }
 
 /// 单次大小上限的预设档。`usize::MAX` 表示不限制。
 ///
-/// 只给几个常用档而非任意输入：托盘菜单没有输入框，且这几档已覆盖绝大多数
-/// 场景；需要精确值的用户仍可直接改 `settings.json`。
+/// 预设档覆盖常见场景，档位之外由子菜单末尾的「自定义…」承接——它会弹一个
+/// 输入框，接受 `500MB`、`1.5GiB` 这类写法。
+///
+/// （早先这里写的是"托盘菜单没有输入框，需要精确值的用户可直接改
+/// `settings.json`"。自从配对流程引入 `dialog::prompt` 后这个前提就不成立了，
+/// 而让用户去翻 `~/Library/Application Support/` 手改 JSON 显然不是好答案。）
 const MAX_BYTES_PRESETS: &[(&str, usize)] = &[
     ("10 MiB", 10 * 1024 * 1024),
     ("100 MiB（默认）", 100 * 1024 * 1024),
@@ -255,6 +317,50 @@ pub struct TraySettings {
     pub compress: bool,
     pub max_bytes: usize,
     pub upload_limit: u64,
+    pub listen_port: u16,
+    pub verbose_log: bool,
+}
+
+/// 「自定义…」项的标签。当前值不在预设档里时带上实际数值，让用户一眼看出
+/// 现在生效的是多少——否则子菜单里一个勾都没有，会显得像没设置过。
+fn custom_label_bytes(current: usize) -> String {
+    if MAX_BYTES_PRESETS.iter().any(|(_, v)| *v == current) {
+        "自定义…".to_string()
+    } else {
+        format!("自定义…（当前 {}）", human_bytes(current))
+    }
+}
+
+fn custom_label_rate(current: u64) -> String {
+    if UPLOAD_LIMIT_PRESETS.iter().any(|(_, v)| *v == current) {
+        "自定义…".to_string()
+    } else {
+        format!("自定义…（当前 {}/s）", human_bytes(current as usize))
+    }
+}
+
+/// 把字节数写成人能读的形式。挑最合适的单位，避免出现 "0.00 GiB" 这种。
+fn human_bytes(n: usize) -> String {
+    if n == usize::MAX {
+        return "不限制".to_string();
+    }
+    const UNITS: &[(&str, usize)] = &[
+        ("GiB", 1 << 30),
+        ("MiB", 1 << 20),
+        ("KiB", 1 << 10),
+    ];
+    for (unit, size) in UNITS {
+        if n >= *size {
+            let v = n as f64 / *size as f64;
+            // 整数倍就不显示小数位，"100 MiB" 比 "100.0 MiB" 干净。
+            return if (v.fract()).abs() < 0.05 {
+                format!("{:.0} {unit}", v)
+            } else {
+                format!("{v:.1} {unit}")
+            };
+        }
+    }
+    format!("{n} B")
 }
 
 /// 托盘运行所需的回调。
@@ -263,6 +369,57 @@ pub struct TrayCallbacks {
     pub on_action: Box<dyn FnMut(TrayAction) -> bool>,
     /// 读取当前设置，用于点击后刷新勾选状态（以实际结果为准，避免脱节）。
     pub current_settings: Box<dyn Fn() -> TraySettings>,
+    /// 读取当前已配对设备及其在线状态，用于渲染设备子菜单。
+    pub current_peers: Box<dyn Fn() -> Vec<TrayPeer>>,
+    /// 同步中枢是否仍在运行。托盘每轮询问一次；一旦为 false 就切到故障状态。
+    pub hub_alive: Box<dyn Fn() -> bool>,
+}
+
+/// 重建「已配对设备」子菜单。
+///
+/// 设备列表在运行期会变（配对、解除配对），而菜单项是构建时创建的，所以每次
+/// 变化都要整体重来一遍。返回新的 (菜单项, device id) 映射供点击时反查。
+///
+/// 列表为空时放一个禁用的提示项而不是留空白——空子菜单在两个平台上都显示为
+/// 一个什么都没有的小方块，看着像坏了。
+fn rebuild_peer_menu(
+    menu: &tray_icon::menu::Submenu,
+    old: &[(tray_icon::menu::MenuItem, String)],
+    peers: &[TrayPeer],
+) -> anyhow::Result<Vec<(tray_icon::menu::MenuItem, String)>> {
+    use tray_icon::menu::MenuItem;
+
+    for (item, _) in old {
+        let _ = menu.remove(item);
+    }
+    // 上一轮的占位项也要清掉，否则会越堆越多。
+    for item in menu.items() {
+        let _ = menu.remove_at(0);
+        drop(item);
+    }
+
+    let mut mapping = Vec::with_capacity(peers.len());
+    if peers.is_empty() {
+        let empty = MenuItem::new("（尚未配对任何设备）", false, None);
+        menu.append(&empty)
+            .map_err(|e| anyhow::anyhow!("构建设备子菜单失败: {e}"))?;
+        return Ok(mapping);
+    }
+
+    for p in peers {
+        // ● 在线 / ○ 离线，一眼能看出哪台连着。文案写明点击的后果——
+        // 这是个破坏性操作，不能让人以为只是查看详情。
+        let label = format!(
+            "{} {} — 解除配对",
+            if p.online { '●' } else { '○' },
+            p.name
+        );
+        let item = MenuItem::new(label, true, None);
+        menu.append(&item)
+            .map_err(|e| anyhow::anyhow!("构建设备子菜单失败: {e}"))?;
+        mapping.push((item, p.device.clone()));
+    }
+    Ok(mapping)
 }
 
 /// 在**主线程**上创建托盘并运行事件循环，直到用户选择退出。
@@ -297,33 +454,48 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
 
     // 预设档用一组 CheckMenuItem 手工做成单选：muda 没有原生 radio 项，
     // 点击后由我们把同组其它项取消勾选。
+    // 预设档 + 末尾的「自定义…」。自定义项做成普通菜单项而非勾选项：
+    // 它是个动作（弹输入框），不是一个可勾选的状态。当前值不在任何预设档里
+    // 时，标签会带上实际数值，让用户一眼看出"现在是自定义的多少"。
     let max_items: Vec<CheckMenuItem> = MAX_BYTES_PRESETS
         .iter()
         .map(|(label, v)| CheckMenuItem::new(*label, true, s0.max_bytes == *v, None))
         .collect();
+    let max_custom = MenuItem::new(custom_label_bytes(s0.max_bytes), true, None);
     let max_menu = Submenu::new("单次大小上限", true);
-    max_menu
-        .append_items(
-            &max_items
-                .iter()
-                .map(|i| i as &dyn tray_icon::menu::IsMenuItem)
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| anyhow::anyhow!("构建上限子菜单失败: {e}"))?;
+    {
+        let mut items: Vec<&dyn tray_icon::menu::IsMenuItem> =
+            max_items.iter().map(|i| i as &dyn tray_icon::menu::IsMenuItem).collect();
+        items.push(&max_custom);
+        max_menu
+            .append_items(&items)
+            .map_err(|e| anyhow::anyhow!("构建上限子菜单失败: {e}"))?;
+    }
 
     let rate_items: Vec<CheckMenuItem> = UPLOAD_LIMIT_PRESETS
         .iter()
         .map(|(label, v)| CheckMenuItem::new(*label, true, s0.upload_limit == *v, None))
         .collect();
+    let rate_custom = MenuItem::new(custom_label_rate(s0.upload_limit), true, None);
     let rate_menu = Submenu::new("发送限速", true);
-    rate_menu
-        .append_items(
-            &rate_items
-                .iter()
-                .map(|i| i as &dyn tray_icon::menu::IsMenuItem)
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| anyhow::anyhow!("构建限速子菜单失败: {e}"))?;
+    {
+        let mut items: Vec<&dyn tray_icon::menu::IsMenuItem> =
+            rate_items.iter().map(|i| i as &dyn tray_icon::menu::IsMenuItem).collect();
+        items.push(&rate_custom);
+        rate_menu
+            .append_items(&items)
+            .map_err(|e| anyhow::anyhow!("构建限速子菜单失败: {e}"))?;
+    }
+
+    let port_item = MenuItem::new(format!("同步端口：{}…", s0.listen_port), true, None);
+
+    // 已配对设备：列出每台及其在线状态，点击可解除配对。
+    let peers_menu = Submenu::new("已配对设备", true);
+    let mut peer_items = rebuild_peer_menu(&peers_menu, &[], &(callbacks.current_peers)())?;
+
+    // 日志：出问题时用户唯一能自查的东西，入口要好找。
+    let verbose_item = CheckMenuItem::new("详细日志（排查问题用）", true, s0.verbose_log, None);
+    let log_dir_item = MenuItem::new("打开日志文件夹…", true, None);
 
     let pause_item = CheckMenuItem::new("暂停同步", true, status.is_paused(), None);
     let autostart_item =
@@ -335,15 +507,19 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
         &PredefinedMenuItem::separator(),
         &pair_item,
         &join_item,
+        &peers_menu,
         &PredefinedMenuItem::separator(),
         &send_images_item,
         &send_files_item,
         &max_menu,
         &rate_menu,
         &compress_item,
+        &port_item,
         &PredefinedMenuItem::separator(),
         &pause_item,
         &autostart_item,
+        &verbose_item,
+        &log_dir_item,
         &PredefinedMenuItem::separator(),
         &quit_item,
     ])
@@ -382,6 +558,20 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
                 Some(TrayAction::ToggleSendFiles)
             } else if event.id == compress_item.id() {
                 Some(TrayAction::ToggleCompress)
+            } else if event.id == max_custom.id() {
+                Some(TrayAction::PromptMaxBytes)
+            } else if event.id == rate_custom.id() {
+                Some(TrayAction::PromptUploadLimit)
+            } else if event.id == port_item.id() {
+                Some(TrayAction::PromptListenPort)
+            } else if event.id == verbose_item.id() {
+                Some(TrayAction::ToggleVerboseLog)
+            } else if event.id == log_dir_item.id() {
+                Some(TrayAction::OpenLogDir)
+            } else if let Some((_, device)) =
+                peer_items.iter().find(|(i, _)| i.id() == &event.id)
+            {
+                Some(TrayAction::Unpair(device.clone()))
             } else {
                 // 两组预设档：按 id 找到被点的那一项。
                 max_items
@@ -417,7 +607,21 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
                 for (item, (_, v)) in rate_items.iter().zip(UPLOAD_LIMIT_PRESETS) {
                     item.set_checked(s.upload_limit == *v);
                 }
+                // 自定义项的标签带着当前值，改完要跟着变；端口项同理。
+                max_custom.set_text(custom_label_bytes(s.max_bytes));
+                rate_custom.set_text(custom_label_rate(s.upload_limit));
+                port_item.set_text(format!("同步端口：{}…", s.listen_port));
+                verbose_item.set_checked(s.verbose_log);
+                // 解除配对会改变设备列表，重建一次。
+                peer_items =
+                    rebuild_peer_menu(&peers_menu, &peer_items, &(callbacks.current_peers)())?;
             }
+        }
+
+        // 中枢若已停止，同步实际已经不工作了——必须让界面如实反映，
+        // 否则用户对着一个绿图标怎么也想不通"为什么复制过不去"。
+        if !status.is_hub_dead() && !(callbacks.hub_alive)() {
+            status.set_hub_dead();
         }
 
         // 状态变化时刷新图标与文字。
@@ -426,6 +630,8 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
             status_item.set_text(&summary);
             let _ = tray.set_tooltip(Some(&summary));
             last_summary = summary;
+            // 汇总变了意味着连接数变了，设备子菜单里的 ●/○ 也该跟着变。
+            peer_items = rebuild_peer_menu(&peers_menu, &peer_items, &(callbacks.current_peers)())?;
         }
         let icon_state = IconState::of(&status);
         if icon_state != current_icon {
@@ -521,7 +727,7 @@ mod tests {
         let s = TrayStatus::new(2);
         assert!(s.summary().contains("未连接"));
 
-        s.set_connected(1);
+        s.set_connected_ids(["dev-a".to_string()].into_iter().collect());
         assert!(s.summary().contains("已连接 1 / 2"));
 
         s.set_paused(true);
@@ -533,7 +739,7 @@ mod tests {
         let s = TrayStatus::new(1);
         assert_eq!(IconState::of(&s), IconState::Disconnected);
 
-        s.set_connected(1);
+        s.set_connected_ids(["dev-a".to_string()].into_iter().collect());
         assert_eq!(IconState::of(&s), IconState::Connected);
 
         // 暂停优先于连接状态——用户主动暂停时应明确显示。
@@ -558,6 +764,46 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(b, c);
         assert_ne!(a, c);
+    }
+
+    /// 中枢停止后，界面不得再显示"一切正常"。
+    ///
+    /// 同步已经彻底不工作了，而托盘图标还是绿的、菜单还写着"已连接 N 台"
+    /// ——用户对着这个界面永远想不通"为什么复制过不去"。
+    #[test]
+    fn dead_hub_overrides_healthy_looking_state() {
+        let s = TrayStatus::new(2);
+        s.set_connected_ids(["dev-a".to_string()].into_iter().collect());
+        assert_eq!(IconState::of(&s), IconState::Connected);
+
+        s.set_hub_dead();
+        assert_eq!(
+            IconState::of(&s),
+            IconState::Broken,
+            "中枢已死时不能还显示已连接"
+        );
+        assert!(
+            s.summary().contains("同步已停止"),
+            "文字也要如实说明，实际: {}",
+            s.summary()
+        );
+    }
+
+    /// 故障优先于暂停：两者都成立时该显示故障，暂停是用户自己知道的事。
+    #[test]
+    fn broken_takes_precedence_over_paused() {
+        let s = TrayStatus::new(1);
+        s.set_paused(true);
+        s.set_hub_dead();
+        assert_eq!(IconState::of(&s), IconState::Broken);
+    }
+
+    #[test]
+    fn broken_icon_is_visually_distinct() {
+        let broken = draw_clipboard(IconState::Broken);
+        for other in [IconState::Connected, IconState::Disconnected, IconState::Paused] {
+            assert_ne!(broken, draw_clipboard(other), "故障图标应与 {other:?} 有区别");
+        }
     }
 
     #[test]

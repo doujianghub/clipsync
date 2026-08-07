@@ -89,6 +89,13 @@ pub struct OutgoingStream {
     buf: Vec<u8>,
     /// 本文件是否值得压缩（开流时采样判定一次，之后各块沿用）。
     compress: bool,
+    /// 从头开始发送时，边读边算的内容哈希。
+    ///
+    /// `None` 表示这是一次**续传**（起始偏移不为 0）——前半段的字节我们根本
+    /// 没读过，无从增量计算，只能在结尾重读整个文件。完整传输则不必：
+    /// 反正每个字节都要过一遍手，顺手喂给哈希器就是了，省掉一次全量磁盘读。
+    /// 90MB 的文件，这一次重读是实打实的开销。
+    running_hash: Option<clipsync_core::hash::Hasher>,
 }
 
 impl OutgoingStream {
@@ -121,6 +128,8 @@ impl OutgoingStream {
             offset,
             buf: vec![0u8; CHUNK_SIZE],
             compress,
+            // 只有从头发才能边读边算；续传缺了前半段，结尾仍需重读一遍。
+            running_hash: (offset == 0).then(clipsync_core::hash::Hasher::new),
         })
     }
 
@@ -140,10 +149,14 @@ impl OutgoingStream {
             .read(&mut self.buf[..want])
             .context("读取待发送文件失败")?;
         if n == 0 {
-            // 读到结尾：计算整份内容的哈希供对端校验。
-            // 此处才计算是有意为之——续传时我们只读了文件的后半段，无法边读边算
-            // 出完整哈希；而这一次完整读取也顺带验证了文件当前确实可读。
-            let content_hash = hash_file(&self.path).context("计算发送文件哈希失败")?;
+            // 读到结尾：给出整份内容的哈希供对端校验。
+            //
+            // 从头发的情况下，每个字节刚才都过了一遍手，增量算出来即可；
+            // 续传则只读了后半段，无从增量，仍需重读整个文件。
+            let content_hash = match self.running_hash.take() {
+                Some(h) => h.finish(),
+                None => hash_file(&self.path).context("计算发送文件哈希失败")?,
+            };
             return Ok(Some(SyncMessage::FileDone {
                 generation: self.generation,
                 file_id: self.file_id,
@@ -152,6 +165,9 @@ impl OutgoingStream {
         }
 
         let plain = &self.buf[..n];
+        if let Some(h) = self.running_hash.as_mut() {
+            h.update(plain);
+        }
         let (data, compressed) = if self.compress {
             match crate::compress::compress(plain) {
                 // 压完反而更大就退回原始字节（极少见，但没必要白费带宽）。
@@ -283,6 +299,122 @@ mod tests {
 
         let m3 = s.next_message(CHUNK_SIZE).unwrap().unwrap();
         assert!(matches!(m3, SyncMessage::FileDone { .. }), "末条应为完成消息");
+    }
+
+    /// **关键正确性**：边读边算的哈希必须与重读整个文件算出的完全一致。
+    ///
+    /// 两者不一致的话，对端在 `finalize` 校验时会判定内容损坏并丢弃重传——
+    /// 表现为文件永远同步不过去，而且日志里只说"校验失败"，根本想不到是
+    /// 发送端算错了。用多块（跨越 CHUNK_SIZE 边界）来确保增量路径真的被走到。
+    #[test]
+    fn incremental_hash_matches_full_reread() {
+        let data: Vec<u8> = (0..(CHUNK_SIZE * 2 + 1234)).map(|i| (i % 251) as u8).collect();
+        let p = write_temp("hash_equiv.bin", &data);
+
+        // 从头发送：走增量路径。
+        let mut s = OutgoingStream::start(1, 1, p.clone(), 0, false).unwrap();
+        let mut incremental = None;
+        while let Some(msg) = s.next_message(CHUNK_SIZE).unwrap() {
+            if let SyncMessage::FileDone { content_hash, .. } = msg {
+                incremental = Some(content_hash);
+                break;
+            }
+        }
+
+        let full = hash_file(&p).unwrap();
+        assert_eq!(
+            incremental.expect("应产出 FileDone"),
+            full,
+            "增量哈希与重读结果不一致——对端会判定内容损坏并永远重传"
+        );
+    }
+
+    /// 续传路径没有前半段字节，必须退回重读整个文件，且结果同样正确。
+    #[test]
+    fn resumed_transfer_still_hashes_whole_file() {
+        let data: Vec<u8> = (0..5000).map(|i| (i % 97) as u8).collect();
+        let p = write_temp("hash_resume.bin", &data);
+
+        let mut s = OutgoingStream::start(1, 1, p.clone(), 2000, false).unwrap();
+        assert!(
+            s.running_hash.is_none(),
+            "续传不该启用增量哈希——前 2000 字节根本没读过"
+        );
+
+        let mut got = None;
+        while let Some(msg) = s.next_message(CHUNK_SIZE).unwrap() {
+            if let SyncMessage::FileDone { content_hash, .. } = msg {
+                got = Some(content_hash);
+                break;
+            }
+        }
+        assert_eq!(
+            got.unwrap(),
+            hash_file(&p).unwrap(),
+            "续传给出的必须是**整个文件**的哈希，不是后半段的"
+        );
+    }
+
+    /// 压缩开启时哈希仍应基于**原始**字节，而不是压缩后的。
+    #[test]
+    fn hash_covers_plaintext_not_compressed_bytes() {
+        let data = vec![b'Z'; 200_000]; // 高度可压
+        let p = write_temp("hash_compressed.bin", &data);
+
+        let mut s = OutgoingStream::start(1, 1, p.clone(), 0, true).unwrap();
+        let mut got = None;
+        while let Some(msg) = s.next_message(CHUNK_SIZE).unwrap() {
+            if let SyncMessage::FileDone { content_hash, .. } = msg {
+                got = Some(content_hash);
+                break;
+            }
+        }
+        assert_eq!(
+            got.unwrap(),
+            hash_file(&p).unwrap(),
+            "压缩不该影响内容哈希——对端解压后校验的是原始内容"
+        );
+    }
+
+    /// 手动基准：量化"省掉一次全量重读"到底值多少。
+    ///
+    /// 默认 `#[ignore]`——它要写一个 90MB 的临时文件，不适合每次 `cargo test`
+    /// 都跑。**必须用优化构建**，debug 下哈希慢一个数量级会把差异淹掉：
+    ///
+    /// ```text
+    /// cargo test --release -p clipsync-app --bin clipsync -- --ignored hash_benchmark --nocapture
+    /// ```
+    #[test]
+    #[ignore = "会写 90MB 临时文件，且需 --release 才有意义"]
+    fn hash_benchmark() {
+        let size = 90 * 1024 * 1024;
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let p = write_temp("hash_bench.bin", &data);
+
+        let run = |offset: u64| {
+            let t = std::time::Instant::now();
+            let mut s = OutgoingStream::start(1, 1, p.clone(), offset, false).unwrap();
+            while let Some(m) = s.next_message(CHUNK_SIZE).unwrap() {
+                if matches!(m, SyncMessage::FileDone { .. }) {
+                    break;
+                }
+            }
+            t.elapsed()
+        };
+
+        let incremental = run(0); // 边读边算
+        let reread = run(1); // 续传路径：结尾重读整个文件
+
+        println!("90MB 文件：");
+        println!("  边读边算（完整传输）: {incremental:?}");
+        println!("  重读一遍（续传路径）: {reread:?}");
+        println!(
+            "  省下: {:?}（{:.0}%）",
+            reread.saturating_sub(incremental),
+            (reread.as_secs_f64() - incremental.as_secs_f64()) / reread.as_secs_f64() * 100.0
+        );
+
+        let _ = std::fs::remove_file(&p);
     }
 
     /// 续传：从指定偏移开始只发送剩余部分。

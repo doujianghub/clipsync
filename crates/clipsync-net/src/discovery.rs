@@ -18,6 +18,8 @@
 //! （见 [`crate::peer`] 与 `SyncMessage::Addresses`）。
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -193,13 +195,31 @@ pub struct PairingHost {
     pub addr: SocketAddr,
 }
 
+/// 配对宣告的运行句柄。**丢弃即停止宣告。**
+///
+/// 早先的实现返回 `JoinHandle` 并声明"句柄被丢弃时线程仍继续运行——配对进程
+/// 本身是短命的，进程退出即停止"。这个假设只对 `clipsync pair --host` 这种
+/// 一次性命令成立；**从托盘发起配对时进程是常驻的**，宣告线程就永远停不下来：
+/// 用户看完配对码关掉窗口，局域网里仍在不停广播"我在等待配对"，每点一次菜单
+/// 再多一个这样的线程。故改为 RAII 守卫。
+pub struct PairingAnnouncer {
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for PairingAnnouncer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
 /// 在配对期间持续向局域网宣告"我在等待配对"。
 ///
-/// 返回的句柄被丢弃时线程仍继续运行——配对进程本身是短命的，进程退出即停止。
+/// 宣告在返回的 [`PairingAnnouncer`] 被丢弃时停止，因此调用方**必须持有**它
+/// 直到配对结束——用 `let _ = ...` 接收会立即停止宣告。
 pub fn spawn_pairing_announcer(
     device_name: String,
     pairing_port: u16,
-) -> Result<std::thread::JoinHandle<()>> {
+) -> Result<PairingAnnouncer> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).context("绑定配对宣告套接字失败")?;
     socket
         .set_multicast_loop_v4(true)
@@ -213,15 +233,37 @@ pub fn spawn_pairing_announcer(
     };
     let bytes = postcard::to_allocvec(&beacon).context("编码配对信标失败")?;
 
-    let handle = std::thread::Builder::new()
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    std::thread::Builder::new()
         .name("pair-announce".into())
-        .spawn(move || loop {
-            if let Err(e) = socket.send_to(&bytes, target) {
-                debug!("发送配对信标失败: {e}");
+        .spawn(move || {
+            while !thread_stop.load(Ordering::SeqCst) {
+                if let Err(e) = socket.send_to(&bytes, target) {
+                    debug!("发送配对信标失败: {e}");
+                }
+                // 分片 sleep：整段睡完才检查停止标志的话，停止最多要等一个
+                // 完整间隔才生效，期间还会多广播一轮。
+                sleep_interruptibly(PAIRING_BEACON_INTERVAL, &thread_stop);
             }
-            std::thread::sleep(PAIRING_BEACON_INTERVAL);
+            debug!("配对宣告已停止");
         })?;
-    Ok(handle)
+
+    Ok(PairingAnnouncer { stop })
+}
+
+/// 分片睡眠，期间发现停止标志就提前返回。
+fn sleep_interruptibly(total: Duration, stop: &AtomicBool) {
+    const SLICE: Duration = Duration::from_millis(100);
+    let mut slept = Duration::ZERO;
+    while slept < total {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let step = SLICE.min(total - slept);
+        std::thread::sleep(step);
+        slept += step;
+    }
 }
 
 /// 在局域网中查找正在等待配对的设备。

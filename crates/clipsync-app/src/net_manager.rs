@@ -145,6 +145,17 @@ impl KnownPeers {
             None => g.push(peer),
         }
     }
+
+    /// 移除一台设备。返回是否确实移除了。
+    ///
+    /// 移除后拨号线程不再拨它，入站握手也查不到其公钥而拒绝连接——解除配对
+    /// 因此立即生效，不必重启。
+    pub fn remove(&self, device: &DeviceId) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let before = g.len();
+        g.retain(|p| &p.device != device);
+        g.len() != before
+    }
 }
 
 /// 网络层共享上下文，避免各函数签名过长。
@@ -558,6 +569,34 @@ mod tests {
         let got = known.snapshot().pop().unwrap();
         assert_eq!(got.name, "改了名的 A");
         assert_eq!(got.static_public_key, vec![9; 32], "公钥应更新为最新一次配对的");
+    }
+
+    /// 解除配对后，拨号与入站认证都必须立刻查不到这台设备。
+    #[test]
+    fn removed_device_is_invisible_to_dialer_and_auth() {
+        let a = peer("a", 1);
+        let b = peer("b", 2);
+        let known = KnownPeers::new(vec![a.clone(), b.clone()]);
+        let shared = known.clone();
+
+        assert!(known.remove(&b.device), "应报告确实移除了");
+
+        assert_eq!(shared.len(), 1);
+        assert!(!shared.contains(&b.device), "拨号线程不应再拨已解除的设备");
+        assert!(
+            shared.find_by_static_key(&b.static_public_key).is_none(),
+            "入站握手应查不到其公钥，从而拒绝连接"
+        );
+        // 没被解除的那台不受影响。
+        assert!(shared.contains(&a.device));
+    }
+
+    #[test]
+    fn removing_absent_device_reports_false() {
+        let known = KnownPeers::new(vec![peer("a", 1)]);
+        let ghost = peer("ghost", 9);
+        assert!(!known.remove(&ghost.device));
+        assert_eq!(known.len(), 1);
     }
 
     #[test]
