@@ -52,9 +52,23 @@ impl IconState {
 /// 图标边长（像素）。
 const ICON_SIZE: u32 = 32;
 
+/// 传输脉冲时图标的不透明度。
+///
+/// **是"变淡"而不是"消失"**：菜单栏里图标整个闪没了，读起来像程序崩了或
+/// 连接断了，反而制造焦虑。淡下去再回来是"在忙"，安静但一眼可辨——这也
+/// 符合这个程序"安静而有用"的定位。
+///
+/// 数值是在深浅两种菜单栏上逐档比出来的（255 / 190 / 160 / 130 / 90）：
+/// 90 太淡，深色栏上灰色的"未连接"几乎融进背景；190 又几乎看不出变化。
+/// 130 两头都合适——一眼分得出，形状却始终饱满。
+const PULSE_ALPHA: u8 = 130;
+
 /// 按状态生成托盘图标：一个简化的剪贴板轮廓。
-pub fn make_icon(state: IconState) -> anyhow::Result<Icon> {
-    let rgba = draw_clipboard(state);
+///
+/// `dimmed` 为真时整体变淡，用于文件传输期间的脉冲。颜色**不变**——脉冲表达
+/// "在忙"，连接状态仍由颜色表达，两者正交，不该互相干扰。
+pub fn make_icon(state: IconState, dimmed: bool) -> anyhow::Result<Icon> {
+    let rgba = draw_clipboard(state, dimmed);
     Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE)
         .map_err(|e| anyhow::anyhow!("生成托盘图标失败: {e}"))
 }
@@ -62,8 +76,9 @@ pub fn make_icon(state: IconState) -> anyhow::Result<Icon> {
 /// 绘制剪贴板形状的 RGBA 像素。
 ///
 /// 形状：一个圆角板身，顶部一个夹子。用纯计算绘制，无需图片资源。
-fn draw_clipboard(state: IconState) -> Vec<u8> {
+fn draw_clipboard(state: IconState, dimmed: bool) -> Vec<u8> {
     let (r, g, b) = state.color();
+    let alpha = if dimmed { PULSE_ALPHA } else { 255 };
     let n = ICON_SIZE as i32;
     let mut px = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
 
@@ -92,12 +107,12 @@ fn draw_clipboard(state: IconState) -> Vec<u8> {
                 px[idx] = r.saturating_sub(40);
                 px[idx + 1] = g.saturating_sub(40);
                 px[idx + 2] = b.saturating_sub(40);
-                px[idx + 3] = 255;
+                px[idx + 3] = alpha;
             } else if in_body {
                 px[idx] = r;
                 px[idx + 1] = g;
                 px[idx + 2] = b;
-                px[idx + 3] = 255;
+                px[idx + 3] = alpha;
             }
             // 其余保持全透明。
         }
@@ -161,7 +176,7 @@ mod tests {
 
     #[test]
     fn icon_pixels_have_expected_size_and_content() {
-        let px = draw_clipboard(IconState::Connected);
+        let px = draw_clipboard(IconState::Connected, false);
         assert_eq!(px.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
         // 应有不透明像素（画出了图形），也应有透明像素（四周留白）。
         assert!(px.chunks(4).any(|p| p[3] == 255), "应绘制出可见图形");
@@ -171,9 +186,9 @@ mod tests {
 
     #[test]
     fn different_states_produce_different_icons() {
-        let a = draw_clipboard(IconState::Connected);
-        let b = draw_clipboard(IconState::Disconnected);
-        let c = draw_clipboard(IconState::Paused);
+        let a = draw_clipboard(IconState::Connected, false);
+        let b = draw_clipboard(IconState::Disconnected, false);
+        let c = draw_clipboard(IconState::Paused, false);
         assert_ne!(a, b);
         assert_ne!(b, c);
         assert_ne!(a, c);
@@ -182,9 +197,51 @@ mod tests {
 
     #[test]
     fn broken_icon_is_visually_distinct() {
-        let broken = draw_clipboard(IconState::Broken);
+        let broken = draw_clipboard(IconState::Broken, false);
         for other in [IconState::Connected, IconState::Disconnected, IconState::Paused] {
-            assert_ne!(broken, draw_clipboard(other), "故障图标应与 {other:?} 有区别");
+            assert_ne!(broken, draw_clipboard(other, false), "故障图标应与 {other:?} 有区别");
+        }
+    }
+
+    /// 脉冲只改透明度，不改颜色。
+    ///
+    /// 颜色表达连接状态、脉冲表达"在忙"，两者正交——若脉冲顺手把颜色也改了，
+    /// 用户就分不清"在传文件"和"连接出问题了"。
+    #[test]
+    fn pulse_dims_without_changing_color() {
+        let bright = draw_clipboard(IconState::Connected, false);
+        let dim = draw_clipboard(IconState::Connected, true);
+        assert_ne!(bright, dim, "淡下去必须看得出来");
+
+        for (b, d) in bright.chunks(4).zip(dim.chunks(4)) {
+            assert_eq!(&b[..3], &d[..3], "RGB 三通道不该变");
+            if b[3] == 0 {
+                assert_eq!(d[3], 0, "透明区仍应透明，不能把留白涂上");
+            } else {
+                assert!(d[3] < b[3], "图形区应变淡");
+                assert!(d[3] > 0, "但不能整个消失——那读起来像程序崩了");
+            }
+        }
+    }
+
+    /// 手动核对：把各状态的两个脉冲相位导出为原始 RGBA，供外部转成图片肉眼看。
+    ///
+    /// 跑法：`cargo test -p clipsync-app --bin clipsync -- --ignored --nocapture dump_icons`
+    #[test]
+    #[ignore = "导出图片供人工核对"]
+    fn dump_icons() {
+        let dir = std::env::var("ICON_DUMP_DIR").unwrap_or_else(|_| "/tmp".into());
+        for st in [
+            IconState::Connected,
+            IconState::Disconnected,
+            IconState::Paused,
+            IconState::Broken,
+        ] {
+            for dim in [false, true] {
+                let name = format!("{dir}/icon_{st:?}_{}.rgba", if dim { "dim" } else { "on" });
+                std::fs::write(&name, draw_clipboard(st, dim)).unwrap();
+                println!("{name}");
+            }
         }
     }
 }
