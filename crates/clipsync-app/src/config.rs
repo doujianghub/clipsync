@@ -14,9 +14,32 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 /// 应用标识，用于定位配置目录。
+///
+/// **organization 必须留空**：`directories` 在 macOS 上把三段拼成 bundle id
+/// （`{qualifier}.{organization}.{application}`），Windows 上拼成
+/// `{organization}\{application}`。organization 与 application 都填 "ClipSync"
+/// 的话，目录就成了 `ClipSync.ClipSync` / `ClipSync\ClipSync`——重复且难看。
 const QUALIFIER: &str = "";
-const ORGANIZATION: &str = "ClipSync";
+const ORGANIZATION: &str = "";
 const APPLICATION: &str = "ClipSync";
+
+/// 早期版本用过的目录名（organization 与 application 都填了 "ClipSync"）。
+///
+/// 留着只为**迁移一次**：里面有设备长期身份私钥与全部配对记录，直接换路径
+/// 等于让用户所有设备一夜之间互不相识，而且不会有任何提示。
+const LEGACY_DIR_NAMES: &[&str] = &["ClipSync.ClipSync", "ClipSync/ClipSync"];
+
+/// 迁移发生时留一句话，等日志系统起来后再打。
+///
+/// `config_dir()` 必须先于日志初始化（日志要写在配置目录里），所以迁移那一刻
+/// `tracing` 还没接管，直接 `info!` 会进虚空——而"配置目录搬过家"恰恰是
+/// 用户日后最需要在日志里查到的事。
+static MIGRATION_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// 取出迁移说明（若本次启动发生过迁移）。由 `main` 在日志就绪后调用。
+pub fn migration_note() -> Option<&'static str> {
+    MIGRATION_NOTE.get().map(|s| s.as_str())
+}
 
 /// 用户可调设置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,15 +126,59 @@ impl Settings {
 /// 运行多个隔离实例做测试，也方便高级用户自定义位置）；否则用系统默认位置
 /// （Windows `%APPDATA%\ClipSync\`、macOS `~/Library/Application Support/ClipSync/`）。
 pub fn config_dir() -> Result<PathBuf> {
-    let dir = if let Some(custom) = std::env::var_os("CLIPSYNC_CONFIG_DIR") {
-        PathBuf::from(custom)
-    } else {
-        let dirs = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
-            .context("无法定位系统配置目录")?;
-        dirs.config_dir().to_path_buf()
-    };
+    if let Some(custom) = std::env::var_os("CLIPSYNC_CONFIG_DIR") {
+        let dir = PathBuf::from(custom);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("无法创建配置目录: {}", dir.display()))?;
+        return Ok(dir);
+    }
+
+    let dirs =
+        ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION).context("无法定位系统配置目录")?;
+    let dir = dirs.config_dir().to_path_buf();
+
+    // 目录名换过一次，把老位置的东西搬过来。见 LEGACY_DIR_NAMES。
+    if !dir.exists() {
+        migrate_legacy_dir(&dir);
+    }
+
     std::fs::create_dir_all(&dir).with_context(|| format!("无法创建配置目录: {}", dir.display()))?;
     Ok(dir)
+}
+
+/// 把早期版本的配置目录整体搬到新位置。
+///
+/// 只在新目录**尚不存在**时做，且用 `rename`（同一卷内是原子的）——不会
+/// 覆盖任何已有数据。搬不动就算了：那只意味着用户要重新配对一次，而不该
+/// 让程序起不来。
+fn migrate_legacy_dir(new_dir: &Path) {
+    let Some(parent) = new_dir.parent() else {
+        return;
+    };
+    for name in LEGACY_DIR_NAMES {
+        let old = parent.join(name);
+        // 别把新目录自己当成老目录搬（两者同名时会发生）。
+        if old == new_dir || !old.join("identity.json").exists() {
+            continue;
+        }
+        match std::fs::rename(&old, new_dir) {
+            Ok(()) => {
+                let _ = MIGRATION_NOTE.set(format!(
+                    "配置目录已从 {} 迁移到 {}",
+                    old.display(),
+                    new_dir.display()
+                ));
+                return;
+            }
+            Err(e) => {
+                let _ = MIGRATION_NOTE.set(format!(
+                    "迁移旧配置目录失败（将按新装处理，需重新配对）: {} → {}: {e}",
+                    old.display(),
+                    new_dir.display()
+                ));
+            }
+        }
+    }
 }
 
 /// 从配置目录加载设置；不存在或**已损坏**时回退到默认值。
