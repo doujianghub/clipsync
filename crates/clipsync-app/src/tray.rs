@@ -7,242 +7,27 @@
 //! **图标由代码生成**而非打包图片文件，这样发布物始终是单个可执行文件，
 //! 也免去了不同平台的资源打包差异。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+// 子模块文件与本文件平级，故显式指路（否则 Rust 会去找 src/tray/ 目录）。
+#[path = "tray_icon_draw.rs"]
+mod tray_icon_draw;
+#[path = "tray_platform.rs"]
+mod tray_platform;
+#[path = "tray_status.rs"]
+mod tray_status;
 
-use tray_icon::Icon;
+pub use tray_icon_draw::{make_icon, IconState};
+pub use tray_status::TrayStatus;
 
-/// 同步状态，供托盘展示。
-#[derive(Debug, Clone, Default)]
-pub struct StatusData {
-    /// 当前已连接的对端数。
-    pub connected: usize,
-    /// 已配对设备总数。
-    pub paired: usize,
-    /// 当前在线的设备 ID 集合，用于在设备列表里标出 ●/○。
-    pub connected_ids: std::collections::HashSet<String>,
-}
+use tray_platform::{init_platform_app, pump_platform_events};
 
-/// 线程安全的状态句柄：中枢更新，托盘读取。
-#[derive(Clone, Default)]
-pub struct TrayStatus {
-    data: Arc<Mutex<StatusData>>,
-    paused: Arc<AtomicBool>,
-    /// 同步中枢是否已停止工作（异常退出）。
-    hub_dead: Arc<AtomicBool>,
-}
+#[path = "tray_menu.rs"]
+mod tray_menu;
 
-impl TrayStatus {
-    pub fn new(paired: usize) -> Self {
-        Self {
-            data: Arc::new(Mutex::new(StatusData {
-                connected: 0,
-                paired,
-                connected_ids: std::collections::HashSet::new(),
-            })),
-            paused: Arc::new(AtomicBool::new(false)),
-            hub_dead: Arc::new(AtomicBool::new(false)),
-        }
-    }
+use tray_menu::{
+    custom_label_bytes, custom_label_rate, rebuild_peer_menu, MAX_BYTES_PRESETS,
+    UPLOAD_LIMIT_PRESETS,
+};
 
-    /// 更新在线设备集合（同时刷新计数，避免两者脱节）。
-    pub fn set_connected_ids(&self, ids: std::collections::HashSet<String>) {
-        let mut g = self.data.lock().unwrap();
-        g.connected = ids.len();
-        g.connected_ids = ids;
-    }
-
-    /// 当前在线的设备 ID。
-    pub fn connected_devices(&self) -> std::collections::HashSet<String> {
-        self.data.lock().unwrap().connected_ids.clone()
-    }
-
-    /// 更新已配对设备总数。
-    ///
-    /// 配对可以在运行期从托盘发起，配完这个数就变了——不更新的话菜单首行
-    /// 会一直停在"尚未配对设备"，而同步其实已经在工作了。
-    pub fn set_paired(&self, n: usize) {
-        self.data.lock().unwrap().paired = n;
-    }
-
-    pub fn snapshot(&self) -> StatusData {
-        self.data.lock().unwrap().clone()
-    }
-
-    pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::SeqCst)
-    }
-
-    pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::SeqCst);
-    }
-
-    /// 标记同步中枢已停止工作。
-    ///
-    /// 中枢线程若因意外退出，所有同步都会静默停止，而托盘图标还是绿的、
-    /// 菜单还写着"已连接 N 台"——用户根本无从察觉，只会觉得"复制了怎么没
-    /// 过去"。宁可明确显示故障，也不要给一个骗人的正常状态。
-    pub fn set_hub_dead(&self) {
-        self.hub_dead.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_hub_dead(&self) -> bool {
-        self.hub_dead.load(Ordering::SeqCst)
-    }
-
-    /// 一句话状态描述，用于托盘提示文本。
-    pub fn summary(&self) -> String {
-        if self.is_hub_dead() {
-            return "ClipSync — 同步已停止（请重启程序）".to_string();
-        }
-        if self.is_paused() {
-            return "ClipSync — 已暂停".to_string();
-        }
-        let s = self.snapshot();
-        if s.paired == 0 {
-            "ClipSync — 尚未配对设备".to_string()
-        } else if s.connected == 0 {
-            format!("ClipSync — 未连接（已配对 {} 台）", s.paired)
-        } else {
-            format!("ClipSync — 已连接 {} / {} 台", s.connected, s.paired)
-        }
-    }
-}
-
-/// 托盘图标的三种视觉状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IconState {
-    /// 至少一台设备已连接——同步正常。
-    Connected,
-    /// 无设备连接。
-    Disconnected,
-    /// 用户主动暂停。
-    Paused,
-    /// 同步中枢已停止——功能实际不可用。
-    Broken,
-}
-
-impl IconState {
-    pub fn of(status: &TrayStatus) -> Self {
-        // 故障优先于一切：这时候显示"已连接"是彻头彻尾的误导。
-        if status.is_hub_dead() {
-            IconState::Broken
-        } else if status.is_paused() {
-            IconState::Paused
-        } else if status.snapshot().connected > 0 {
-            IconState::Connected
-        } else {
-            IconState::Disconnected
-        }
-    }
-
-    /// 该状态对应的主色（RGB）。
-    fn color(self) -> (u8, u8, u8) {
-        match self {
-            // 绿：一切正常
-            IconState::Connected => (0x35, 0xB5, 0x6A),
-            // 灰：未连接
-            IconState::Disconnected => (0x8A, 0x8A, 0x8A),
-            // 琥珀：已暂停
-            IconState::Paused => (0xE0, 0xA0, 0x30),
-            // 红：出故障了，与"暂停"的琥珀明确区分开
-            IconState::Broken => (0xD0, 0x3A, 0x3A),
-        }
-    }
-}
-
-/// 图标边长（像素）。
-const ICON_SIZE: u32 = 32;
-
-/// 按状态生成托盘图标：一个简化的剪贴板轮廓。
-pub fn make_icon(state: IconState) -> anyhow::Result<Icon> {
-    let rgba = draw_clipboard(state);
-    Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE)
-        .map_err(|e| anyhow::anyhow!("生成托盘图标失败: {e}"))
-}
-
-/// 绘制剪贴板形状的 RGBA 像素。
-///
-/// 形状：一个圆角板身，顶部一个夹子。用纯计算绘制，无需图片资源。
-fn draw_clipboard(state: IconState) -> Vec<u8> {
-    let (r, g, b) = state.color();
-    let n = ICON_SIZE as i32;
-    let mut px = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
-
-    // 板身范围（留出边距）与夹子范围。
-    let body = Rect {
-        x0: 6,
-        y0: 7,
-        x1: n - 6,
-        y1: n - 4,
-    };
-    let clip = Rect {
-        x0: n / 2 - 5,
-        y0: 3,
-        x1: n / 2 + 5,
-        y1: 9,
-    };
-
-    for y in 0..n {
-        for x in 0..n {
-            let idx = ((y * n + x) * 4) as usize;
-            let in_body = body.contains_rounded(x, y, 3);
-            let in_clip = clip.contains_rounded(x, y, 2);
-
-            if in_clip {
-                // 夹子用更深的同色，形成层次。
-                px[idx] = r.saturating_sub(40);
-                px[idx + 1] = g.saturating_sub(40);
-                px[idx + 2] = b.saturating_sub(40);
-                px[idx + 3] = 255;
-            } else if in_body {
-                px[idx] = r;
-                px[idx + 1] = g;
-                px[idx + 2] = b;
-                px[idx + 3] = 255;
-            }
-            // 其余保持全透明。
-        }
-    }
-    px
-}
-
-struct Rect {
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
-}
-
-impl Rect {
-    /// 是否落在带圆角的矩形内。
-    fn contains_rounded(&self, x: i32, y: i32, radius: i32) -> bool {
-        if x < self.x0 || x >= self.x1 || y < self.y0 || y >= self.y1 {
-            return false;
-        }
-        // 四角做圆角裁切。
-        let corners = [
-            (self.x0 + radius, self.y0 + radius),
-            (self.x1 - 1 - radius, self.y0 + radius),
-            (self.x0 + radius, self.y1 - 1 - radius),
-            (self.x1 - 1 - radius, self.y1 - 1 - radius),
-        ];
-        for (cx, cy) in corners {
-            let outside_x = (x < cx && cx == self.x0 + radius) || (x > cx && cx != self.x0 + radius);
-            let outside_y = (y < cy && cy == self.y0 + radius) || (y > cy && cy != self.y0 + radius);
-            if outside_x && outside_y {
-                let dx = x - cx;
-                let dy = y - cy;
-                if dx * dx + dy * dy > radius * radius {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-}
-
-/// 托盘菜单被点击后需要主程序执行的动作。
 // 不再是 Copy：`Unpair` 携带 device id。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayAction {
@@ -285,30 +70,6 @@ pub struct TrayPeer {
     pub online: bool,
 }
 
-/// 单次大小上限的预设档。`usize::MAX` 表示不限制。
-///
-/// 预设档覆盖常见场景，档位之外由子菜单末尾的「自定义…」承接——它会弹一个
-/// 输入框，接受 `500MB`、`1.5GiB` 这类写法。
-///
-/// （早先这里写的是"托盘菜单没有输入框，需要精确值的用户可直接改
-/// `settings.json`"。自从配对流程引入 `dialog::prompt` 后这个前提就不成立了，
-/// 而让用户去翻 `~/Library/Application Support/` 手改 JSON 显然不是好答案。）
-const MAX_BYTES_PRESETS: &[(&str, usize)] = &[
-    ("10 MiB", 10 * 1024 * 1024),
-    ("100 MiB（默认）", 100 * 1024 * 1024),
-    ("500 MiB", 500 * 1024 * 1024),
-    ("2 GiB", 2 * 1024 * 1024 * 1024),
-    ("不限制", usize::MAX),
-];
-
-/// 发送限速的预设档。`0` 表示不限速。
-const UPLOAD_LIMIT_PRESETS: &[(&str, u64)] = &[
-    ("不限速（默认）", 0),
-    ("10 MB/s", 10 * 1000 * 1000),
-    ("20 MB/s", 20 * 1000 * 1000),
-    ("50 MB/s", 50 * 1000 * 1000),
-];
-
 /// 托盘需要展示的当前设置值（用于菜单初始勾选状态）。
 #[derive(Debug, Clone, Copy)]
 pub struct TraySettings {
@@ -321,48 +82,6 @@ pub struct TraySettings {
     pub verbose_log: bool,
 }
 
-/// 「自定义…」项的标签。当前值不在预设档里时带上实际数值，让用户一眼看出
-/// 现在生效的是多少——否则子菜单里一个勾都没有，会显得像没设置过。
-fn custom_label_bytes(current: usize) -> String {
-    if MAX_BYTES_PRESETS.iter().any(|(_, v)| *v == current) {
-        "自定义…".to_string()
-    } else {
-        format!("自定义…（当前 {}）", human_bytes(current))
-    }
-}
-
-fn custom_label_rate(current: u64) -> String {
-    if UPLOAD_LIMIT_PRESETS.iter().any(|(_, v)| *v == current) {
-        "自定义…".to_string()
-    } else {
-        format!("自定义…（当前 {}/s）", human_bytes(current as usize))
-    }
-}
-
-/// 把字节数写成人能读的形式。挑最合适的单位，避免出现 "0.00 GiB" 这种。
-fn human_bytes(n: usize) -> String {
-    if n == usize::MAX {
-        return "不限制".to_string();
-    }
-    const UNITS: &[(&str, usize)] = &[
-        ("GiB", 1 << 30),
-        ("MiB", 1 << 20),
-        ("KiB", 1 << 10),
-    ];
-    for (unit, size) in UNITS {
-        if n >= *size {
-            let v = n as f64 / *size as f64;
-            // 整数倍就不显示小数位，"100 MiB" 比 "100.0 MiB" 干净。
-            return if (v.fract()).abs() < 0.05 {
-                format!("{:.0} {unit}", v)
-            } else {
-                format!("{v:.1} {unit}")
-            };
-        }
-    }
-    format!("{n} B")
-}
-
 /// 托盘运行所需的回调。
 pub struct TrayCallbacks {
     /// 处理一次菜单动作；返回 false 表示应退出程序。
@@ -373,53 +92,6 @@ pub struct TrayCallbacks {
     pub current_peers: Box<dyn Fn() -> Vec<TrayPeer>>,
     /// 同步中枢是否仍在运行。托盘每轮询问一次；一旦为 false 就切到故障状态。
     pub hub_alive: Box<dyn Fn() -> bool>,
-}
-
-/// 重建「已配对设备」子菜单。
-///
-/// 设备列表在运行期会变（配对、解除配对），而菜单项是构建时创建的，所以每次
-/// 变化都要整体重来一遍。返回新的 (菜单项, device id) 映射供点击时反查。
-///
-/// 列表为空时放一个禁用的提示项而不是留空白——空子菜单在两个平台上都显示为
-/// 一个什么都没有的小方块，看着像坏了。
-fn rebuild_peer_menu(
-    menu: &tray_icon::menu::Submenu,
-    old: &[(tray_icon::menu::MenuItem, String)],
-    peers: &[TrayPeer],
-) -> anyhow::Result<Vec<(tray_icon::menu::MenuItem, String)>> {
-    use tray_icon::menu::MenuItem;
-
-    for (item, _) in old {
-        let _ = menu.remove(item);
-    }
-    // 上一轮的占位项也要清掉，否则会越堆越多。
-    for item in menu.items() {
-        let _ = menu.remove_at(0);
-        drop(item);
-    }
-
-    let mut mapping = Vec::with_capacity(peers.len());
-    if peers.is_empty() {
-        let empty = MenuItem::new("（尚未配对任何设备）", false, None);
-        menu.append(&empty)
-            .map_err(|e| anyhow::anyhow!("构建设备子菜单失败: {e}"))?;
-        return Ok(mapping);
-    }
-
-    for p in peers {
-        // ● 在线 / ○ 离线，一眼能看出哪台连着。文案写明点击的后果——
-        // 这是个破坏性操作，不能让人以为只是查看详情。
-        let label = format!(
-            "{} {} — 解除配对",
-            if p.online { '●' } else { '○' },
-            p.name
-        );
-        let item = MenuItem::new(label, true, None);
-        menu.append(&item)
-            .map_err(|e| anyhow::anyhow!("构建设备子菜单失败: {e}"))?;
-        mapping.push((item, p.device.clone()));
-    }
-    Ok(mapping)
 }
 
 /// 在**主线程**上创建托盘并运行事件循环，直到用户选择退出。
@@ -645,75 +317,6 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
     }
 }
 
-/// 处理平台原生消息，使托盘图标与菜单能够响应。
-#[cfg(windows)]
-fn pump_platform_events() {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
-    };
-
-    // SAFETY: 标准的非阻塞消息泵。PeekMessage 取不到消息时立即返回 0。
-    unsafe {
-        let mut msg: MSG = std::mem::zeroed();
-        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn pump_platform_events() {
-    use objc2_app_kit::{NSApplication, NSEventMask};
-    use objc2_foundation::{MainThreadMarker, NSDate, NSDefaultRunLoopMode};
-
-    // 托盘必须在主线程运行（见 `run` 的文档）。非主线程时静默返回而不 panic：
-    // 事件泵取不到事件只会让菜单无响应，不该让整个程序崩溃。
-    let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
-    let app = NSApplication::sharedApplication(mtm);
-
-    // distantPast 作为超时点表示"绝不等待"：有事件就取走，没有立即返回 None。
-    // 这样循环不会阻塞，主线程仍能按 200ms 节奏刷新图标与处理菜单事件。
-    // SAFETY: NSDefaultRunLoopMode 是 AppKit 导出的常量字符串，读取始终有效。
-    let mode = unsafe { NSDefaultRunLoopMode };
-    while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
-        NSEventMask::Any,
-        Some(&NSDate::distantPast()),
-        mode,
-        true,
-    ) {
-        app.sendEvent(&event);
-    }
-}
-
-/// macOS 专用：进入事件循环前初始化 NSApp。
-///
-/// 两件事缺一不可：
-///   - `Accessory` 激活策略——托盘程序不应在 Dock 里占一个图标。
-///   - `finishLaunching`——不调用则 AppKit 未完成启动流程，菜单点击无响应。
-#[cfg(target_os = "macos")]
-fn init_platform_app() {
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-    use objc2_foundation::MainThreadMarker;
-
-    let Some(mtm) = MainThreadMarker::new() else {
-        tracing::warn!("托盘未在主线程启动，菜单可能无响应");
-        return;
-    };
-    let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-    app.finishLaunching();
-}
-
-#[cfg(not(target_os = "macos"))]
-fn init_platform_app() {}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-fn pump_platform_events() {
-    // 其它平台无需额外的消息泵。
-}
 
 #[cfg(test)]
 mod tests {
@@ -732,38 +335,6 @@ mod tests {
 
         s.set_paused(true);
         assert!(s.summary().contains("已暂停"), "暂停状态应优先展示");
-    }
-
-    #[test]
-    fn icon_state_priority() {
-        let s = TrayStatus::new(1);
-        assert_eq!(IconState::of(&s), IconState::Disconnected);
-
-        s.set_connected_ids(["dev-a".to_string()].into_iter().collect());
-        assert_eq!(IconState::of(&s), IconState::Connected);
-
-        // 暂停优先于连接状态——用户主动暂停时应明确显示。
-        s.set_paused(true);
-        assert_eq!(IconState::of(&s), IconState::Paused);
-    }
-
-    #[test]
-    fn icon_pixels_have_expected_size_and_content() {
-        let px = draw_clipboard(IconState::Connected);
-        assert_eq!(px.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
-        // 应有不透明像素（画出了图形），也应有透明像素（四周留白）。
-        assert!(px.chunks(4).any(|p| p[3] == 255), "应绘制出可见图形");
-        assert!(px.chunks(4).any(|p| p[3] == 0), "四周应为透明");
-    }
-
-    #[test]
-    fn different_states_produce_different_icons() {
-        let a = draw_clipboard(IconState::Connected);
-        let b = draw_clipboard(IconState::Disconnected);
-        let c = draw_clipboard(IconState::Paused);
-        assert_ne!(a, b);
-        assert_ne!(b, c);
-        assert_ne!(a, c);
     }
 
     /// 中枢停止后，界面不得再显示"一切正常"。
@@ -796,14 +367,6 @@ mod tests {
         s.set_paused(true);
         s.set_hub_dead();
         assert_eq!(IconState::of(&s), IconState::Broken);
-    }
-
-    #[test]
-    fn broken_icon_is_visually_distinct() {
-        let broken = draw_clipboard(IconState::Broken);
-        for other in [IconState::Connected, IconState::Disconnected, IconState::Paused] {
-            assert_ne!(broken, draw_clipboard(other), "故障图标应与 {other:?} 有区别");
-        }
     }
 
     #[test]
