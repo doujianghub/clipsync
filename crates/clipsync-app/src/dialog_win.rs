@@ -255,12 +255,18 @@ fn run_powershell(
 }
 
 /// 运行一段 PowerShell 脚本，用户内容经环境变量传入（脚本体不做拼接）。
+///
+/// **脚本走 `-EncodedCommand` 而不是 stdin**。早先用 `powershell -Command -`
+/// 从 stdin 喂脚本，症状是：进程起来了（能看到黑框一闪）、正常退出、
+/// stderr 为空、**窗口不出现**——也就是脚本压根没被执行，PowerShell 读到
+/// EOF 就走了。`-EncodedCommand` 把脚本 Base64 编成 UTF-16LE 直接放命令行，
+/// 传递路径上不再有 stdin，也不受控制台代码页影响，是自动化场景的标准做法。
 fn run_powershell_env(
     script: &str,
     env: &[(&str, &str)],
     capture: bool,
 ) -> Result<Option<String>> {
-    use std::io::Write;
+    let encoded = encode_command(&format!("{DPI_PRELUDE}\n{script}"));
 
     let stdout = if capture {
         std::process::Stdio::piped()
@@ -268,35 +274,21 @@ fn run_powershell_env(
         std::process::Stdio::null()
     };
     let mut cmd = Command::new("powershell");
-    // `-STA` 不可省：WinForms 的 `ShowDialog()` 要求线程处于单线程单元。
-    // powershell.exe(5.1) 默认就是 STA，但如果 PATH 里的 `powershell` 实际
-    // 指向 PowerShell 7，默认是 **MTA**，窗口根本创建不出来。
-    //
-    // 去掉了 `-NonInteractive`：它的本意是"不要弹交互提示"，而我们**就是**
-    // 要弹窗，没有理由自缚手脚。
-    cmd.args(["-NoProfile", "-STA", "-Command", "-"]);
+    // -STA：WinForms 的 ShowDialog 要求线程处于单线程单元。powershell.exe
+    // (5.1) 默认就是 STA，但若 `powershell` 实际指向 PowerShell 7，默认是
+    // MTA，窗口根本创建不出来。
+    cmd.args(["-NoProfile", "-STA", "-EncodedCommand", &encoded]);
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = cmd
-        .stdin(std::process::Stdio::piped())
+
+    tracing::debug!("弹窗：启动 powershell（脚本 {} 字节）", script.len());
+    let out = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(stdout)
-        // **必须捕获 stderr**：脚本在子进程里出错时，这是唯一的线索来源。
-        // 早先丢给 null，结果是"黑框一闪而过、窗口不出现、日志里什么都没有"
-        // ——只能靠猜。为一点点噪音丢掉全部诊断信息，非常不划算。
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .context("启动 powershell 失败")?;
-
-    // DPI 声明必须先于脚本体：一旦窗口已创建，再改感知级别就晚了。
-    let mut stdin = child.stdin.take().context("取 powershell stdin 失败")?;
-    stdin
-        .write_all(DPI_PRELUDE.as_bytes())
-        .and_then(|()| stdin.write_all(script.as_bytes()))
-        .context("写入 powershell 脚本失败")?;
-    drop(stdin); // 关闭 stdin，否则 `-Command -` 会一直等更多输入
-
-    let out = child
+        .context("启动 powershell 失败")?
         .wait_with_output()
         .context("等待 powershell 结束失败")?;
 
@@ -306,13 +298,53 @@ fn run_powershell_env(
     if !err.is_empty() {
         tracing::warn!("弹窗脚本报错（窗口可能没弹出来）: {err}");
     }
+    tracing::debug!(
+        "弹窗：powershell 退出 {}，stdout {} 字节",
+        out.status,
+        out.stdout.len()
+    );
     if !out.status.success() {
-        tracing::warn!("弹窗脚本以 {} 退出", out.status);
         return Ok(None);
     }
-
     if !capture {
         return Ok(None);
     }
     Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// 把脚本编成 `-EncodedCommand` 要的形式：UTF-16LE 再 Base64。
+fn encode_command(script: &str) -> String {
+    let utf16: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    base64(&utf16)
+}
+
+/// 标准 Base64。
+///
+/// 自己写这二十行，是为了不给项目多拖一个依赖——用途只有这一处，
+/// 且输入是我们自己生成的脚本，不涉及任何解码与容错。
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18 & 63) as usize] as char);
+        out.push(TABLE[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
