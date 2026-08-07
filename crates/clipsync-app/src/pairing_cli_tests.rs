@@ -83,7 +83,7 @@ fn manual_pairing_dialog() {
     let code = PairingCode::generate();
     // 打到 stdout，供外部脚本比对窗口里显示的是不是同一个码。
     println!("EXPECT_CODE={code}");
-    crate::dialog::show_info("ClipSync 配对", &dialog_body(&code, 47_684));
+    crate::dialog::show_info("ClipSync 配对", &code_dialog_body(code.as_str(), 47_684));
 }
 
 /// 纯配对码：不带地址，调用方走局域网自动发现。
@@ -155,15 +155,66 @@ fn manual_code_with_address_round_trips() {
 #[test]
 fn dialog_body_tells_the_user_everything_and_mentions_no_clipboard() {
     let code = PairingCode::from_entropy(b"\x01\x02\x03\x04");
-    let body = dialog_body(&code, 47_684);
+    let body = code_dialog_body(code.as_str(), 47_684);
 
     assert!(body.contains(code.as_str()), "得有码");
     assert!(body.contains("输入配对码"), "得说去哪儿输");
+    assert!(body.contains("配对成功即失效"), "得说清一个码只配一台");
     assert!(
-        body.contains(&HOST_SESSION_TIMEOUT.as_secs().to_string()),
+        body.contains(&(HOST_SESSION_TIMEOUT.as_secs() / 60).to_string()),
         "得说多久过期"
     );
     assert!(!body.contains("剪贴板"), "不该再提剪贴板");
     assert!(!body.contains("复制"), "不该再提复制");
 }
 
+/// 人工核对两处地址列表的实际样子。
+#[test]
+#[ignore = "结果取决于本机网卡，只为肉眼看"]
+fn manual_show_address_blocks() {
+    println!("—— 配对码窗口 ——");
+    println!("{}", code_dialog_body("1234", 47_684));
+    println!();
+    println!("—— 手输地址时 ——");
+    println!("请输入对方的 IP（对方窗口里有）：");
+    if let Some(b) = addr_block(47_684) {
+        println!();
+        println!("本机地址，供对照挑同网段的：");
+        println!("{b}");
+    }
+}
+
+/// 地址列表要列**全部** IPv4 并标注类别，且同网段的排最前。
+///
+/// 回归自实机反馈：原先只挑"最合适"的一个（优先覆盖网），碰上对方只在
+/// 局域网里，那个地址就是死的，用户还以为程序给错了。哪个地址通取决于
+/// **对方**在哪张网上，本机无从知道——列全了由人来挑。
+#[test]
+fn address_block_lists_every_ipv4_lan_first() {
+    let lines = local_ipv4_lines(47_684);
+    // 构建环境可能一张网卡都没有，那时为空也是对的。
+    if lines.is_empty() {
+        return;
+    }
+    for l in &lines {
+        assert!(
+            l.contains("（局域网）") || l.contains("（覆盖网）") || l.contains("（公网）"),
+            "每条都要标类别：{l}"
+        );
+        assert!(!l.contains(':'), "只列 IPv4，不该出现 IPv6 或端口：{l}");
+    }
+    // TUN 模式代理的假 IP 段永不可路由，列出来只会让人挑错。
+    assert!(
+        !lines.iter().any(|l| l.starts_with("198.18.") || l.starts_with("198.19.")),
+        "RFC 2544 基准测试段不该出现：{lines:?}"
+    );
+
+    // 局域网的必须排在覆盖网/公网之前，与连接时的优选顺序一致。
+    let first_non_lan = lines.iter().position(|l| !l.contains("（局域网）"));
+    if let Some(i) = first_non_lan {
+        assert!(
+            lines[i..].iter().all(|l| !l.contains("（局域网）")),
+            "局域网地址应连续排在最前：{lines:?}"
+        );
+    }
+}

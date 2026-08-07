@@ -267,14 +267,14 @@ pub(crate) fn host_pairing_interactive(
     let guard = match pairing.host_slot.try_acquire() {
         Ok(g) => g,
         Err(code) => {
-            // 已有会话在等待——把同一个码再显示一遍即可。
+            // 已有会话在等待——把**同一份**文案再显示一遍。
+            //
+            // 此前这里另写了一段更短的，不含地址列表，于是"关掉窗口再打开，
+            // 地址就没了"，用户以为程序把信息弄丢了。同一件事只该有一份文案。
             info!("配对会话已在进行中，重新显示当前配对码");
             dialog::show_info(
                 "ClipSync 配对",
-                &format!(
-                    "配对码  {code}\n\n\
-                     本机仍在等待对方加入，请在对方设备上选「输入配对码…」。"
-                ),
+                &pairing_cli::code_dialog_body(&code, sync_port),
             );
             return;
         }
@@ -333,8 +333,7 @@ pub(crate) fn join_by_code_interactive(
                 match ask_what_next() {
                     Some(NotFound::RetryWithNewCode) => continue,
                     Some(NotFound::EnterAddress) => {
-                        let Some(h) = dialog::prompt("配对", "请输入对方的 IP（对方窗口里有）：")
-                        else {
+                        let Some(h) = dialog::prompt("配对", &ask_address_body(sync_port)) else {
                             return;
                         };
                         match pairing_cli::connect_hosts(Some(h.trim())) {
@@ -372,6 +371,19 @@ enum NotFound {
     RetryWithNewCode,
     /// 手动填对方地址。
     EnterAddress,
+}
+
+/// 手输对方地址时的提示语。
+///
+/// 一并列出**本机**的地址：对方窗口里可能有好几个，用户得挑一个跟自己同
+/// 网段的才连得通。不给参照物的话，这个判断只能靠猜——而这恰恰是程序能
+/// 帮上忙、用户又最容易搞错的地方。
+fn ask_address_body(sync_port: u16) -> String {
+    let mut s = "请输入对方的 IP（对方窗口里有）：".to_string();
+    if let Some(block) = pairing_cli::addr_block(sync_port) {
+        s.push_str(&format!("\n\n本机地址，供对照挑同网段的：\n{block}"));
+    }
+    s
 }
 
 /// 没找到对方时问一句下一步。

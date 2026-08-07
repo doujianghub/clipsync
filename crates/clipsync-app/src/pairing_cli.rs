@@ -47,39 +47,67 @@ pub fn parse_pairing_input(input: &str) -> Option<(PairingCode, Option<String>)>
     }
 }
 
-/// 挑一个最适合放进配对串的本机地址。
+/// 本机全部可达的 IPv4 地址，按"对方最可能连得通"的顺序排好并标注类别。
 ///
-/// 优先覆盖网（Tailscale 等）：局域网那种情况自动发现本来就能搞定，真正需要
-/// 手动带地址的恰恰是组播过不去的覆盖网。没有覆盖网地址时退而给局域网地址，
-/// 总比什么都不给强。
-fn best_addr_for_sharing(port: u16) -> Option<std::net::SocketAddr> {
-    use clipsync_net::local::{local_candidates, local_networks};
-    use clipsync_net::peer::{classify, AddrClass};
+/// **为什么要列全，而不是只给"最合适"的那一个**：哪个地址通，取决于**对方**
+/// 在哪张网上——本机无从知道。原先只挑一个（优先覆盖网），碰上对方只在
+/// 局域网里，那个地址就是死的，用户还以为程序给错了。列全之后由人来挑，
+/// 这件事人比程序清楚。
+///
+/// 只列 IPv4：要人念、人敲的场合，IPv6 那一长串既难念又易错；真需要时
+/// `clipsync addrs` 里有全部。
+fn local_ipv4_lines(sync_port: u16) -> Vec<String> {
+    // **不能用 `peer::classify`**：那是拿来判断**对端**地址是否与本机同网段的，
+    // 而本机自己的地址永远"在自己的网段里"，问它必得「局域网」——实测三张
+    // 网卡（局域网、Tailscale、代理 utun）被一律标成局域网，等于没标。
+    // 这里按地址段本身判断，与 `clipsync addrs` 同一套口径。
+    let mut rows: Vec<(u8, String)> = clipsync_net::local::local_candidates(sync_port)
+        .into_iter()
+        .filter_map(|sa| match sa.ip() {
+            std::net::IpAddr::V4(v4) => Some((v4, sa)),
+            std::net::IpAddr::V6(_) => None,
+        })
+        // 掐掉 198.18.0.0/15：RFC 2544 的基准测试段，公网上永不可路由，
+        // 而 Clash/Surge 这类 TUN 模式代理正是拿它做假 IP。它会被认成"公网
+        // 地址"列出来，用户挑中就是死路一条。
+        .filter(|(v4, _)| {
+            let o = v4.octets();
+            !(o[0] == 198 && (18..20).contains(&o[1]))
+        })
+        .map(|(v4, sa)| {
+            let o = v4.octets();
+            let (rank, label) = if o[0] == 100 && (64..128).contains(&o[1]) {
+                (1, "覆盖网")
+            } else if v4.is_private() {
+                (0, "局域网")
+            } else {
+                (2, "公网")
+            };
+            (rank, format!("{}（{label}）", fmt_host(&sa)))
+        })
+        .collect();
+    // 局域网排最前，与连接时「同网段直连 → 覆盖网 → 公网」的优选顺序一致，
+    // 免得两处给出的次序打架。
+    rows.sort_by_key(|(r, _)| *r);
+    rows.into_iter().map(|(_, s)| s).collect()
+}
 
-    let nets = local_networks();
-    let cands = local_candidates(port);
-    let pick = |want: AddrClass| {
-        cands
+/// 把地址列表排成缩进的几行；一个都没有时返回 `None`。
+pub fn addr_block(sync_port: u16) -> Option<String> {
+    let lines = local_ipv4_lines(sync_port);
+    if lines.is_empty() {
+        return None;
+    }
+    Some(
+        lines
             .iter()
-            .find(|sa| classify(sa.ip(), &nets) == Some(want) && sa.is_ipv4())
-            .or_else(|| cands.iter().find(|sa| classify(sa.ip(), &nets) == Some(want)))
-            .copied()
-    };
-    // IPv4 优先只是因为它短、好念、好核对，不影响可达性。
-    pick(AddrClass::Overlay)
-        .or_else(|| pick(AddrClass::LanDirect))
-        .or_else(|| pick(AddrClass::Public))
+            .map(|l| format!("    {l}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
-/// 本机最适合被对方连到的地址，用于弹窗末尾那句兜底提示。
-///
-/// 自动发现覆盖不到时（比如网段大到不值得枚举、组网工具又不在表里），用户
-/// 需要手输一次地址——那就得让他看得见该输什么。
-fn own_addr_hint(sync_port: u16) -> Option<String> {
-    best_addr_for_sharing(sync_port).map(|a| fmt_host(&a))
-}
-
-/// 主持配对的有效期。到期自动结束：释放端口、停止组播宣告。
+/// 主持配对的有效期。/// 主持配对的有效期。到期自动结束：释放端口、停止组播宣告。
 ///
 /// **为什么必须有这个**：配对码是一次性凭证，"永远有效"既是安全问题，更是
 /// 一个必现的功能故障——见 [`host`] 的说明。
@@ -206,7 +234,7 @@ pub fn host(
     // 早先注释说"先监听再弹才不会错过连接"——只对了一半：连接确实不会丢，
     // 但握手不是内核能替我们完成的。
     if show_dialog {
-        let body = dialog_body(&code, sync_port);
+        let body = code_dialog_body(code.as_str(), sync_port);
         std::thread::spawn(move || {
             crate::dialog::show_info("ClipSync 配对", &body);
         });
@@ -312,19 +340,22 @@ fn fmt_host(sa: &std::net::SocketAddr) -> String {
     }
 }
 
-/// 弹窗正文。
+/// 配对码弹窗的正文。
 ///
-/// 只说三件事：码是多少、去哪儿输、多久过期。地址放在最后一行且加了"若"，
-/// 因为绝大多数情况下自动发现能搞定，不该让每个用户都先读一遍 IP。
-fn dialog_body(code: &PairingCode, sync_port: u16) -> String {
+/// `pub` 是为了让「会话进行中重复点菜单」那条路复用同一份文案——此前那里
+/// 另写了一段更短的，结果是"关掉窗口再打开，地址就没了"，用户以为程序把
+/// 信息弄丢了。同一件事只该有一份文案。
+pub fn code_dialog_body(code: &str, sync_port: u16) -> String {
     let mut s = format!(
         "配对码  {code}\n\n\
          在对方设备上选「输入配对码…」，输入这四位。\n\
-         {} 秒内有效。",
-        HOST_SESSION_TIMEOUT.as_secs()
+         {} 分钟内有效，配对成功即失效。",
+        HOST_SESSION_TIMEOUT.as_secs() / 60
     );
-    if let Some(addr) = own_addr_hint(sync_port) {
-        s.push_str(&format!("\n\n若对方提示需要地址，本机是 {addr}"));
+    if let Some(block) = addr_block(sync_port) {
+        s.push_str(&format!(
+            "\n\n若对方提示需要地址，挑一个与它同网段的：\n{block}"
+        ));
     }
     s
 }
