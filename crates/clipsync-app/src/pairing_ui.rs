@@ -318,44 +318,86 @@ pub(crate) fn join_by_code_interactive(
     sync_port: u16,
     pairing: &PairingDeps,
 ) {
-    let Some((code, host)) = obtain_code() else {
-        return; // 用户取消，或输入的不是有效配对码
-    };
-    let code = code.to_string();
+    // 循环：找不到对方时最可能是码过期了，那就让用户拿新码再来一遍——
+    // 而不是把他推去填 IP。对方根本没在监听的话，IP 填对了也连不上。
+    loop {
+        let Some((code, host)) = obtain_code() else {
+            return; // 用户取消，或输入的不是有效配对码
+        };
+        let code = code.to_string();
 
-    let streams = match pairing_cli::connect_hosts(host.as_deref()) {
-        Ok(s) => s,
-        Err(e) => {
-            info!("自动查找对方失败，改为询问地址: {e:#}");
-            let Some(h) = dialog::prompt(
-                "输入配对码",
-                "没能自动找到对方。\n请输入对方的 IP（对方窗口里有）：",
-            ) else {
-                return;
-            };
-            match pairing_cli::connect_hosts(Some(h.trim())) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("配对失败: {e:#}");
-                    dialog::show_info("配对失败", &format!("{e:#}"));
-                    return;
+        let streams = match pairing_cli::connect_hosts(host.as_deref()) {
+            Ok(s) => s,
+            Err(e) => {
+                info!("没找到等待配对的设备: {e:#}");
+                match ask_what_next() {
+                    Some(NotFound::RetryWithNewCode) => continue,
+                    Some(NotFound::EnterAddress) => {
+                        let Some(h) = dialog::prompt("配对", "请输入对方的 IP（对方窗口里有）：")
+                        else {
+                            return;
+                        };
+                        match pairing_cli::connect_hosts(Some(h.trim())) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("配对失败: {e:#}");
+                                dialog::show_info("配对失败", &format!("{e:#}"));
+                                return;
+                            }
+                        }
+                    }
+                    None => return,
                 }
             }
-        }
-    };
+        };
 
-    // 逐个试：占着配对端口的不一定就是 ClipSync，通常只有一个。
-    let mut last = None;
-    for mut s in streams {
-        match pairing_cli::join_on(&mut s, dir, identity, device_name, &code, sync_port) {
-            Ok(record) => return finish_join(Ok(record), pairing),
-            Err(e) => last = Some(e),
+        // 逐个试：占着配对端口的不一定就是 ClipSync，通常只有一个。
+        let mut last = None;
+        for mut s in streams {
+            match pairing_cli::join_on(&mut s, dir, identity, device_name, &code, sync_port) {
+                Ok(record) => return finish_join(Ok(record), pairing),
+                Err(e) => last = Some(e),
+            }
         }
+        return finish_join(
+            Err(last.unwrap_or_else(|| anyhow::anyhow!("没有可用的连接"))),
+            pairing,
+        );
     }
-    finish_join(
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("没有可用的连接"))),
-        pairing,
-    );
+}
+
+/// 没找到对方时，用户接下来想干什么。
+enum NotFound {
+    /// 让对方重新显示配对码，自己再输一次新的。
+    RetryWithNewCode,
+    /// 手动填对方地址。
+    EnterAddress,
+}
+
+/// 没找到对方时问一句下一步。
+///
+/// **把最可能的原因说在前面**：自动发现覆盖到局域网、覆盖网与可枚举的虚拟
+/// 网段，都落空的话，绝大多数时候不是"找不到路"，而是"对方那边已经过期了"
+/// ——配对码只有 3 分钟有效。此前这里直接弹出"请输入对方 IP"，把用户引向一条
+/// 死路：对方根本没在监听，IP 填得再对也连不上。
+fn ask_what_next() -> Option<NotFound> {
+    let opts = [
+        "让对方重新显示配对码，我输新的".to_string(),
+        "手动填对方地址".to_string(),
+    ];
+    match dialog::choose(
+        "没找到对方",
+        &format!(
+            "没找到正在等待配对的设备。\n\n\
+             配对码 {} 分钟内有效，多半是过期了。",
+            pairing_cli::HOST_SESSION_TIMEOUT.as_secs() / 60
+        ),
+        &opts,
+    ) {
+        Some(0) => Some(NotFound::RetryWithNewCode),
+        Some(1) => Some(NotFound::EnterAddress),
+        _ => None,
+    }
 }
 
 /// 让用户输入配对码。

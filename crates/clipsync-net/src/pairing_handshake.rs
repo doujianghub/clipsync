@@ -306,3 +306,65 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod guess_rate {
+    use super::*;
+    use crate::pairing::PairingCode;
+
+    /// 量一下：拿掉次数上限后，攻击者一秒能猜多少次配对码。
+    ///
+    /// 跑法：`cargo test -p clipsync-net -- --ignored --nocapture guess_rate`
+    ///
+    /// 主持方的 accept 循环是**串行**的，所以这个速率就是在线穷举的速率。
+    /// 用回环测量的是密码学与帧处理的开销；真实局域网再加一个 RTT，
+    /// 但数量级不会变。
+    #[test]
+    #[ignore = "性能测量，只在评估安全参数时手动跑"]
+    fn measure_online_guessing_rate() {
+        const N: u32 = 200;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 主持方：照 pairing_cli::host 的样子串行接客，每次用正确的码。
+        let host = std::thread::spawn(move || {
+            let real = PairingCode::parse("4242").unwrap();
+            let info = LocalPairingInfo {
+                device_id: "h".into(),
+                name: "host".into(),
+                static_public_key: vec![1; 32],
+                addrs: vec![],
+            };
+            for _ in 0..N {
+                let Ok((mut s, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = run_pairing(&mut s, &real, &info);
+            }
+        });
+
+        let wrong = PairingCode::parse("1111").unwrap();
+        let info = LocalPairingInfo {
+            device_id: "a".into(),
+            name: "attacker".into(),
+            static_public_key: vec![2; 32],
+            addrs: vec![],
+        };
+        let t0 = std::time::Instant::now();
+        for _ in 0..N {
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            let _ = run_pairing(&mut s, &wrong, &info);
+        }
+        let el = t0.elapsed();
+        host.join().unwrap();
+
+        let per_sec = N as f64 / el.as_secs_f64();
+        println!("{N} 次错误猜测耗时 {el:?} → {per_sec:.0} 次/秒");
+        println!("  4 位数字共 10000 种组合");
+        println!("  60 秒窗口内可猜 {:.0} 次", per_sec * 60.0);
+        println!(
+            "  → 单次会话被猜中的概率 {:.1}%",
+            (per_sec * 60.0 / 10000.0).min(1.0) * 100.0
+        );
+    }
+}
