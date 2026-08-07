@@ -232,6 +232,57 @@ fn ellipsize_middle(s: &str, max_width: usize) -> String {
     format!("{head}…{}", tail.into_iter().collect::<String>())
 }
 
+/// Windows 托盘提示的硬上限：`NOTIFYICONDATA.szTip` 是 64 个 UTF-16 单元
+/// （63 个字符 + 结尾的 0），超出部分被系统直接切掉，不换行也不省略。
+///
+/// 实机截图里正好断在第 64 个字符上，后半截连百分比都看不到。注意这个限制
+/// 数的是**字符数**（汉字也只算一个 UTF-16 单元），与菜单那边的**显示列数**
+/// 是两套约束——这也是提示与菜单项必须分开生成的原因。
+const TOOLTIP_MAX_CHARS: usize = 63;
+
+/// 把字符串硬塞进 `max` 个字符，超了就尾部省略。
+///
+/// 这是最后一道保险。正常路径上文案已经短于上限，走到这里说明哪里算漏了
+/// ——宁可自己带个省略号，也别让系统在半截字上切一刀。
+fn fit_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+}
+
+/// 按**字符数**从中间省略。
+///
+/// 与 [`ellipsize_middle`] 同一个思路（保住扩展名），但量的是字符数而非显示
+/// 列数：托盘提示的上限是 UTF-16 单元数，汉字只算一个。两个约束都要满足，
+/// 所以两把尺子都得有。
+fn ellipsize_chars(s: &str, max_chars: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_chars {
+        return s.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".into();
+    }
+    let budget = max_chars - 1;
+    let tail = budget * 4 / 10;
+    let head = budget - tail;
+    let h: String = s.chars().take(head).collect();
+    let t: String = s.chars().skip(n - tail).collect();
+    format!("{h}…{t}")
+}
+
+/// `已传 / 总量`。单位相同就只写一次：`3.9 / 9.3 GiB` 比
+/// `3.9 GiB / 9.3 GiB` 短五列，也更好读——重复的单位不带任何信息。
+fn bytes_pair(done: u64, total: u64) -> String {
+    let d = crate::tray::human_bytes(done);
+    let t = crate::tray::human_bytes(total);
+    match (d.rsplit_once(' '), t.rsplit_once(' ')) {
+        (Some((dv, du)), Some((_, tu))) if du == tu => format!("{dv} / {t}"),
+        _ => format!("{d} / {t}"),
+    }
+}
+
 /// 把进度渲染成一行人话。托盘与日志共用同一套格式。
 ///
 /// `shorten` 只影响文件名：托盘要一眼扫过、且 Windows 的托盘提示有硬上限，
@@ -257,9 +308,8 @@ fn describe(st: &ProgressState, shorten: bool) -> String {
         if moved > 0 && secs >= 0.5 {
             let rate = (moved as f64 / secs) as u64;
             format!(
-                "{dir} {name} {pct}%（{} / {}，{}/s）",
-                crate::tray::human_bytes(st.p.done),
-                crate::tray::human_bytes(st.p.total),
+                "{dir} {name} {pct}%（{}，{}/s）",
+                bytes_pair(st.p.done, st.p.total),
                 crate::tray::human_bytes(rate)
             )
         } else {
@@ -343,6 +393,57 @@ impl TrayStatus {
         } else {
             format!("ClipSync — 已连接 {} / {} 台", s.connected, s.paired)
         }
+    }
+}
+
+impl TrayStatus {
+    /// 悬停提示。与菜单里那行**不是**同一份文案。
+    ///
+    /// 菜单项能占一整行，放得下绝对字节数；托盘提示只有 63 个字符，光是
+    /// `ClipSync — 接收 ` 加上 `（151.8 MiB / 17.3 GiB，37.2 MiB/s）` 就占掉
+    /// 五十来个，留给文件名的连 13 个都不到。所以提示这边砍掉两样：
+    ///
+    ///   - **`ClipSync — ` 前缀**：鼠标正悬在 ClipSync 的图标上，不必再自报家门；
+    ///   - **绝对字节数**：一瞥之下要的是"到哪了、多快"，具体数字留给菜单和日志。
+    pub fn tooltip(&self) -> String {
+        let text = match self.progress_brief() {
+            Some(p) => p,
+            None => self.summary(),
+        };
+        fit_chars(&text, TOOLTIP_MAX_CHARS)
+    }
+
+    /// 提示用的精简进度：`接收 video.mp4 42% · 8.3 MiB/s`。
+    ///
+    /// 文件名的可用长度由剩余预算倒推，而不是写死——速率位数会变，写死就会
+    /// 在某些数值下又超出去。
+    fn progress_brief(&self) -> Option<String> {
+        if !self.is_transferring() {
+            return None;
+        }
+        let g = self.progress.lock().unwrap();
+        let st = g.as_ref()?;
+
+        let dir = if st.p.sending { "发送" } else { "接收" };
+        let pct = if st.p.total > 0 {
+            st.p.done.saturating_mul(100) / st.p.total
+        } else {
+            0
+        };
+        let moved = st.p.done.saturating_sub(st.since_bytes);
+        let secs = st.since.elapsed().as_secs_f64();
+        let tail = if moved > 0 && secs >= 0.5 {
+            let rate = (moved as f64 / secs) as u64;
+            format!(" {pct}% · {}/s", crate::tray::human_bytes(rate))
+        } else {
+            format!(" {pct}%")
+        };
+
+        // 除文件名外都是定长部分，剩下多少给名字就用多少。
+        let fixed = dir.chars().count() + 1 + tail.chars().count();
+        let budget = TOOLTIP_MAX_CHARS.saturating_sub(fixed);
+        let name = ellipsize_chars(&st.p.name, budget);
+        Some(format!("{dir} {name}{tail}"))
     }
 }
 
@@ -438,6 +539,15 @@ mod tests {
         assert!(!sum.contains("/s"), "刚开头不该报速度：{sum}");
     }
 
+    /// 单位相同就只写一次——重复的单位不带信息，白占五列。
+    #[test]
+    fn byte_pairs_drop_the_repeated_unit() {
+        assert_eq!(bytes_pair(4 << 30, 9 << 30), "4 / 9 GiB");
+        // 单位不同就得都写全，否则读者会误以为同一量级。
+        let mixed = bytes_pair(151 << 20, 17 << 30);
+        assert!(mixed.contains("MiB") && mixed.contains("GiB"), "{mixed}");
+    }
+
     /// 短名字原样保留，不该无端加省略号。
     #[test]
     fn short_names_pass_through() {
@@ -478,27 +588,74 @@ mod tests {
         assert!(display_width(&ellipsize_middle(&too_long, 28)) <= 28);
     }
 
-    /// 截断后的整条摘要要短到能塞进 Windows 的托盘提示。
+    /// 托盘提示**任何情况下**都不能超过 63 个字符。
     ///
-    /// `NOTIFYICONDATA` 的提示文本有硬上限，超了就被系统直接切掉，用户
-    /// 连百分比都看不到——实机上就是这个现象。
+    /// 回归自实机截图：文案在第 64 个字符上被系统一刀切断，后半截连百分比
+    /// 都看不到。上一轮只截了文件名，可固定部分（`ClipSync — 接收 ` 加上
+    /// 绝对字节数与速率）本身就占掉五十来个，光截名字不够。
     #[test]
-    fn summary_stays_short_enough_for_the_windows_tooltip() {
+    fn tooltip_never_exceeds_the_windows_limit() {
+        let cases: [(&str, u64, u64); 4] = [
+            ("sha256-1194192cf2b8e4a09d7c3f5061e2a78863006a.tar.zst", 159_000_000, 18_500_000_000),
+            ("这是一个特别特别特别特别长的中文文件名用来测试截断.mkv", 1, 100),
+            ("a.txt", 50, 100),
+            (&"x".repeat(300), 1, 2),
+        ];
+        for (name, done, total) in cases {
+            let s = TrayStatus::new(3);
+            s.set_connected_ids(["a".into(), "b".into()].into_iter().collect());
+            s.note_transfer(TransferProgress {
+                sending: false,
+                name: name.into(),
+                done,
+                total,
+            });
+            // 走一遍会显示速率的分支：预算是倒推出来的，速率位数变化不该把
+            // 总长顶出去。
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            s.note_transfer(TransferProgress {
+                sending: false,
+                name: name.into(),
+                done: done + 12_345_678,
+                total,
+            });
+
+            let tip = s.tooltip();
+            let n = tip.chars().count();
+            assert!(n <= 63, "提示 {n} 字符，超了：{tip}");
+            assert!(tip.contains('%'), "百分比不能被挤掉：{tip}");
+        }
+    }
+
+    /// 没有传输时提示也得守住上限（设备名可以很长）。
+    #[test]
+    fn idle_tooltip_also_fits() {
+        let s = TrayStatus::new(9);
+        assert!(s.tooltip().chars().count() <= 63);
+        s.set_connected_ids((0..9).map(|i| i.to_string()).collect());
+        assert!(s.tooltip().chars().count() <= 63);
+    }
+
+    /// 菜单项那份可以更详细——它没有 63 字符的限制，绝对字节数是有用的。
+    #[test]
+    fn menu_summary_keeps_the_absolute_bytes() {
         let s = TrayStatus::new(1);
         s.note_transfer(TransferProgress {
             sending: false,
-            name: "这是一个特别特别特别长的文件名用来测试截断是否生效.mkv".into(),
-            done: 42,
-            total: 100,
+            name: "video.mkv".into(),
+            done: 0,
+            total: 17_300_000_000,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        s.note_transfer(TransferProgress {
+            sending: false,
+            name: "video.mkv".into(),
+            done: 151_800_000,
+            total: 17_300_000_000,
         });
         let sum = s.summary();
-        assert!(
-            sum.chars().count() < 100,
-            "摘要 {} 字符，Windows 托盘提示放不下：{sum}",
-            sum.chars().count()
-        );
-        assert!(sum.contains(".mkv"), "扩展名得看得见：{sum}");
-        assert!(sum.contains("42%"), "百分比不能被挤掉：{sum}");
+        assert!(sum.contains("GiB") || sum.contains("MiB"), "菜单里该有字节数：{sum}");
+        assert!(!s.tooltip().contains(" / "), "提示里不该有字节数：{}", s.tooltip());
     }
 
     /// 人工核对截断效果。
@@ -520,8 +677,18 @@ mod tests {
                 done: 4_200_000_000,
                 total: 10_000_000_000,
             });
+            // 走到会显示速率的分支——那才是传输中的常态，文案也最长。
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            s.note_transfer(TransferProgress {
+                sending: false,
+                name: name.into(),
+                done: 4_230_000_000,
+                total: 10_000_000_000,
+            });
             println!("原名 {name}");
-            println!("  → {}", s.summary());
+            println!("  菜单 {}", s.summary());
+            let tip = s.tooltip();
+            println!("  提示 {tip}  [{} 字符]", tip.chars().count());
         }
     }
 }
