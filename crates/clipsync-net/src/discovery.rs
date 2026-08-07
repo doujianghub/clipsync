@@ -100,28 +100,102 @@ pub fn spawn_sender(
     // 每轮发送前重新求值，使地址变化（如 VPN 上线）能及时反映。
     addrs_provider: impl Fn() -> Vec<SocketAddr> + Send + 'static,
 ) -> Result<std::thread::JoinHandle<()>> {
-    // 绑定临时端口发送，避免与监听端口争用。
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).context("绑定信标发送套接字失败")?;
-    socket
-        .set_multicast_loop_v4(true)
-        .context("设置组播回环失败")?;
-
     let target = SocketAddr::new(IpAddr::V4(BEACON_GROUP), BEACON_PORT);
     let handle = std::thread::Builder::new()
         .name("beacon-send".into())
-        .spawn(move || loop {
-            let beacon = Beacon::new(&device, sync_port, addrs_provider());
-            match postcard::to_allocvec(&beacon) {
-                Ok(bytes) => {
-                    if let Err(e) = socket.send_to(&bytes, target) {
-                        debug!("发送信标失败（可能无可用网络）: {e}");
+        .spawn(move || {
+            // 只在"全都发不出去 ↔ 恢复"这两个时刻记日志。原先每轮失败都记
+            // 一条，多网卡机器上就是每 15 秒刷一行，把真正的问题淹没了。
+            let mut healthy = true;
+            loop {
+                let beacon = Beacon::new(&device, sync_port, addrs_provider());
+                match postcard::to_allocvec(&beacon) {
+                    Ok(bytes) => {
+                        let sent = send_multicast_on_all_ifaces(&bytes, target);
+                        if sent == 0 && healthy {
+                            warn!("局域网信标一个网卡都发不出去，局域网自动发现将不可用");
+                            healthy = false;
+                        } else if sent > 0 && !healthy {
+                            info!("局域网信标已恢复（{sent} 个网卡）");
+                            healthy = true;
+                        }
                     }
+                    Err(e) => warn!("编码信标失败: {e}"),
                 }
-                Err(e) => warn!("编码信标失败: {e}"),
+                std::thread::sleep(BEACON_INTERVAL);
             }
-            std::thread::sleep(BEACON_INTERVAL);
         })?;
     Ok(handle)
+}
+
+/// 在**每个**可用网卡上各发一份组播，返回成功的网卡数。
+///
+/// **为什么不能只发一次**：绑到 `0.0.0.0` 时出接口由路由表决定，多网卡机器
+/// 上多半不是你想要的那个。实机上 Mac mini 的默认路由走 utun，而 utun 不支持
+/// 组播——于是日志里每 15 秒一条 `No route to host (os error 65)`，局域网发现
+/// 从头到尾就没工作过。开发机上实测：
+///
+/// ```text
+/// en0      192.168.2.177 -> ok
+/// utun4    100.88.88.22  -> ok        （Tailscale，收下但不转发）
+/// utun1024 198.18.0.1    -> No route to host   ← TUN 模式代理的假 IP 网卡
+/// ```
+///
+/// 逐个网卡绑定源地址再发，既绕开了坏网卡，也让**所有**局域网口都真的收到
+/// 广播。每轮重新枚举网卡（而不是启动时建好套接字）是为了跟上网络切换。
+///
+/// 用绑定源地址而不是 `IP_MULTICAST_IF`：后者标准库没有暴露，为它引入 libc
+/// 或 socket2 不值当；BSD/Linux 上绑定具体源地址同样能选定出接口，上面那组
+/// 实测就是证据。
+fn send_multicast_on_all_ifaces(bytes: &[u8], target: SocketAddr) -> usize {
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return 0;
+    };
+    let mut sent = 0;
+    for ifa in ifaces {
+        let if_addrs::IfAddr::V4(v4) = ifa.addr else {
+            continue;
+        };
+        // 回环靠 set_multicast_loop_v4 就能送达同机监听者，不必单独发一份；
+        // 链路本地地址（169.254/16）没有可用的对端。
+        if v4.ip.is_loopback() || v4.ip.is_link_local() {
+            continue;
+        }
+        let Ok(sock) = UdpSocket::bind((v4.ip, 0)) else {
+            continue;
+        };
+        let _ = sock.set_multicast_loop_v4(true);
+        if sock.send_to(bytes, target).is_ok() {
+            sent += 1;
+        }
+    }
+    sent
+}
+
+/// 在**每个**网卡上加入组播组，返回成功的网卡数。
+///
+/// 与发送侧同一个道理：`join_multicast_v4(.., UNSPECIFIED)` 只在路由表选中的
+/// 那个网卡上加入，别的网卡进来的信标一概收不到。一个都没成功时退回默认
+/// 网卡，至少不比原先差。
+fn join_multicast_on_all_ifaces(socket: &UdpSocket) -> usize {
+    let mut joined = 0;
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for ifa in ifaces {
+            let if_addrs::IfAddr::V4(v4) = ifa.addr else {
+                continue;
+            };
+            if v4.ip.is_link_local() {
+                continue;
+            }
+            if socket.join_multicast_v4(&BEACON_GROUP, &v4.ip).is_ok() {
+                joined += 1;
+            }
+        }
+    }
+    if joined == 0 && socket.join_multicast_v4(&BEACON_GROUP, &Ipv4Addr::UNSPECIFIED).is_ok() {
+        joined = 1;
+    }
+    joined
 }
 
 /// 启动信标监听线程：接收组播信标并回调。
@@ -134,9 +208,9 @@ pub fn spawn_listener(
 ) -> Result<std::thread::JoinHandle<()>> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, BEACON_PORT))
         .with_context(|| format!("绑定信标端口 {BEACON_PORT} 失败"))?;
-    socket
-        .join_multicast_v4(&BEACON_GROUP, &Ipv4Addr::UNSPECIFIED)
-        .context("加入组播组失败")?;
+    if join_multicast_on_all_ifaces(&socket) == 0 {
+        anyhow::bail!("加入组播组失败（所有网卡）");
+    }
     info!("局域网发现已启动（组播 {BEACON_GROUP}:{BEACON_PORT}）");
 
     let handle = std::thread::Builder::new()
@@ -199,7 +273,12 @@ impl PairingBeacon {
 pub struct PairingHost {
     pub device_name: String,
     /// 可直接连接的配对地址（信标来源 IP + 其宣告的配对端口）。
-    pub addr: SocketAddr,
+    ///
+    /// **一台主机会有多个**：信标是逐网卡发送的，同一台机器从局域网口和
+    /// 覆盖网口各来一份，源地址不同。按地址去重曾把这些当成"多台设备在
+    /// 等待配对"而直接报错——同机 e2e 一跑就露馅。按设备名归并之后，多出来
+    /// 的地址反倒是好事：一条走不通还能试下一条。
+    pub addrs: Vec<SocketAddr>,
 }
 
 /// 配对宣告的运行句柄。**丢弃即停止宣告。**
@@ -227,11 +306,6 @@ pub fn spawn_pairing_announcer(
     device_name: String,
     pairing_port: u16,
 ) -> Result<PairingAnnouncer> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).context("绑定配对宣告套接字失败")?;
-    socket
-        .set_multicast_loop_v4(true)
-        .context("设置组播回环失败")?;
-
     let target = SocketAddr::new(IpAddr::V4(BEACON_GROUP), PAIRING_BEACON_PORT);
     let beacon = PairingBeacon {
         magic: PAIRING_MAGIC,
@@ -246,8 +320,8 @@ pub fn spawn_pairing_announcer(
         .name("pair-announce".into())
         .spawn(move || {
             while !thread_stop.load(Ordering::SeqCst) {
-                if let Err(e) = socket.send_to(&bytes, target) {
-                    debug!("发送配对信标失败: {e}");
+                if send_multicast_on_all_ifaces(&bytes, target) == 0 {
+                    debug!("配对信标一个网卡都发不出去");
                 }
                 // 分片 sleep：整段睡完才检查停止标志的话，停止最多要等一个
                 // 完整间隔才生效，期间还会多广播一轮。
@@ -279,9 +353,9 @@ fn sleep_interruptibly(total: Duration, stop: &AtomicBool) {
 pub fn discover_pairing_hosts(timeout: Duration) -> Result<Vec<PairingHost>> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, PAIRING_BEACON_PORT))
         .with_context(|| format!("绑定配对发现端口 {PAIRING_BEACON_PORT} 失败"))?;
-    socket
-        .join_multicast_v4(&BEACON_GROUP, &Ipv4Addr::UNSPECIFIED)
-        .context("加入组播组失败")?;
+    if join_multicast_on_all_ifaces(&socket) == 0 {
+        anyhow::bail!("加入组播组失败（所有网卡）");
+    }
     // 分段等待，便于发现后尽早返回。
     socket
         .set_read_timeout(Some(Duration::from_millis(300)))
@@ -291,43 +365,49 @@ pub fn discover_pairing_hosts(timeout: Duration) -> Result<Vec<PairingHost>> {
     let mut found: Vec<PairingHost> = Vec::new();
     let mut buf = [0u8; 1024];
 
+    // 收一条信标，按**设备名**归并进结果；返回 true 表示这是第一次见到它。
+    let absorb = |found: &mut Vec<PairingHost>, buf: &[u8], src: std::net::SocketAddr| {
+        let Ok(b) = postcard::from_bytes::<PairingBeacon>(buf) else {
+            return false; // 非本协议流量
+        };
+        if !b.is_valid() {
+            return false;
+        }
+        let addr = SocketAddr::new(src.ip(), b.pairing_port);
+        match found.iter_mut().find(|h| h.device_name == b.device_name) {
+            Some(h) => {
+                if !h.addrs.contains(&addr) {
+                    h.addrs.push(addr);
+                }
+                false
+            }
+            None => {
+                found.push(PairingHost {
+                    device_name: b.device_name,
+                    addrs: vec![addr],
+                });
+                true
+            }
+        }
+    };
+
     while std::time::Instant::now() < deadline {
-        let (n, src) = match socket.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue, // 超时或瞬时错误，继续等
+        let Ok((n, src)) = socket.recv_from(&mut buf) else {
+            continue; // 超时或瞬时错误，继续等
         };
-        let beacon: PairingBeacon = match postcard::from_bytes(&buf[..n]) {
-            Ok(b) => b,
-            Err(_) => continue, // 非本协议流量
-        };
-        if !beacon.is_valid() {
+        if !absorb(&mut found, &buf[..n], src) {
             continue;
         }
-        let host = PairingHost {
-            device_name: beacon.device_name,
-            addr: SocketAddr::new(src.ip(), beacon.pairing_port),
-        };
-        if !found.iter().any(|h| h.addr == host.addr) {
-            found.push(host);
-            // 已找到设备，再稍等片刻收集可能的其它设备后返回。
-            let grace = std::time::Instant::now() + Duration::from_millis(600);
-            while std::time::Instant::now() < grace {
-                if let Ok((n2, src2)) = socket.recv_from(&mut buf) {
-                    if let Ok(b2) = postcard::from_bytes::<PairingBeacon>(&buf[..n2]) {
-                        if b2.is_valid() {
-                            let h2 = PairingHost {
-                                device_name: b2.device_name,
-                                addr: SocketAddr::new(src2.ip(), b2.pairing_port),
-                            };
-                            if !found.iter().any(|h| h.addr == h2.addr) {
-                                found.push(h2);
-                            }
-                        }
-                    }
-                }
+        // 已找到设备，再稍等片刻，把它其余网卡的地址、以及可能存在的其它
+        // 设备一并收齐。
+        let grace = std::time::Instant::now() + Duration::from_millis(600);
+        while std::time::Instant::now() < grace {
+            if let Ok((n2, src2)) = socket.recv_from(&mut buf) {
+                let b = buf;
+                absorb(&mut found, &b[..n2], src2);
             }
-            break;
         }
+        break;
     }
     Ok(found)
 }
@@ -383,5 +463,45 @@ mod tests {
         let b = Beacon::new(&dev, 47684, addrs);
         let bytes = postcard::to_allocvec(&b).unwrap();
         assert!(bytes.len() < 1200, "信标包过大: {} 字节", bytes.len());
+    }
+}
+
+#[cfg(test)]
+mod loopback_smoke {
+    use super::*;
+
+    /// 只跑发现，配合外部进程的 `clipsync pair --host` 定位收发哪一侧坏了。
+    #[test]
+    #[ignore = "需要外部进程在宣告"]
+    fn manual_discover_only() {
+        println!("发现结果：{:?}", discover_pairing_hosts(Duration::from_secs(5)));
+    }
+
+    /// 同机自发自收：宣告线程发出的配对信标，发现函数必须收得到，
+    /// 且**多网卡来的多份必须算作一台设备**。
+    ///
+    /// 两条断言各挡一个真实故障：
+    ///
+    /// 一、能收到——"逐网卡收发"改造里，发送侧绑到某个网卡的源地址后，接收侧
+    /// 必须在**同一个**网卡上加入过组播组，否则回环那份副本进不来，局域网
+    /// 发现整个失效。
+    ///
+    /// 二、算作一台——这条是补写的。原先按**地址**去重，同一台机器从局域网口
+    /// 和覆盖网口各发一份就成了"两台设备在等待配对"，调用方直接报错退出。
+    /// 当时这个测试只断言"能找到"，于是绿着放过了；同机 e2e 一跑才露馅。
+    /// 教训是断言要覆盖**调用方真正依赖的性质**，而不只是"有结果"。
+    #[test]
+    fn pairing_beacon_reaches_a_local_listener_as_one_host() {
+        let _ann = spawn_pairing_announcer("测试机".into(), 47_685).expect("启动宣告失败");
+        let hosts = discover_pairing_hosts(Duration::from_secs(4)).expect("发现失败");
+
+        let mine: Vec<_> = hosts.iter().filter(|h| h.device_name == "测试机").collect();
+        assert_eq!(mine.len(), 1, "同一台机器只能算一台，实际 {hosts:?}");
+        assert!(!mine[0].addrs.is_empty(), "总得给出至少一个可连地址");
+        // 地址不去重的话，同一网卡的多轮信标会把列表撑爆。
+        let mut uniq = mine[0].addrs.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), mine[0].addrs.len(), "地址不该重复");
     }
 }

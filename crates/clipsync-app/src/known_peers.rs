@@ -48,6 +48,8 @@ pub struct KnownPeers {
     ///
     /// 每轮比对一个整数即可，不必拿锁拷贝整张表。
     version: Arc<std::sync::atomic::AtomicU64>,
+    /// 变更通知：拨号线程等在这上面，配对/引荐一登记就立刻醒。
+    changed: Arc<(Mutex<()>, std::sync::Condvar)>,
 }
 
 impl KnownPeers {
@@ -55,6 +57,7 @@ impl KnownPeers {
         Self {
             inner: Arc::new(Mutex::new(peers)),
             version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            changed: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
         }
     }
 
@@ -66,6 +69,28 @@ impl KnownPeers {
     fn bump(&self) {
         self.version
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // 先取锁再通知：等待方是在持锁状态下读的版本号，这样不会丢唤醒。
+        let _g = self.changed.0.lock().unwrap();
+        self.changed.1.notify_all();
+    }
+
+    /// 等设备表发生变化，最多等 `timeout`。
+    ///
+    /// **为什么需要**：拨号线程原先是死等一个退避间隔，而退避连不上时会翻倍
+    /// 到上限。于是刚配好一台设备、或刚经引荐认识一台，都得干等下一轮——
+    /// 实机日志里"经 KPC 认识了 MacBook Pro"到真正连上隔了 **45 秒**。
+    /// 用户的感受是"配对完还得等半天，引荐更慢"。
+    ///
+    /// 换成条件变量之后，登记与拨号之间几乎没有延迟，且不靠轮询——不该为了
+    /// 反应快就让一个后台线程每 200 毫秒醒一次。
+    pub fn wait_for_change(&self, since: u64, timeout: std::time::Duration) {
+        let g = self.changed.0.lock().unwrap();
+        // 持锁期间再确认一次：`bump` 必须拿到同一把锁才能通知，所以这之后
+        // 发生的变更一定能唤醒我们，不存在丢唤醒的窗口。
+        if self.version() != since {
+            return;
+        }
+        let _ = self.changed.1.wait_timeout(g, timeout);
     }
 
     /// 当前全部已配对设备。

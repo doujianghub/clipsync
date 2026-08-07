@@ -149,3 +149,47 @@ fn version_stays_put_when_nothing_removed() {
     assert!(!known.remove(&peer("ghost", 9).device));
     assert_eq!(known.version(), v, "移除不存在的设备不算变化");
 }
+
+/// 设备表一变，等在上面的线程必须立刻醒。
+///
+/// 回归自实机观感："配对完还得等半天，引荐更慢"。日志量出来是 45 秒——
+/// 拨号线程死等一个退避间隔，而退避连不上时会翻倍到上限。
+#[test]
+fn waiting_thread_wakes_the_moment_a_device_is_added() {
+    use std::time::{Duration, Instant};
+
+    let known = KnownPeers::new(vec![]);
+    let version = known.version();
+
+    let waiter = known.clone();
+    let t0 = Instant::now();
+    let h = std::thread::spawn(move || {
+        // 退避上限量级的等待；被唤醒才算通过。
+        waiter.wait_for_change(version, Duration::from_secs(60));
+        t0.elapsed()
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+    known.upsert(peer("b", 2));
+
+    let waited = h.join().unwrap();
+    assert!(
+        waited < Duration::from_secs(2),
+        "登记新设备后应立刻醒，实际等了 {waited:?}"
+    );
+}
+
+/// 已经变过了就不该再等——否则调用方在"变更发生在检查与等待之间"时会白等
+/// 一整个超时。
+#[test]
+fn waiting_returns_at_once_when_the_change_already_happened() {
+    use std::time::{Duration, Instant};
+
+    let known = KnownPeers::new(vec![]);
+    let stale = known.version();
+    known.upsert(peer("b", 2));
+
+    let t0 = Instant::now();
+    known.wait_for_change(stale, Duration::from_secs(60));
+    assert!(t0.elapsed() < Duration::from_millis(100), "不该等");
+}

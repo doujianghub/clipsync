@@ -362,6 +362,10 @@ fn is_reachable_peer(ip: Ipv4Addr) -> bool {
 ///
 /// 一旦有人应答就置位停止标志：后续候选不再发起连接，已在途的最多再等
 /// [`PROBE_TIMEOUT`]。主持方通常只有一台，没必要把整个网段探完。
+pub fn probe_candidates(candidates: Vec<SocketAddr>) -> Vec<(SocketAddr, TcpStream)> {
+    probe(candidates)
+}
+
 fn probe(candidates: Vec<SocketAddr>) -> Vec<(SocketAddr, TcpStream)> {
     if candidates.is_empty() {
         return Vec::new();

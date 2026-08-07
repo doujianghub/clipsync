@@ -166,8 +166,10 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
                 }
                 round = round.wrapping_add(1);
 
-                // 每轮取一次快照：配对流程可能刚加进来一台新设备，
-                // 这样无需重启即可开始拨号。
+                // 在取快照**之前**记下版本：本轮进行期间新加的设备也算变化，
+                // 立刻再来一轮，而不是等满退避。
+                let version_before = ctx.known.version();
+
                 let mut any_connected = false;
                 for peer in ctx.known.snapshot() {
                     // 方向去重：仅由 id 较小的一方主动拨号。
@@ -183,7 +185,9 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
                 }
 
                 backoff = next_backoff(backoff, any_connected);
-                std::thread::sleep(backoff);
+                // 睡到退避到期，或设备表一变就提前醒——配对、引荐登记完
+                // 立即开拨，不用干等一个退避周期。
+                ctx.known.wait_for_change(version_before, backoff);
             }
         })
         .expect("启动拨号线程失败")
