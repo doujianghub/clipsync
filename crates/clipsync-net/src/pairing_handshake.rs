@@ -141,6 +141,8 @@ pub fn run_pairing<S: std::io::Read + std::io::Write>(
         name: their_auth.identity.name,
         static_public_key: their_auth.identity.static_public_key,
         addrs: their_auth.identity.addrs,
+        // 走到这里的都是用户亲手完成的配对（输过配对码）。
+        introduced_by: None,
     })
 }
 

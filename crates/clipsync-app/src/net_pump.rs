@@ -41,8 +41,20 @@ pub(super) fn pump(
     let mut current_timeout = IDLE_READ_TIMEOUT;
     conn.set_read_timeout(Some(current_timeout))?;
 
+    // 先自报家门。`Hello` 在 v1 就已定义，旧版本能解码后忽略，所以发它总是
+    // 安全的；而对端是否**回**一条，正是我们判断它新旧的依据。
+    conn.send(&SyncMessage::Hello {
+        protocol: clipsync_core::PROTOCOL_VERSION,
+        device: ctx.local_device.clone(),
+        device_name: whoami(ctx),
+    })
+    .context("发送 Hello 失败")?;
+
     announce_addresses(&mut conn, ctx)?;
     let mut last_announce = Instant::now();
+    // 对端协议版本；`None` 表示还没收到 Hello（旧版本永远不会发）。
+    let mut peer_protocol: Option<u16> = None;
+    let mut introduced = false;
 
     // 当前正在发送的文件流（同一时刻至多一个）。
     let mut stream: Option<OutgoingStream> = None;
@@ -140,7 +152,15 @@ pub(super) fn pump(
         // 3) 周期性通告地址（覆盖网上线/IP 变化后对端能及时学到）。
         if last_announce.elapsed() >= ADDR_ANNOUNCE_INTERVAL {
             announce_addresses(&mut conn, ctx)?;
+            // 设备表也可能变了（用户又配了一台），顺带再引荐一次。
+            introduce_peers(&mut conn, ctx, peer, peer_protocol)?;
             last_announce = Instant::now();
+        }
+
+        // 收到对端 Hello 后引荐一次，让它认识我们已知的其它设备。
+        if !introduced && peer_protocol.is_some() {
+            introduce_peers(&mut conn, ctx, peer, peer_protocol)?;
+            introduced = true;
         }
 
         // 4) 接收对端消息。
@@ -167,6 +187,11 @@ pub(super) fn pump(
                         }
                         Err(reply) => conn.send(&reply).context("回复文件请求失败")?,
                     }
+                } else if let SyncMessage::Hello { protocol, .. } = msg {
+                    debug!("对端 {} 协议版本 {}", peer.name, protocol);
+                    peer_protocol = Some(protocol);
+                } else if let SyncMessage::Peers { peers } = msg {
+                    learn_peers(ctx, peer, peers);
                 } else {
                     ctx.hub.send(HubEvent::Remote {
                         from: peer.device.clone(),
@@ -180,6 +205,99 @@ pub(super) fn pump(
             }
             Ok(RecvOutcome::Timeout) => { /* 正常超时，回到发送检查 */ }
             Err(e) => return Err(e).context("接收对端消息失败"),
+        }
+    }
+}
+
+/// 本机设备名。配对记录里存的是**对端**的名字，本机名只能现取。
+fn whoami(ctx: &NetCtx) -> String {
+    let _ = ctx;
+    crate::device_name::device_name_best_effort()
+}
+
+/// 把本机已知的其它设备介绍给对端。
+///
+/// 不包含对端自己（它当然认识自己），也不包含本机（对端已经连着我们了）。
+/// 对端版本低于 2 时静默跳过——那边的枚举里没有 `Peers`，发过去只会让它
+/// 解码失败、断开、重连，循环往复。
+fn introduce_peers(
+    conn: &mut NoiseConnection,
+    ctx: &NetCtx,
+    peer: &KnownPeer,
+    peer_protocol: Option<u16>,
+) -> Result<()> {
+    if peer_protocol.unwrap_or(0) < 2 {
+        return Ok(());
+    }
+    let peers: Vec<clipsync_core::PeerIntro> = ctx
+        .known
+        .snapshot()
+        .into_iter()
+        .filter(|p| p.device != peer.device)
+        .map(|p| clipsync_core::PeerIntro {
+            addrs: ctx
+                .addrbook
+                .connect_order(&p.device)
+                .into_iter()
+                .map(|c| c.addr)
+                .collect(),
+            device: p.device,
+            name: p.name,
+            static_public_key: p.static_public_key,
+        })
+        .collect();
+    if peers.is_empty() {
+        return Ok(());
+    }
+    debug!("向 {} 引荐 {} 台设备", peer.name, peers.len());
+    conn.send(&SyncMessage::Peers { peers }).context("引荐设备失败")
+}
+
+/// 收下对端引荐的设备：登记、落盘、记住地址。
+///
+/// **信任模型**：只接受**已配对**对端的引荐——能发到这里的连接都通过了
+/// Noise 静态密钥认证。也就是说，引荐权等同于"你已经信任了这台设备"，
+/// 与它能直接同步你的剪贴板相比，介绍一台新设备并不是更大的权限。
+///
+/// 已认识的设备只更新地址，不覆盖记录——避免对端用一个同 id 但不同公钥的
+/// 条目把已有配对顶掉。
+fn learn_peers(ctx: &NetCtx, from: &KnownPeer, peers: Vec<clipsync_core::PeerIntro>) {
+    // 用户主动移除过的设备一律不收。没有这道关卡，「解除配对」只能维持到
+    // 下一次引荐——那等于这个功能不存在。
+    let blocked = crate::config::load_blocklist(&ctx.config_dir);
+
+    for p in peers {
+        // 别把自己学进去。
+        if p.device == ctx.local_device {
+            continue;
+        }
+        if blocked.contains(&p.device) {
+            debug!("忽略引荐的 {}：已被移除过", p.device);
+            continue;
+        }
+        let known = ctx.known.contains(&p.device);
+        if !known {
+            info!("经 {} 认识了新设备 {}（{}）", from.name, p.name, p.device);
+            ctx.known.upsert(crate::known_peers::KnownPeer {
+                device: p.device.clone(),
+                name: p.name.clone(),
+                static_public_key: p.static_public_key.clone(),
+            });
+            // 落盘，否则重启就忘了。
+            let record = clipsync_net::pairing::PairingRecord {
+                device: p.device.clone(),
+                name: p.name.clone(),
+                static_public_key: p.static_public_key.clone(),
+                addrs: p.addrs.clone(),
+                introduced_by: Some(from.name.clone()),
+            };
+            if let Err(e) = crate::config::upsert_pairing(&ctx.config_dir, record) {
+                warn!("保存引荐来的设备失败: {e:#}");
+            }
+        }
+        if !p.addrs.is_empty() {
+            ctx.addrbook
+                .add_addrs(&p.device, p.addrs, clipsync_net::peer::AddrSource::Peer);
         }
     }
 }

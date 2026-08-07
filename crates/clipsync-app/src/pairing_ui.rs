@@ -101,13 +101,26 @@ impl PairingDeps {
     /// 当前已配对设备及其在线状态，供托盘渲染设备列表。
     pub(crate) fn peers_for_tray(&self) -> Vec<tray::TrayPeer> {
         let connected = self.status.connected_devices();
+        // 来源只存在配对记录里（设备表是运行期的精简副本），读一次盘。
+        // 每次打开菜单几十字节的 IO，换用户能分辨"这台是谁引荐来的"。
+        let introduced: std::collections::HashMap<String, String> =
+            config::load_pairings(&self.dir)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| r.introduced_by.map(|by| (r.device.to_string(), by)))
+                .collect();
+
         self.known
             .snapshot()
             .into_iter()
-            .map(|p| tray::TrayPeer {
-                online: connected.contains(p.device.as_str()),
-                device: p.device.to_string(),
-                name: p.name,
+            .map(|p| {
+                let id = p.device.to_string();
+                tray::TrayPeer {
+                    online: connected.contains(id.as_str()),
+                    introduced_by: introduced.get(&id).cloned(),
+                    device: id,
+                    name: p.name,
+                }
             })
             .collect()
     }
@@ -126,6 +139,9 @@ impl PairingDeps {
         if name.is_none() {
             return Ok(None); // 已经不在了，无需再做
         }
+        // 记下"用户不要这台"，否则下次对端一引荐它就回来了。
+        // 重新亲手配对会自动解除（见 config::upsert_pairing）。
+        config::block_device(&self.dir, &device)?;
         self.known.remove(&device);
         self.addrbook.forget(&device);
         self.hub.send(hub::HubEvent::Unpaired {
@@ -232,9 +248,14 @@ pub(crate) fn host_pairing_interactive(
 ///
 /// 跑在后台线程（弹窗会阻塞到用户点掉，不能占着托盘事件循环）。
 ///
-/// **地址从哪来**：先按局域网自动发现找主持方；找不到再问一次对方地址——
-/// 主持方那边的窗口里就列着可用地址，照抄即可。这样同局域网的常见情形
-/// 全程只需输一个配对码，跨网络也不至于卡死没有出路。
+/// **地址从哪来**，按代价从低到高：
+///   1. 对方给的串里就带着（`ABCDEF@100.88.88.22`）——跨网络时的正路；
+///   2. 局域网自动发现——同网段最省事，一个码就够；
+///   3. 都不行才问用户要地址。
+///
+/// 第 1 条是为覆盖网准备的：Tailscale 这类 L3 overlay **不转发组播**，
+/// 自动发现在那边注定落空。与其让用户先看一屏 IP 再手敲，不如让对方把
+/// 带地址的串整个复制过来。
 pub(crate) fn join_by_code_interactive(
     dir: &std::path::Path,
     identity: &clipsync_net::crypto::StaticIdentity,
@@ -242,55 +263,66 @@ pub(crate) fn join_by_code_interactive(
     sync_port: u16,
     pairing: &PairingDeps,
 ) {
-    let Some(code) = dialog::prompt(
-        "ClipSync 配对",
-        "请输入对方显示的配对码：\n（在对方设备的托盘菜单里选「显示配对码…」）",
+    let Some(input) = dialog::prompt(
+        "输入配对码",
+        "填入对方显示的配对码。\n跨网络时用对方给的「码@地址」那一串。",
     ) else {
         return; // 用户取消
     };
 
-    if clipsync_net::pairing::PairingCode::parse(&code).is_none() {
+    let Some((code, host)) = pairing_cli::parse_pairing_input(&input) else {
         dialog::show_info(
-            "ClipSync 配对失败",
-            &format!("配对码「{code}」格式不正确，请核对后重试。"),
+            "配对失败",
+            &format!("「{input}」不是有效的配对码。\n\n应为 6 位码，或「码@地址」。"),
+        );
+        return;
+    };
+    let code = code.to_string();
+
+    // 串里带了地址就直连，不必再试注定失败的组播发现。
+    if let Some(host) = host {
+        finish_join(
+            pairing_cli::join(dir, identity, device_name, Some(&host), &code, sync_port),
+            pairing,
         );
         return;
     }
 
-    // 先试局域网自动发现。
+    // 没带地址：先试局域网自动发现。
     match pairing_cli::join(dir, identity, device_name, None, &code, sync_port) {
         Ok(record) => {
-            pairing.register(&record);
-            dialog::show_info(
-                "ClipSync 配对成功",
-                &format!("已与「{}」配对，现在可以互相同步了。", record.name),
-            );
+            finish_join(Ok(record), pairing);
             return;
         }
-        Err(e) => {
-            info!("局域网自动发现未能完成配对，改为询问对方地址: {e:#}");
-        }
+        Err(e) => info!("局域网未发现对方，改为询问地址: {e:#}"),
     }
 
-    // 自动发现走不通（不同局域网、组播被拦），退而求其次问地址。
+    // 自动发现走不通（不同局域网、覆盖网、组播被拦），退而求其次问地址。
     let Some(host) = dialog::prompt(
-        "ClipSync 配对",
-        "没能在局域网里找到对方。\n请输入对方设备的 IP 地址（对方窗口里有列出）：",
+        "输入配对码",
+        "没能在局域网里找到对方。\n请输入对方的 IP（对方窗口里有）：",
     ) else {
         return;
     };
+    finish_join(
+        pairing_cli::join(dir, identity, device_name, Some(&host), &code, sync_port),
+        pairing,
+    );
+}
 
-    match pairing_cli::join(dir, identity, device_name, Some(&host), &code, sync_port) {
+/// 配对收尾：登记 + 告知结果。三条路径共用。
+fn finish_join(
+    result: Result<clipsync_net::pairing::PairingRecord>,
+    pairing: &PairingDeps,
+) {
+    match result {
         Ok(record) => {
             pairing.register(&record);
-            dialog::show_info(
-                "ClipSync 配对成功",
-                &format!("已与「{}」配对，现在可以互相同步了。", record.name),
-            );
+            dialog::show_info("配对成功", &format!("已与「{}」配对。", record.name));
         }
         Err(e) => {
             warn!("配对失败: {e:#}");
-            dialog::show_info("ClipSync 配对失败", &format!("{e:#}"));
+            dialog::show_info("配对失败", &format!("{e:#}"));
         }
     }
 }

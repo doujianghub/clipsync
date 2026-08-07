@@ -89,6 +89,15 @@ pub struct PairingRecord {
     /// 持续刷新。`serde(default)` 保证旧版本记录仍可读取。
     #[serde(default)]
     pub addrs: Vec<std::net::SocketAddr>,
+
+    /// 这台设备是**怎么进来的**：`None` 表示用户亲手配对，`Some(名字)`
+    /// 表示由该设备引荐而来。
+    ///
+    /// 记下来是为了让用户能分辨——引荐是传递信任，你的设备表里可能出现
+    /// 从没亲手加过的设备，界面上不区分就等于把这件事藏起来了。
+    /// `serde(default)` 保证旧记录仍可读取（一律视为亲手配对）。
+    #[serde(default)]
+    pub introduced_by: Option<String>,
 }
 
 #[cfg(test)]

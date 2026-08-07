@@ -62,6 +62,8 @@ pub struct TrayPeer {
     pub device: String,
     pub name: String,
     pub online: bool,
+    /// 由哪台设备引荐而来；`None` 表示用户亲手配对。
+    pub introduced_by: Option<String>,
 }
 
 /// 托盘需要展示的当前设置值（用于菜单初始勾选状态）。

@@ -13,6 +13,17 @@
 //! 覆盖网/VPN → 公网"自动优选。因此 Tailscale、ZeroTier、Netbird、WireGuard
 //! 乃至公网端口转发都能直接工作。
 
+// Windows 上编译为 GUI 子系统：双击 exe 或开机自启时不再弹出一个空的黑色
+// 控制台窗口——那对一个"安静常驻"的托盘程序是明显的打扰。
+//
+// **命令行子命令不受影响**：`windows_subsystem` 只决定"要不要自动分配一个
+// 新控制台"。从已有终端（cmd/PowerShell）运行时，进程照样继承父进程的控制台，
+// `println!` 正常可见。真正会丢输出的是双击运行——而那种情况本来就没人看
+// 终端，配对码等关键信息一律另走弹窗（见 `dialog` 模块）。
+//
+// debug 构建保留控制台，方便开发期直接看日志。
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod addrbook;
 mod autostart;
 mod cli;
@@ -75,16 +86,21 @@ fn main() -> Result<()> {
             }
             Some(first) => {
                 let settings = config::load_or_init_settings(&dir)?;
-                // 两种用法：
-                //   clipsync pair <配对码>          局域网自动发现对方
-                //   clipsync pair <对方IP> <配对码>  跨网络时显式指定
-                // 靠"能否解析为合法配对码"区分——配对码字符集不含点与冒号，
-                // 与 IP 地址天然不会混淆。
-                if clipsync_net::pairing::PairingCode::parse(first).is_some()
-                    && args.get(2).is_none()
-                {
-                    pairing_cli::join(&dir, &identity, &device_name, None, first, settings.listen_port)
-                        .map(|_| ())
+                // 三种写法，靠能否解析为配对码来区分——配对码字符集不含点、
+                // 冒号与 @，与 IP 地址天然不会混淆：
+                //   clipsync pair <码>           局域网自动发现
+                //   clipsync pair <码>@<地址>     跨网络，一串搞定
+                //   clipsync pair <地址> <码>     旧写法，仍然支持
+                if let Some((code, host)) = pairing_cli::parse_pairing_input(first) {
+                    pairing_cli::join(
+                        &dir,
+                        &identity,
+                        &device_name,
+                        host.as_deref(),
+                        &code.to_string(),
+                        settings.listen_port,
+                    )
+                    .map(|_| ())
                 } else {
                     let code = args.get(2).map(|s| s.as_str()).unwrap_or("");
                     pairing_cli::join(
@@ -102,7 +118,7 @@ fn main() -> Result<()> {
                 eprintln!("用法:");
                 eprintln!("  clipsync pair --host             主持配对，显示配对码");
                 eprintln!("  clipsync pair <配对码>            局域网内自动找到对方");
-                eprintln!("  clipsync pair <对方IP> <配对码>   跨网络时显式指定");
+                eprintln!("  clipsync pair <配对码>@<对方IP>   跨网络（如 Tailscale）");
                 Ok(())
             }
         },
@@ -235,6 +251,7 @@ fn run_sync(
         outgoing,
         settings: settings_handle.clone(),
         sync_port: settings.listen_port,
+        config_dir: dir.clone(),
     };
     net_manager::spawn_listener(ctx.clone())?;
     net_manager::spawn_dialer(ctx.clone());

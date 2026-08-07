@@ -85,6 +85,7 @@ fn remove_pairing_persists() {
         name: name.to_string(),
         static_public_key: vec![seed; 32],
         addrs: vec![],
+        introduced_by: None,
     };
     let a = mk(1, "笔记本");
     let b = mk(2, "台式机");
@@ -121,4 +122,84 @@ fn settings_roundtrip_custom_values() {
     let back = load_or_init_settings(&dir).unwrap();
     assert_eq!(back.max_bytes, 777_000_000);
     assert_eq!(back.upload_limit_bytes_per_sec, 33_000_000);
+}
+
+/// 解除配对必须压得住引荐——否则「解除」只是个假动作。
+///
+/// 引荐的逻辑是"只要不认识就加进来"。用户在列表里移除某台设备，下一次对端
+/// 一引荐它就原样回来了，而用户以为自己已经断绝了关系。
+#[test]
+fn removed_device_stays_blocked_against_reintroduction() {
+    use clipsync_net::pairing::PairingRecord;
+
+    let dir = std::env::temp_dir().join("clipsync_blocklist_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let dev = clipsync_core::DeviceId::from_public_key(&[9u8; 32]);
+    assert!(load_blocklist(&dir).is_empty(), "起初没有拒绝记录");
+
+    // 用户主动移除。
+    block_device(&dir, &dev).unwrap();
+    assert!(load_blocklist(&dir).contains(&dev), "移除后应记入名单");
+
+    // 重复记入不产生第二条。
+    block_device(&dir, &dev).unwrap();
+    assert_eq!(load_blocklist(&dir).len(), 1);
+
+    // 被引荐回来的记录**不该**解除拒绝——那会让整个机制形同虚设。
+    upsert_pairing(
+        &dir,
+        PairingRecord {
+            device: dev.clone(),
+            name: "回来的设备".into(),
+            static_public_key: vec![9u8; 32],
+            addrs: vec![],
+            introduced_by: Some("某台设备".into()),
+        },
+    )
+    .unwrap();
+    assert!(
+        load_blocklist(&dir).contains(&dev),
+        "引荐不得解除用户的拒绝"
+    );
+
+    // 但用户**亲手**重新配对是明确授权，应当解除拒绝。
+    upsert_pairing(
+        &dir,
+        PairingRecord {
+            device: dev.clone(),
+            name: "亲手配的".into(),
+            static_public_key: vec![9u8; 32],
+            addrs: vec![],
+            introduced_by: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        !load_blocklist(&dir).contains(&dev),
+        "亲手配对应当压过之前的拒绝"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 旧版本的 pairings.json 没有 introduced_by 字段，必须仍能读取。
+#[test]
+fn old_records_without_source_still_load() {
+    let dir = std::env::temp_dir().join("clipsync_oldrec_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("pairings.json"),
+        r#"[{"device":"aabbccddeeff0011","name":"旧记录","static_public_key":[1,2,3]}]"#,
+    )
+    .unwrap();
+
+    let list = load_pairings(&dir).expect("旧格式应能读取");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "旧记录");
+    assert!(list[0].introduced_by.is_none(), "旧记录视为亲手配对");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

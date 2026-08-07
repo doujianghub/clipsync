@@ -9,7 +9,25 @@ use crate::content::ClipContent;
 use crate::device::DeviceId;
 
 /// 协议版本，握手后校验，避免不兼容版本互联出错。
-pub const PROTOCOL_VERSION: u16 = 1;
+/// 协议版本。
+///
+/// **2**：新增 [`SyncMessage::Peers`]（设备互相介绍）。旧版本的枚举里没有这个
+/// 变体，收到会解码失败并断开重连，陷入死循环——所以发它之前必须先确认对端
+/// 版本。确认手段就是 `Hello`：它在 v1 就已定义，旧版本能正常解码后忽略，
+/// 因此对老对端发 `Hello` 是安全的；而老对端不会回 `Hello`，我们据此判定
+/// "对方是旧版"，从而不发 `Peers`。
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// 把一台设备介绍给另一台所需的全部信息。
+///
+/// 公钥是认证依据，没有它对方仍然会拒绝连接；地址是首次连接的线索。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerIntro {
+    pub device: DeviceId,
+    pub name: String,
+    pub static_public_key: Vec<u8>,
+    pub addrs: Vec<std::net::SocketAddr>,
+}
 
 /// 应用层消息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +118,23 @@ pub enum SyncMessage {
     /// 心跳，保持连接与探活。
     Ping,
     Pong,
+
+    // ———————————————————————————————————————————————————————————
+    // 新变体一律追加在末尾：postcard 按变体**索引**编码，插在中间会让
+    // 已有变体的编码整体错位，与旧版本彻底不兼容。
+    // ———————————————————————————————————————————————————————————
+    /// 把本机已知的其它设备介绍给对端。
+    ///
+    /// **解决的问题**：配对是两两的。A 分别与 B、C 配对后，B 和 C 互不认识
+    /// ——它们没交换过公钥，彼此的连接会被"对端未配对"拒绝，信标也互相忽略。
+    /// 而用户看到的是两台设备各自"已连接 1/1 台"，一切正常的样子，直到某天
+    /// 发现 B 复制的东西在 C 上粘不出来。
+    ///
+    /// 于是让已连接的双方互相引荐：A 告诉 B"我还认识 C，这是它的公钥和地址"。
+    /// B 据此把 C 记为已配对，此后 B 与 C 可直连——**A 关机也不影响**。
+    ///
+    /// 只在对端协议版本 ≥ 2 时发送（见 [`PROTOCOL_VERSION`]）。
+    Peers { peers: Vec<PeerIntro> },
 }
 
 impl SyncMessage {
