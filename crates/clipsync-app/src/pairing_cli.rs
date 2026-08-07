@@ -231,3 +231,32 @@ fn local_info(identity: &StaticIdentity, device_name: &str, sync_port: u16) -> L
         addrs: clipsync_net::local::local_candidates(sync_port),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 手动目视验证：弹出与托盘「显示配对码」**完全一致**的窗口。
+    ///
+    /// 这里刻意复用真实的 `dialog_body` 与 `show_info_and_copy`，而不是另写
+    /// 一段相似的内容——照抄一遍只能证明抄得对，证明不了线上那条路径对。
+    /// 唯一省略的是 `TcpListener` 与 `accept` 循环：它们与"窗口显示成什么样"
+    /// 无关，却会让测试永久阻塞。
+    ///
+    /// 跑法：`cargo test -p clipsync-app --bin clipsync -- --ignored pairing_dialog`
+    ///
+    /// 判据：窗口标题为「ClipSync 配对」，正文首行的配对码可读，
+    /// 且该配对码已进入剪贴板（正文里"已复制到剪贴板"这句得是真的）。
+    #[test]
+    #[ignore = "会弹窗并阻塞，需人工/脚本关闭"]
+    fn manual_pairing_dialog() {
+        let code = PairingCode::generate();
+        // 打到 stdout，供外部脚本比对窗口里显示的是不是同一个码。
+        println!("EXPECT_CODE={code}");
+        crate::dialog::show_info_and_copy(
+            "ClipSync 配对",
+            &dialog_body(&code, 47_684, true),
+            &code.to_string(),
+        );
+    }
+}

@@ -125,3 +125,38 @@ mod platform {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// 恶意"设备名"：把两个平台的脚本注入手法都塞进去。
+    ///
+    /// 挑选依据是"若真被解析会留下可观测痕迹"，而不是随便找些特殊字符：
+    ///   - `$(...)` / 反引号：PowerShell 与 shell 的命令替换。写成新建文件，
+    ///     一旦执行就会在 TEMP 留下 `clipsync_inject_marker.txt`。
+    ///   - `"` `;` `&`：闭合引号、拼接下一条命令。
+    ///   - `$env:USERNAME` / `%USERNAME%`：变量展开。若窗口里显示的是真实
+    ///     用户名而非这串字面量，说明内容被当成了脚本文本。
+    pub const EVIL_NAME: &str = concat!(
+        r#"设备"A" ; $(New-Item -Path $env:TEMP\clipsync_inject_marker.txt -Force) "#,
+        r#"& `whoami` $env:USERNAME %USERNAME% 结束"#
+    );
+
+    /// 手动目视验证：弹出一个标题与正文都含注入载荷的窗口。
+    ///
+    /// 默认 `#[ignore]`——它会真的弹窗并阻塞到窗口被关闭，不适合进 CI。
+    /// 跑法：`cargo test -p clipsync-app --bin clipsync -- --ignored injection`
+    ///
+    /// 判据（三条都要看到，缺一不算通过）：
+    ///   1. 窗口真的出现了；
+    ///   2. 标题与正文里那串载荷**原样显示**（说明内容确实传进去了——
+    ///      光看"命令没报错"会漏掉参数根本没传到这件事）；
+    ///   3. `%TEMP%\clipsync_inject_marker.txt` **不存在**（说明没被执行）。
+    #[test]
+    #[ignore = "会弹窗并阻塞，需人工/脚本关闭"]
+    fn manual_injection_dialog() {
+        super::show_info(
+            &format!("ClipSync 配对失败 {EVIL_NAME}"),
+            &format!("对端设备：{EVIL_NAME}\n\n上面这行应原样显示，且不应有任何命令被执行。"),
+        );
+    }
+}
