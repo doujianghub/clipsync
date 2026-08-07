@@ -268,14 +268,23 @@ fn run_powershell_env(
         std::process::Stdio::null()
     };
     let mut cmd = Command::new("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", "-"]);
+    // `-STA` 不可省：WinForms 的 `ShowDialog()` 要求线程处于单线程单元。
+    // powershell.exe(5.1) 默认就是 STA，但如果 PATH 里的 `powershell` 实际
+    // 指向 PowerShell 7，默认是 **MTA**，窗口根本创建不出来。
+    //
+    // 去掉了 `-NonInteractive`：它的本意是"不要弹交互提示"，而我们**就是**
+    // 要弹窗，没有理由自缚手脚。
+    cmd.args(["-NoProfile", "-STA", "-Command", "-"]);
     for (k, v) in env {
         cmd.env(k, v);
     }
     let mut child = cmd
         .stdin(std::process::Stdio::piped())
         .stdout(stdout)
-        .stderr(std::process::Stdio::null())
+        // **必须捕获 stderr**：脚本在子进程里出错时，这是唯一的线索来源。
+        // 早先丢给 null，结果是"黑框一闪而过、窗口不出现、日志里什么都没有"
+        // ——只能靠猜。为一点点噪音丢掉全部诊断信息，非常不划算。
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .context("启动 powershell 失败")?;
 
@@ -287,14 +296,22 @@ fn run_powershell_env(
         .context("写入 powershell 脚本失败")?;
     drop(stdin); // 关闭 stdin，否则 `-Command -` 会一直等更多输入
 
-    if !capture {
-        child.wait().context("等待 powershell 结束失败")?;
-        return Ok(None);
-    }
     let out = child
         .wait_with_output()
         .context("等待 powershell 结束失败")?;
+
+    // 有 stderr 就一定记下来——脚本报错时它是唯一的线索。
+    let err = String::from_utf8_lossy(&out.stderr);
+    let err = err.trim();
+    if !err.is_empty() {
+        tracing::warn!("弹窗脚本报错（窗口可能没弹出来）: {err}");
+    }
     if !out.status.success() {
+        tracing::warn!("弹窗脚本以 {} 退出", out.status);
+        return Ok(None);
+    }
+
+    if !capture {
         return Ok(None);
     }
     Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
