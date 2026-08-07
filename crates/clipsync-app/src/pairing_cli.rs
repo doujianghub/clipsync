@@ -30,13 +30,15 @@ pub const PAIRING_PORT: u16 = 47_685;
 /// `show_dialog`：是否额外弹窗显示配对码。从托盘触发时必须为 `true`
 /// （GUI 启动没有终端，`println!` 的内容用户看不到）；命令行下为 `false`，
 /// 避免多弹一个窗打断用户。
+/// 返回配对成功的记录，供调用方登记到运行中的已配对设备表——从托盘发起
+/// 配对时进程正在运行，不登记就要重启才生效。
 pub fn host(
     dir: &Path,
     identity: &StaticIdentity,
     device_name: &str,
     sync_port: u16,
     show_dialog: bool,
-) -> Result<()> {
+) -> Result<clipsync_net::pairing::PairingRecord> {
     let code = PairingCode::generate();
 
     // 向局域网宣告等待配对（失败不致命，退化为需手输 IP）。
@@ -83,7 +85,7 @@ pub fn host(
                 config::upsert_pairing(dir, record.clone())?;
                 println!("  ✓ 配对成功：{} ({})", record.name, record.device);
                 print_learned_addrs(&record);
-                return Ok(());
+                return Ok(record);
             }
             Err(e) => {
                 println!("  ✗ 本次配对未成功：{e:#}");
@@ -152,7 +154,7 @@ pub fn join(
     host_ip: Option<&str>,
     code_str: &str,
     sync_port: u16,
-) -> Result<()> {
+) -> Result<clipsync_net::pairing::PairingRecord> {
     let code =
         PairingCode::parse(code_str).with_context(|| format!("配对码格式非法: {code_str}"))?;
 
@@ -171,7 +173,7 @@ pub fn join(
     config::upsert_pairing(dir, record.clone())?;
     println!("  ✓ 配对成功：{} ({})", record.name, record.device);
     print_learned_addrs(&record);
-    Ok(())
+    Ok(record)
 }
 
 /// 在局域网中查找正在等待配对的设备，返回其地址。

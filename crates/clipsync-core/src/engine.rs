@@ -88,7 +88,14 @@ pub struct SyncEngine {
     /// 由此产生的下一次本地变化应被当作回声抑制。
     ///
     /// 用集合而非单值，容忍平台监听的轻微乱序/延迟。
+    ///
+    /// **为什么要限容**：登记是"一写一销"的，但回声不保证兑现——写入剪贴板
+    /// 后用户立刻复制了别的内容，去抖动会把这次变化合并掉，那条哈希就再也
+    /// 没人来消费。引擎不碰时间（无法按时长过期），故改用容量上限 + FIFO
+    /// 淘汰：常驻进程跑上几个月，集合也不会无限涨。
     pending_echo: std::collections::HashSet<u64>,
+    /// 回声登记的先后顺序，用于超出容量时淘汰最旧的。
+    pending_echo_order: std::collections::VecDeque<u64>,
 
     /// 曾被判定为敏感的内容哈希。
     ///
@@ -108,6 +115,12 @@ pub struct SyncEngine {
 /// 足够覆盖"标记消失后重新出现"的窗口，又不会无限增长；超出后淘汰最旧的。
 const SENSITIVE_MEMORY: usize = 64;
 
+/// 最多同时挂着多少条待兑现的回声登记。
+///
+/// 正常情况下集合里至多一两条（写入剪贴板后下一轮监听就消费掉了）。取 16
+/// 足以覆盖平台监听的乱序与延迟，又能保证未兑现的登记不会堆积。
+const PENDING_ECHO_CAPACITY: usize = 16;
+
 impl SyncEngine {
     pub fn new(device_id: DeviceId, limits: Limits) -> Self {
         Self {
@@ -117,6 +130,7 @@ impl SyncEngine {
             next_seq: 0,
             last_hash: None,
             pending_echo: std::collections::HashSet::new(),
+            pending_echo_order: std::collections::VecDeque::new(),
             sensitive_hashes: std::collections::HashSet::new(),
             sensitive_order: std::collections::VecDeque::new(),
         }
@@ -160,7 +174,7 @@ impl SyncEngine {
         let hash = content.content_hash();
 
         // 1) 回声抑制：这是我们刚写入系统剪贴板的内容。
-        if self.pending_echo.remove(&hash) {
+        if self.take_echo(hash) {
             // 同步 last_hash，使后续同内容的真实本地复制也能正确去重。
             self.last_hash = Some(hash);
             return LocalDecision::Skip(SkipReason::Echo);
@@ -230,13 +244,30 @@ impl SyncEngine {
     /// 登记"即将写入系统剪贴板"的内容哈希，使随之触发的本地变化被识别为回声。
     ///
     /// 必须在真正写入系统剪贴板之前调用。
+    ///
+    /// 超出 [`PENDING_ECHO_CAPACITY`] 时淘汰最早登记的一条——它多半是一次
+    /// 永远不会兑现的回声（写入后剪贴板又被别的内容盖掉了）。
     pub fn expect_echo(&mut self, content_hash: u64) {
-        self.pending_echo.insert(content_hash);
+        if self.pending_echo.insert(content_hash) {
+            self.pending_echo_order.push_back(content_hash);
+            while self.pending_echo_order.len() > PENDING_ECHO_CAPACITY {
+                if let Some(old) = self.pending_echo_order.pop_front() {
+                    self.pending_echo.remove(&old);
+                }
+            }
+        }
     }
 
-    /// 清空待抑制回声（例如长时间未等到回声，避免集合无限增长）。
-    pub fn clear_pending_echo(&mut self) {
-        self.pending_echo.clear();
+    /// 消费一条回声登记，同时把它从顺序表里摘掉。
+    fn take_echo(&mut self, hash: u64) -> bool {
+        if self.pending_echo.remove(&hash) {
+            if let Some(pos) = self.pending_echo_order.iter().position(|h| *h == hash) {
+                self.pending_echo_order.remove(pos);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// 忘记"当前内容"记录。
@@ -476,6 +507,61 @@ mod tests {
             e.on_local_change(&c, false),
             LocalDecision::Skip(SkipReason::Duplicate)
         );
+    }
+
+    /// 未兑现的回声登记不得无限堆积。
+    ///
+    /// 真实场景：远端内容写入本地剪贴板后，用户立刻复制了别的东西，去抖动
+    /// 把这次变化合并掉——那条登记就再也没人消费。常驻进程一跑几个月，
+    /// 若不限容，集合会随同步次数单调增长。
+    #[test]
+    fn pending_echo_is_bounded() {
+        let mut e = engine();
+        for i in 0..(PENDING_ECHO_CAPACITY * 4) {
+            e.expect_echo(text(&format!("never-echoed-{i}")).content_hash());
+        }
+        assert!(
+            e.pending_echo.len() <= PENDING_ECHO_CAPACITY,
+            "回声登记应受容量限制，实际 {}",
+            e.pending_echo.len()
+        );
+        assert_eq!(
+            e.pending_echo.len(),
+            e.pending_echo_order.len(),
+            "集合与顺序表必须同步，否则淘汰会漏删"
+        );
+
+        // 最近登记的仍应被当作回声抑制——限容不能牺牲防回环这个本职。
+        let recent = text(&format!("never-echoed-{}", PENDING_ECHO_CAPACITY * 4 - 1));
+        assert_eq!(
+            e.on_local_change(&recent, false),
+            LocalDecision::Skip(SkipReason::Echo)
+        );
+    }
+
+    /// 消费一条回声后，顺序表也要同步摘除，否则淘汰时会误删仍有效的登记。
+    #[test]
+    fn consuming_echo_keeps_order_list_in_sync() {
+        let mut e = engine();
+        let a = text("aaa");
+        let b = text("bbb");
+        e.expect_echo(a.content_hash());
+        e.expect_echo(b.content_hash());
+
+        assert_eq!(
+            e.on_local_change(&a, false),
+            LocalDecision::Skip(SkipReason::Echo)
+        );
+        assert_eq!(e.pending_echo.len(), 1);
+        assert_eq!(e.pending_echo_order.len(), 1, "顺序表未同步摘除已消费的登记");
+
+        // b 的登记仍在，仍应被抑制。
+        assert_eq!(
+            e.on_local_change(&b, false),
+            LocalDecision::Skip(SkipReason::Echo)
+        );
+        assert!(e.pending_echo.is_empty());
+        assert!(e.pending_echo_order.is_empty());
     }
 
     /// 文件传输失败后必须能重试：清除记录前会被判为重复，清除后应可重新接收。

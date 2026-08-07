@@ -92,12 +92,68 @@ impl From<PairingRecord> for KnownPeer {
     }
 }
 
+/// 已配对设备表，可在运行期增补。
+///
+/// **为什么不是启动时定格的 `Arc<Vec<_>>`**：配对现在可以从托盘发起
+/// （「显示配对码…」/「输入配对码…」），配对成功时进程正在运行。若这张表
+/// 是启动快照，新配对的设备要**重启程序**才会被拨号线程看见、才会通过入站
+/// 认证——用户点完菜单、看到"配对成功"，然后发现什么也同步不了，只能靠
+/// 猜出"得重启一下"。
+///
+/// 读多写极少（几秒一次读、一辈子几次写），用 `Mutex` + 读时克隆即可，
+/// 不值得引入 `RwLock` 的复杂度。
+#[derive(Clone, Default)]
+pub struct KnownPeers {
+    inner: Arc<Mutex<Vec<KnownPeer>>>,
+}
+
+impl KnownPeers {
+    pub fn new(peers: Vec<KnownPeer>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(peers)),
+        }
+    }
+
+    /// 当前全部已配对设备。
+    pub fn snapshot(&self) -> Vec<KnownPeer> {
+        self.inner.lock().unwrap().clone()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    pub fn contains(&self, device: &DeviceId) -> bool {
+        self.inner.lock().unwrap().iter().any(|p| &p.device == device)
+    }
+
+    /// 按静态公钥查找——入站连接的认证依据。
+    pub fn find_by_static_key(&self, key: &[u8]) -> Option<KnownPeer> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.static_public_key == key)
+            .cloned()
+    }
+
+    /// 加入或更新一台设备（按 device id 去重）。
+    pub fn upsert(&self, peer: KnownPeer) {
+        let mut g = self.inner.lock().unwrap();
+        match g.iter_mut().find(|p| p.device == peer.device) {
+            Some(existing) => *existing = peer,
+            None => g.push(peer),
+        }
+    }
+}
+
 /// 网络层共享上下文，避免各函数签名过长。
 #[derive(Clone)]
 pub struct NetCtx {
     pub local_device: DeviceId,
     pub identity: Arc<StaticIdentity>,
-    pub known: Arc<Vec<KnownPeer>>,
+    /// 已配对设备表。运行期可被配对流程增补，故每次使用都取快照。
+    pub known: KnownPeers,
     pub hub: HubHandle,
     pub registry: ConnRegistry,
     pub addrbook: AddrBook,
@@ -165,7 +221,9 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
                 }
                 round = round.wrapping_add(1);
 
-                for peer in ctx.known.iter() {
+                // 每轮取一次快照：配对流程可能刚加进来一台新设备，
+                // 这样无需重启即可开始拨号。
+                for peer in ctx.known.snapshot() {
                     // 方向去重：仅由 id 较小的一方主动拨号。
                     if ctx.local_device.as_str() >= peer.device.as_str() {
                         continue;
@@ -173,7 +231,7 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
                     if ctx.registry.contains(&peer.device) {
                         continue;
                     }
-                    dial_peer(peer, &ctx);
+                    dial_peer(&peer, &ctx);
                 }
                 std::thread::sleep(DIAL_RETRY_INTERVAL);
             }
@@ -183,9 +241,9 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
 
 /// 输出地址簿概况，便于排查"为何连不上"。
 fn log_addrbook_state(ctx: &NetCtx) {
+    let known = ctx.known.snapshot();
     for (device, cands) in ctx.addrbook.snapshot() {
-        let name = ctx
-            .known
+        let name = known
             .iter()
             .find(|k| k.device == device)
             .map(|k| k.name.as_str())
@@ -251,10 +309,8 @@ fn run_connection(conn: NoiseConnection, ctx: &NetCtx, via: Option<SocketAddr>) 
         .ok_or_else(|| anyhow!("握手后无法获取对端静态公钥"))?;
     let peer = ctx
         .known
-        .iter()
-        .find(|k| k.static_public_key == remote_static)
-        .ok_or_else(|| anyhow!("对端未配对（静态公钥不在记录中），拒绝连接"))?
-        .clone();
+        .find_by_static_key(&remote_static)
+        .ok_or_else(|| anyhow!("对端未配对（静态公钥不在记录中），拒绝连接"))?;
 
     // 去重：同一对端已有连接则放弃本条。
     if !ctx.registry.try_insert(&peer.device) {
@@ -454,6 +510,64 @@ fn announce_addresses(conn: &mut NoiseConnection, ctx: &NetCtx) -> Result<()> {
     }
     conn.send(&SyncMessage::Addresses { addrs })
         .context("通告本机地址失败")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(id: &str, key: u8) -> KnownPeer {
+        KnownPeer {
+            device: DeviceId::from_public_key(id.as_bytes()),
+            name: id.to_string(),
+            static_public_key: vec![key; 32],
+        }
+    }
+
+    /// 运行期新增的设备必须立刻对拨号与入站认证可见。
+    ///
+    /// 配对可以从托盘发起，此时进程正在运行。若这张表是启动快照，用户会
+    /// 看到"配对成功"却什么都同步不了，且没有任何提示说该重启。
+    #[test]
+    fn newly_paired_device_is_visible_immediately() {
+        let known = KnownPeers::new(vec![peer("a", 1)]);
+        let shared = known.clone(); // 拨号线程持有的那一份
+
+        let b = peer("b", 2);
+        known.upsert(b.clone());
+
+        assert_eq!(shared.len(), 2, "克隆出的句柄应看到新设备");
+        assert!(shared.contains(&b.device), "拨号线程据此决定拨谁");
+        assert_eq!(
+            shared.find_by_static_key(&b.static_public_key).map(|p| p.name),
+            Some("b".to_string()),
+            "入站握手据静态公钥认证，查不到就会拒绝这台新配对的设备"
+        );
+    }
+
+    /// 重复配对同一设备只更新、不产生第二条记录。
+    #[test]
+    fn upsert_replaces_instead_of_duplicating() {
+        let known = KnownPeers::new(vec![peer("a", 1)]);
+
+        let mut renamed = peer("a", 9);
+        renamed.name = "改了名的 A".to_string();
+        known.upsert(renamed);
+
+        assert_eq!(known.len(), 1, "同一 device id 不应出现两条");
+        let got = known.snapshot().pop().unwrap();
+        assert_eq!(got.name, "改了名的 A");
+        assert_eq!(got.static_public_key, vec![9; 32], "公钥应更新为最新一次配对的");
+    }
+
+    #[test]
+    fn unknown_static_key_is_not_found() {
+        let known = KnownPeers::new(vec![peer("a", 1)]);
+        assert!(
+            known.find_by_static_key(&[7u8; 32]).is_none(),
+            "未配对的公钥必须查不到——这是拒绝陌生连接的依据"
+        );
+    }
 }
 
 /// 把配对记录中保存的对端地址装入地址簿（首次连接的地址来源）。

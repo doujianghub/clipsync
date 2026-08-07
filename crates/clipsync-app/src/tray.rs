@@ -43,6 +43,14 @@ impl TrayStatus {
         self.data.lock().unwrap().connected = n;
     }
 
+    /// 更新已配对设备总数。
+    ///
+    /// 配对可以在运行期从托盘发起，配完这个数就变了——不更新的话菜单首行
+    /// 会一直停在"尚未配对设备"，而同步其实已经在工作了。
+    pub fn set_paired(&self, n: usize) {
+        self.data.lock().unwrap().paired = n;
+    }
+
     pub fn snapshot(&self) -> StatusData {
         self.data.lock().unwrap().clone()
     }
@@ -202,7 +210,10 @@ impl Rect {
 pub enum TrayAction {
     TogglePause,
     ToggleAutostart,
+    /// 主持配对：生成并显示配对码，等对方连入。
     ShowPairingCode,
+    /// 加入配对：输入对方给的配对码，主动连过去。
+    EnterPairingCode,
     Quit,
     /// 切换"发送图片到其它设备"。
     ToggleSendImages,
@@ -271,7 +282,11 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
     let menu = Menu::new();
     // 首项显示状态，不可点击，仅作信息展示。
     let status_item = MenuItem::new(status.summary(), false, None);
-    let pair_item = MenuItem::new("显示配对码…", true, None);
+    // 配对的两端各给一个入口。此前只有"显示配对码"，加入方**只能**去命令行敲
+    // `clipsync pair <码>`——而这是个托盘常驻的图形程序，多数用户根本不会开
+    // 终端，等于配对只做了一半。
+    let pair_item = MenuItem::new("显示配对码…（本机等待对方加入）", true, None);
+    let join_item = MenuItem::new("输入配对码…（加入对方）", true, None);
 
     // 开关文案强调"发送"：这两项只拦截发出，收到的内容不受影响
     // （引擎只在 on_local_change 检查，on_remote 不检查）。写成"同步图片"
@@ -319,6 +334,7 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
         &status_item,
         &PredefinedMenuItem::separator(),
         &pair_item,
+        &join_item,
         &PredefinedMenuItem::separator(),
         &send_images_item,
         &send_files_item,
@@ -356,6 +372,8 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
                 Some(TrayAction::ToggleAutostart)
             } else if event.id == pair_item.id() {
                 Some(TrayAction::ShowPairingCode)
+            } else if event.id == join_item.id() {
+                Some(TrayAction::EnterPairingCode)
             } else if event.id == quit_item.id() {
                 Some(TrayAction::Quit)
             } else if event.id == send_images_item.id() {
