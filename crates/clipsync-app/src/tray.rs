@@ -16,7 +16,7 @@ mod tray_platform;
 mod tray_status;
 
 pub use tray_icon_draw::{make_icon, IconState};
-pub use tray_status::TrayStatus;
+pub use tray_status::{TrayStatus, TransferProgress};
 
 use tray_platform::{init_platform_app, pump_platform_events};
 
@@ -184,6 +184,7 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
     // 200ms 转一圈，无脑重画等于一秒生成五张图标，白费 CPU。
     let mut current_icon = (IconState::of(&status), false);
     let loop_started = std::time::Instant::now();
+    let mut last_connected = status.connected_devices();
 
     loop {
         // 让平台处理其自身的窗口/菜单消息。
@@ -266,7 +267,16 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
             status_item.set_text(&summary);
             let _ = tray.set_tooltip(Some(&summary));
             last_summary = summary;
-            // 汇总变了意味着连接数变了，设备子菜单里的 ●/○ 也该跟着变。
+        }
+
+        // 设备子菜单只在**在线集合**变化时重建。
+        //
+        // 原先是跟着摘要文案变就重建——加了传输进度之后，摘要每 200ms 就变一次
+        // （百分比、速度都在动），于是设备子菜单被一秒重建五次：白费 CPU，
+        // 菜单正开着的话还会闪。文案变和设备列表变本来就是两回事。
+        let connected_now = status.connected_devices();
+        if connected_now != last_connected {
+            last_connected = connected_now;
             peer_items = rebuild_peer_menu(&peers_menu, &(callbacks.current_peers)())?;
         }
         // 传输中让图标脉冲：亮 / 淡各 450ms。周期取得比 200ms 的循环间隔长
@@ -359,7 +369,12 @@ mod tests {
         let s = TrayStatus::new(1);
         assert!(!s.is_transferring(), "从未传输过就不该脉冲");
 
-        s.note_transfer();
+        s.note_transfer(TransferProgress {
+            sending: true,
+            name: "big.zip".into(),
+            done: 1,
+            total: 100,
+        });
         assert!(s.is_transferring(), "刚传完分块应处于脉冲状态");
     }
 

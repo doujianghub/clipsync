@@ -89,6 +89,8 @@ pub struct OutgoingStream {
     buf: Vec<u8>,
     /// 本文件是否值得压缩（开流时采样判定一次，之后各块沿用）。
     compress: bool,
+    /// 文件总字节数（开流时定格），用于报进度。
+    size: u64,
     /// 从头开始发送时，边读边算的内容哈希。
     ///
     /// `None` 表示这是一次**续传**（起始偏移不为 0）——前半段的字节我们根本
@@ -115,6 +117,7 @@ impl OutgoingStream {
         file.seek(SeekFrom::Start(offset))
             .context("定位到续传偏移失败")?;
 
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         let compress = allow_compress && crate::compress::is_worth_compressing(&path);
         if compress {
             debug!("文件 {} 判定为可压缩，将压缩后传输", path.display());
@@ -126,11 +129,22 @@ impl OutgoingStream {
             path,
             file,
             offset,
+            size,
             buf: vec![0u8; CHUNK_SIZE],
             compress,
             // 只有从头发才能边读边算；续传缺了前半段，结尾仍需重读一遍。
             running_hash: (offset == 0).then(clipsync_core::hash::Hasher::new),
         })
+    }
+
+    /// 当前进度：(已发字节, 总字节) 与文件名，供托盘显示。
+    pub fn progress(&self) -> (u64, u64, String) {
+        let name = self
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "文件".into());
+        (self.offset, self.size, name)
     }
 
     pub fn generation(&self) -> u64 {

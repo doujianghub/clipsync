@@ -98,6 +98,7 @@ pub(super) fn pump(
                     generation: s.generation(),
                 })?;
                 stream = None;
+                ctx.status.clear_transfer();
             } else {
                 let mut finished = false;
                 for _ in 0..CHUNKS_PER_ROUND {
@@ -112,7 +113,13 @@ pub(super) fn pump(
                         Ok(Some(msg)) => {
                             let done = matches!(msg, SyncMessage::FileDone { .. });
                             conn.send(&msg).context("发送文件分块失败")?;
-                            ctx.status.note_transfer();
+                            let (sent, total, name) = s.progress();
+                            ctx.status.note_transfer(crate::tray::TransferProgress {
+                                sending: true,
+                                name,
+                                done: sent,
+                                total,
+                            });
                             if done {
                                 finished = true;
                                 break;
@@ -131,6 +138,7 @@ pub(super) fn pump(
                 }
                 if finished {
                     stream = None;
+                    ctx.status.clear_transfer();
                 }
             }
         }

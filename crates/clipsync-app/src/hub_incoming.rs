@@ -20,6 +20,12 @@ pub(super) struct IncomingTransfer {
     pub(super) files: Vec<FileMeta>,
     /// 与 `files` 等长：各文件内容是否已完整落入缓存。
     pub(super) done: Vec<bool>,
+    /// 本批文件的总字节数与已到手字节数，供托盘报进度。
+    ///
+    /// 累计着算而不是每块去问缓存：`have_bytes` 要按文件查一遍，放在每个
+    /// 分块的路径上就是白白的开销。
+    pub(super) total_bytes: u64,
+    pub(super) got_bytes: u64,
 }
 
 impl IncomingTransfer {
@@ -66,6 +72,8 @@ impl HubState {
             from: from.clone(),
             files,
             done,
+            total_bytes: total,
+            got_bytes: cached_bytes,
         };
 
         if transfer.all_done() {
@@ -138,7 +146,24 @@ impl HubState {
             warn!("写入文件分块失败: {e:#}");
             self.incoming = None;
             self.engine.forget_current();
+            self.deps.status.clear_transfer();
             let _ = from;
+            return;
+        }
+
+        // 报进度。名字取当前这个文件——多文件是逐个传的，报总数反而看不出在动。
+        if let Some(t) = self.incoming.as_mut() {
+            t.got_bytes = t.got_bytes.saturating_add(plain.len() as u64);
+            let name = t
+                .index_of(file_id)
+                .map(|i| t.files[i].name.clone())
+                .unwrap_or_else(|| "文件".into());
+            self.deps.status.note_transfer(crate::tray::TransferProgress {
+                sending: false,
+                name,
+                done: t.got_bytes,
+                total: t.total_bytes,
+            });
         }
     }
 
