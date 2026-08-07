@@ -29,8 +29,17 @@ tray-icon = "0.19"
 flate2 = "1"
 
 # 托盘需要在主线程上跑平台消息循环。windows-sys 已缓存，仅增 feature。
+# Win32_UI_Controls 提供 TaskDialogIndirect——系统原生的现代对话框。
+# 用它替代"起 PowerShell 子进程画 WinForms 窗口"：后者外观停留在 2002 年，
+# 每次弹窗要多花 100–300ms 起进程，GUI 进程创建控制台子进程时还会闪一下
+# 黑框，而且 `powershell -Command -`（从 stdin 喂脚本）是无文件攻击的典型
+# 模式，杀软有充分理由拦它。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.60", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_Foundation",
+] }
 
 # macOS 上 tray-icon 依赖 NSApplication 的事件循环才能响应菜单点击。
 # 版本对齐 tray-icon 0.19 实际使用的 objc2 0.6 / app-kit 0.3（见 Cargo.lock）。

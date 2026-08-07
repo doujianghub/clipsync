@@ -6,6 +6,26 @@
 use anyhow::{Context, Result};
 use std::process::Command;
 
+#[path = "dialog_win_task.rs"]
+mod task;
+
+/// 信息框、确认框、选择框一律先走 TaskDialog（系统原生、无子进程、不闪黑框）。
+///
+/// **仍保留 PowerShell 实现作为回退**：TaskDialog 需要 comctl32 v6，正常的
+/// Windows 都有，但万一某个精简系统上拿不到，弹不出窗比丑要糟得多——那意味着
+/// 连配对码都看不见。回退路径让功能不至于整个消失。
+macro_rules! task_or_fallback {
+    ($task:expr, $fallback:expr) => {
+        match $task {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                tracing::warn!("TaskDialog 不可用，回退到 PowerShell 弹窗: {e:#}");
+                $fallback
+            }
+        }
+    };
+}
+
 
 /// **必须在创建任何窗口之前执行**的 DPI 感知声明。
 ///
@@ -81,13 +101,13 @@ $box.Font = New-Object System.Drawing.Font('Consolas', 12)
 $form.Controls.Add($box)
 
 $ok = New-Object System.Windows.Forms.Button
-$ok.Text = '确定'
+$ok.Text = $env:CLIPSYNC_DLG_OK
 $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
 $ok.SetBounds(196, 114, 80, 26)
 $form.Controls.Add($ok)
 
 $cancel = New-Object System.Windows.Forms.Button
-$cancel.Text = '取消'
+$cancel.Text = $env:CLIPSYNC_DLG_CANCEL
 $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 $cancel.SetBounds(284, 114, 80, 26)
 $form.Controls.Add($cancel)
@@ -103,11 +123,23 @@ if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
 "#;
 
 pub fn show(title: &str, body: &str) -> Result<()> {
-    run_powershell(SCRIPT, title, body, false).map(|_| ())
+    task_or_fallback!(
+        task::show(title, body),
+        run_powershell(SCRIPT, title, body, false).map(|_| ())
+    )
 }
 
 pub fn prompt(title: &str, body: &str) -> Result<Option<String>> {
-    run_powershell(PROMPT_SCRIPT, title, body, true)
+    run_powershell_env(
+        PROMPT_SCRIPT,
+        &[
+            ("CLIPSYNC_DLG_TITLE", title),
+            ("CLIPSYNC_DLG_BODY", body),
+            ("CLIPSYNC_DLG_OK", "确定"),
+            ("CLIPSYNC_DLG_CANCEL", "取消"),
+        ],
+        true,
+    )
 }
 
 /// 确认框。默认按钮设为「否」——破坏性操作不该被一次回车带过。
@@ -153,13 +185,13 @@ if ($list.Items.Count -gt 0) { $list.SelectedIndex = 0 }
 $form.Controls.Add($list)
 
 $ok = New-Object System.Windows.Forms.Button
-$ok.Text = '确定'
+$ok.Text = $env:CLIPSYNC_DLG_OK
 $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
 $ok.SetBounds(156, 222, 80, 26)
 $form.Controls.Add($ok)
 
 $cancel = New-Object System.Windows.Forms.Button
-$cancel.Text = '取消'
+$cancel.Text = $env:CLIPSYNC_DLG_CANCEL
 $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 $cancel.SetBounds(244, 222, 80, 26)
 $form.Controls.Add($cancel)
@@ -167,7 +199,7 @@ $form.Controls.Add($cancel)
 $form.AcceptButton = $ok
 $form.CancelButton = $cancel
 $form.Topmost = $true
-# 双击列表项等同于确定——省一次点击。
+# Double-click acts as OK.
 $list.Add_DoubleClick({ $form.DialogResult = [System.Windows.Forms.DialogResult]::OK })
 
 if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK -and $list.SelectedIndex -ge 0) {
@@ -176,6 +208,10 @@ if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK -and $list.Se
 "#;
 
 pub fn choose(title: &str, body: &str, items: &[String]) -> Result<Option<usize>> {
+    task_or_fallback!(task::choose(title, body, items), choose_winforms(title, body, items))
+}
+
+fn choose_winforms(title: &str, body: &str, items: &[String]) -> Result<Option<usize>> {
     let joined = items.join("\n");
     let out = run_powershell_env(
         CHOOSE_SCRIPT,
@@ -183,6 +219,8 @@ pub fn choose(title: &str, body: &str, items: &[String]) -> Result<Option<usize>
             ("CLIPSYNC_DLG_TITLE", title),
             ("CLIPSYNC_DLG_BODY", body),
             ("CLIPSYNC_DLG_ITEMS", &joined),
+            ("CLIPSYNC_DLG_OK", "确定"),
+            ("CLIPSYNC_DLG_CANCEL", "取消"),
         ],
         true,
     )?;
@@ -190,6 +228,10 @@ pub fn choose(title: &str, body: &str, items: &[String]) -> Result<Option<usize>
 }
 
 pub fn confirm(title: &str, body: &str) -> Result<bool> {
+    task_or_fallback!(task::confirm(title, body), confirm_winforms(title, body))
+}
+
+fn confirm_winforms(title: &str, body: &str) -> Result<bool> {
     Ok(run_powershell(CONFIRM_SCRIPT, title, body, true)?
         .map(|s| s.trim() == "yes")
         .unwrap_or(false))

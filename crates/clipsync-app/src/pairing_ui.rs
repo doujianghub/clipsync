@@ -244,18 +244,23 @@ pub(crate) fn host_pairing_interactive(
     }
 }
 
-/// 托盘「输入配对码…」的完整流程：要码 → 加入 → 告知结果。
+/// 托盘「输入配对码…」的完整流程：拿到码 → 加入 → 告知结果。
 ///
 /// 跑在后台线程（弹窗会阻塞到用户点掉，不能占着托盘事件循环）。
 ///
-/// **地址从哪来**，按代价从低到高：
-///   1. 对方给的串里就带着（`ABCDEF@100.88.88.22`）——跨网络时的正路；
-///   2. 局域网自动发现——同网段最省事，一个码就够；
-///   3. 都不行才问用户要地址。
+/// **优先读剪贴板**：对方点「显示配对码」时，码就已经自动进了他的剪贴板；
+/// 他微信发给你、你复制一下——这是本来就要做的动作。于是这里直接读，
+/// 弹个确认框问一句就行，不必手打 6 位码（也就不会打错）。
 ///
-/// 第 1 条是为覆盖网准备的：Tailscale 这类 L3 overlay **不转发组播**，
-/// 自动发现在那边注定落空。与其让用户先看一屏 IP 再手敲，不如让对方把
-/// 带地址的串整个复制过来。
+/// 这还顺带绕开了一个真实故障：Windows 上文本输入框依赖 PowerShell 子进程，
+/// 而那条路径可能被杀软拦下（`powershell -Command -` 是无文件攻击的典型
+/// 模式）。确认框走的是系统原生 TaskDialog，不受影响——**配对这条核心流程
+/// 因此不再依赖输入框**。
+///
+/// **地址从哪来**，按代价从低到高：
+///   1. 码串里就带着（`ABCDEF@100.88.88.22`）——跨网络时的正路；
+///   2. 局域网自动发现——同网段最省事；
+///   3. 都不行才问用户要地址。
 pub(crate) fn join_by_code_interactive(
     dir: &std::path::Path,
     identity: &clipsync_net::crypto::StaticIdentity,
@@ -263,23 +268,12 @@ pub(crate) fn join_by_code_interactive(
     sync_port: u16,
     pairing: &PairingDeps,
 ) {
-    let Some(input) = dialog::prompt(
-        "输入配对码",
-        "填入对方显示的配对码。\n跨网络时用对方给的「码@地址」那一串。",
-    ) else {
-        return; // 用户取消
-    };
-
-    let Some((code, host)) = pairing_cli::parse_pairing_input(&input) else {
-        dialog::show_info(
-            "配对失败",
-            &format!("「{input}」不是有效的配对码。\n\n应为 6 位码，或「码@地址」。"),
-        );
-        return;
+    let Some((code, host)) = obtain_code() else {
+        return; // 用户取消，或没给出可用的码
     };
     let code = code.to_string();
 
-    // 串里带了地址就直连，不必再试注定失败的组播发现。
+    // 码串里带了地址就直连，不必再试注定失败的组播发现。
     if let Some(host) = host {
         finish_join(
             pairing_cli::join(dir, identity, device_name, Some(&host), &code, sync_port),
@@ -288,7 +282,6 @@ pub(crate) fn join_by_code_interactive(
         return;
     }
 
-    // 没带地址：先试局域网自动发现。
     match pairing_cli::join(dir, identity, device_name, None, &code, sync_port) {
         Ok(record) => {
             finish_join(Ok(record), pairing);
@@ -297,7 +290,6 @@ pub(crate) fn join_by_code_interactive(
         Err(e) => info!("局域网未发现对方，改为询问地址: {e:#}"),
     }
 
-    // 自动发现走不通（不同局域网、覆盖网、组播被拦），退而求其次问地址。
     let Some(host) = dialog::prompt(
         "输入配对码",
         "没能在局域网里找到对方。\n请输入对方的 IP（对方窗口里有）：",
@@ -308,6 +300,50 @@ pub(crate) fn join_by_code_interactive(
         pairing_cli::join(dir, identity, device_name, Some(&host), &code, sync_port),
         pairing,
     );
+}
+
+/// 拿到配对码：先看剪贴板，不成再让用户手输。
+fn obtain_code() -> Option<(clipsync_net::pairing::PairingCode, Option<String>)> {
+    if let Some(text) = clipboard_text() {
+        if let Some((code, host)) = pairing_cli::parse_pairing_input(&text) {
+            let where_ = match &host {
+                Some(h) => format!("\n对方地址：{h}"),
+                None => String::new(),
+            };
+            if dialog::confirm(
+                "输入配对码",
+                &format!("剪贴板里的配对码是 {code}{where_}\n\n用它与对方配对吗？"),
+            ) {
+                return Some((code, host));
+            }
+            // 用户说不是这个，继续往下走手输。
+        }
+    }
+
+    let input = dialog::prompt(
+        "输入配对码",
+        "填入对方显示的配对码。\n跨网络时用对方给的「码@地址」那一串。",
+    )?;
+    match pairing_cli::parse_pairing_input(&input) {
+        Some(v) => Some(v),
+        None => {
+            dialog::show_info(
+                "配对失败",
+                &format!("「{input}」不是有效的配对码。\n\n应为 6 位码，或「码@地址」。"),
+            );
+            None
+        }
+    }
+}
+
+/// 读剪贴板里的纯文本；读不到就当没有。
+fn clipboard_text() -> Option<String> {
+    use clipsync_clip::Clipboard as _;
+    let mut cb = clipsync_clip::ArboardClipboard::new().ok()?;
+    match cb.read().ok()?? .content {
+        clipsync_core::ClipContent::Text(s) => Some(s),
+        _ => None,
+    }
 }
 
 /// 配对收尾：登记 + 告知结果。三条路径共用。

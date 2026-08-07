@@ -203,3 +203,64 @@ fn old_records_without_source_still_load() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 目录名换过一次，旧位置的东西必须搬过来。
+///
+/// 那里面有设备长期身份私钥与全部配对记录——直接换路径等于让用户所有设备
+/// 一夜之间互不相识，而且不会有任何提示。
+#[test]
+fn legacy_dir_is_migrated() {
+    let base = std::env::temp_dir().join("clipsync_migrate_test");
+    let _ = std::fs::remove_dir_all(&base);
+    let old = base.join("ClipSync.ClipSync");
+    let new = base.join("ClipSync");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("identity.json"), r#"{"private_key":[1],"public_key":[2]}"#).unwrap();
+    std::fs::write(old.join("pairings.json"), "[]").unwrap();
+
+    migrate_legacy_dir(&new);
+
+    assert!(new.join("identity.json").exists(), "身份文件应已搬到新目录");
+    assert!(new.join("pairings.json").exists(), "配对记录应一并搬过来");
+    assert!(!old.exists(), "旧目录应已不复存在（是移动不是复制）");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 新目录已有内容时不得覆盖——那会毁掉用户当前正在用的配置。
+#[test]
+fn migration_never_clobbers_existing() {
+    let base = std::env::temp_dir().join("clipsync_migrate_test2");
+    let _ = std::fs::remove_dir_all(&base);
+    let old = base.join("ClipSync.ClipSync");
+    let new = base.join("ClipSync");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("identity.json"), "旧的").unwrap();
+    std::fs::create_dir_all(&new).unwrap();
+    std::fs::write(new.join("identity.json"), "新的").unwrap();
+
+    migrate_legacy_dir(&new);
+
+    assert_eq!(
+        std::fs::read_to_string(new.join("identity.json")).unwrap(),
+        "新的",
+        "已有配置不得被旧目录覆盖"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 旧目录里没有身份文件（空壳/残留）时不该搬。
+#[test]
+fn empty_legacy_dir_is_ignored() {
+    let base = std::env::temp_dir().join("clipsync_migrate_test3");
+    let _ = std::fs::remove_dir_all(&base);
+    let old = base.join("ClipSync.ClipSync");
+    let new = base.join("ClipSync");
+    std::fs::create_dir_all(&old).unwrap();
+
+    migrate_legacy_dir(&new);
+
+    assert!(!new.exists(), "没有身份文件的残留目录不值得搬");
+    let _ = std::fs::remove_dir_all(&base);
+}
