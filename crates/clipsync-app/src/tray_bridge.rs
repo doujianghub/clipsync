@@ -73,44 +73,26 @@ pub(crate) fn run_tray(
                 running_for_cb.store(false, Ordering::SeqCst);
                 false
             }
-            tray::TrayAction::ToggleSendImages => {
+            tray::TrayAction::ToggleImages => {
                 let now = !settings_for_cb.snapshot().allow_image;
                 settings_for_cb.update(|s| s.allow_image = now);
-                info!("发送图片已{}", if now { "开启" } else { "关闭" });
+                info!("同步图片已{}", if now { "开启" } else { "关闭" });
                 true
             }
-            tray::TrayAction::ToggleSendFiles => {
+            tray::TrayAction::ToggleFiles => {
                 let now = !settings_for_cb.snapshot().allow_files;
                 settings_for_cb.update(|s| s.allow_files = now);
-                info!("发送文件已{}", if now { "开启" } else { "关闭" });
+                info!("同步文件已{}", if now { "开启" } else { "关闭" });
                 true
             }
             tray::TrayAction::ToggleCompress => {
                 let now = !settings_for_cb.snapshot().compress_transfers;
                 settings_for_cb.update(|s| s.compress_transfers = now);
-                info!("传输前自动压缩已{}", if now { "开启" } else { "关闭" });
+                info!("传输前压缩已{}", if now { "开启" } else { "关闭" });
                 true
             }
-            tray::TrayAction::SetMaxBytes(v) => {
-                settings_for_cb.update(|s| s.max_bytes = v);
-                if v == usize::MAX {
-                    info!("单次大小上限：不限制");
-                } else {
-                    info!("单次大小上限：{} MiB", v / (1024 * 1024));
-                }
-                true
-            }
-            tray::TrayAction::SetUploadLimit(v) => {
-                settings_for_cb.update(|s| s.upload_limit_bytes_per_sec = v);
-                if v == 0 {
-                    info!("发送限速：不限速");
-                } else {
-                    info!("发送限速：{} MB/s", v / 1_000_000);
-                }
-                true
-            }
-            // 三个「自定义…」都要弹框，而弹框会阻塞到用户点掉——放在托盘
-            // 事件循环里会让整个菜单卡住，故一律丢到后台线程。
+            // 弹框会阻塞到用户点掉，放在托盘事件循环里会让整个菜单卡住，
+            // 故一律丢到后台线程。
             tray::TrayAction::PromptMaxBytes => {
                 let s = settings_for_cb.clone();
                 std::thread::spawn(move || prompt_max_bytes(&s));
@@ -155,8 +137,8 @@ pub(crate) fn run_tray(
         current_settings: Box::new(move || {
             let s = settings_for_read.snapshot();
             tray::TraySettings {
-                send_images: s.allow_image,
-                send_files: s.allow_files,
+                sync_images: s.allow_image,
+                sync_files: s.allow_files,
                 compress: s.compress_transfers,
                 max_bytes: s.max_bytes,
                 upload_limit: s.upload_limit_bytes_per_sec,
@@ -183,114 +165,91 @@ pub(crate) fn run_tray(
 /// 托盘里点某台设备 → 确认 → 解除配对。
 ///
 
-/// 弹框自定义单次大小上限。
+/// 弹一个输入框改某项设置。
 ///
-/// 输入非法时**再弹一次说明**而不是静默忽略：用户刚打完一串字，什么反馈都
-/// 没有只会让人以为程序坏了。
+/// 三处设置（上限、限速、端口）流程完全一样：显示当前值 → 收输入 → 解析 →
+/// 写回或告知为什么没生效。差别只在**怎么解析**和**怎么描述**，抽出来后
+/// 各自只剩几行。
+///
+/// 输入非法时**再弹一次说明**而不是静默忽略：用户刚打完一串字，什么反馈
+/// 都没有只会让人以为程序坏了。
+fn prompt_setting<T>(
+    settings: &config::SettingsHandle,
+    title: &str,
+    current: &str,
+    hint: &str,
+    parse: impl Fn(&str) -> anyhow::Result<T>,
+    apply: impl FnOnce(&mut config::Settings, T),
+) {
+    let Some(input) = dialog::prompt(title, &format!("当前：{current}\n\n{hint}")) else {
+        return; // 用户取消
+    };
+    match parse(&input) {
+        Ok(v) => {
+            settings.update(|s| apply(s, v));
+            info!("{title}已更新");
+        }
+        Err(e) => dialog::show_info(title, &format!("{e}")),
+    }
+}
+
 fn prompt_max_bytes(settings: &config::SettingsHandle) {
-    let current = settings.snapshot().max_bytes;
-    let Some(input) = dialog::prompt(
-        "ClipSync 单次大小上限",
-        &format!(
-            "当前：{}\n\n输入新的上限，例如 500MB、1.5GiB、200m：\n（填 0 表示不限制）",
-            describe_bytes(current)
-        ),
-    ) else {
-        return;
-    };
-
-    match size_parse::parse_byte_size(&input) {
-        Ok(0) => {
-            settings.update(|s| s.max_bytes = usize::MAX);
-            info!("单次大小上限：不限制");
-        }
-        Ok(v) => {
-            let v = v as usize;
-            settings.update(|s| s.max_bytes = v);
-            info!("单次大小上限：{} 字节", v);
-        }
-        Err(e) => dialog::show_info("ClipSync 设置未生效", &format!("{e}")),
-    }
-}
-
-/// 弹框自定义发送限速。
-fn prompt_upload_limit(settings: &config::SettingsHandle) {
-    let current = settings.snapshot().upload_limit_bytes_per_sec;
-    let shown = if current == 0 {
-        "不限速".to_string()
+    let cur = settings.snapshot().max_bytes;
+    let shown = if cur == usize::MAX {
+        "不限".to_string()
     } else {
-        format!("{}/s", describe_bytes(current as usize))
+        tray::human_bytes(cur as u64)
     };
-    let Some(input) = dialog::prompt(
-        "ClipSync 发送限速",
-        &format!(
-            "当前：{shown}\n\n输入新的限速，例如 10MB/s、20mbps、5M：\n（填 0 表示不限速）"
-        ),
-    ) else {
-        return;
-    };
-
-    match size_parse::parse_rate(&input) {
-        Ok(v) => {
-            settings.update(|s| s.upload_limit_bytes_per_sec = v);
-            if v == 0 {
-                info!("发送限速：不限速");
-            } else {
-                info!("发送限速：{} 字节/秒", v);
-            }
-        }
-        Err(e) => dialog::show_info("ClipSync 设置未生效", &format!("{e}")),
-    }
+    prompt_setting(
+        settings,
+        "单次上限",
+        &shown,
+        "例如 500MB、1.5GiB；填 0 表示不限",
+        size_parse::parse_byte_size,
+        // 0 在这里表示"不限"，而不是"一个字节都不许传"。
+        |s, v| s.max_bytes = if v == 0 { usize::MAX } else { v as usize },
+    );
 }
 
-/// 弹框修改同步监听端口。
-///
-/// 端口与其它设置不同：**改了要重启才生效**——监听套接字在启动时就绑好了，
+fn prompt_upload_limit(settings: &config::SettingsHandle) {
+    let cur = settings.snapshot().upload_limit_bytes_per_sec;
+    let shown = if cur == 0 {
+        "不限".to_string()
+    } else {
+        format!("{}/s", tray::human_bytes(cur))
+    };
+    prompt_setting(
+        settings,
+        "发送限速",
+        &shown,
+        "例如 10MB/s、20mbps；填 0 表示不限",
+        size_parse::parse_rate,
+        |s, v| s.upload_limit_bytes_per_sec = v,
+    );
+}
+
+/// 端口与其它设置不同：**改了要重启才生效**。监听套接字在启动时就绑好了，
 /// 运行中换端口意味着断开所有连接重新监听，还要让对端重新学到新端口。
 /// 与其做一套半可靠的热切换，不如如实告诉用户重启一下。
 fn prompt_listen_port(settings: &config::SettingsHandle) {
-    let current = settings.snapshot().listen_port;
-    let Some(input) = dialog::prompt(
-        "ClipSync 同步端口",
-        &format!("当前：{current}\n\n输入新的端口（1024–65535）：\n改动将在下次启动时生效。"),
-    ) else {
-        return;
-    };
-
-    match input.trim().parse::<u16>() {
-        // 1024 以下是特权端口，普通用户绑不上，提前拦住比让它启动时失败好。
-        Ok(p) if p >= 1024 => {
-            settings.update(|s| s.listen_port = p);
-            info!("同步端口已改为 {p}（重启后生效）");
-            dialog::show_info(
-                "ClipSync 同步端口",
-                &format!("已设为 {p}。\n\n请重启 ClipSync 使其生效，并确认对端也能连到这个端口。"),
-            );
-        }
-        Ok(p) => dialog::show_info(
-            "ClipSync 设置未生效",
-            &format!("端口 {p} 属于系统保留范围，请填 1024–65535 之间的值。"),
-        ),
-        Err(_) => dialog::show_info(
-            "ClipSync 设置未生效",
-            &format!("「{input}」不是有效端口，请填 1024–65535 之间的整数。"),
-        ),
-    }
-}
-
-/// 把字节数写成人能读的形式（弹窗里展示当前值用）。
-fn describe_bytes(n: usize) -> String {
-    if n == usize::MAX {
-        return "不限制".to_string();
-    }
-    if n >= 1 << 30 {
-        format!("{:.2} GiB", n as f64 / (1u64 << 30) as f64)
-    } else if n >= 1 << 20 {
-        format!("{:.0} MiB", n as f64 / (1u64 << 20) as f64)
-    } else if n >= 1 << 10 {
-        format!("{:.0} KiB", n as f64 / 1024.0)
-    } else {
-        format!("{n} 字节")
-    }
+    let cur = settings.snapshot().listen_port;
+    prompt_setting(
+        settings,
+        "同步端口",
+        &cur.to_string(),
+        "填 1024–65535；重启后生效",
+        |s| {
+            let p: u16 = s
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("「{s}」不是有效端口"))?;
+            // 1024 以下是特权端口，普通用户绑不上，提前拦住比启动时才失败好。
+            if p < 1024 {
+                anyhow::bail!("端口 {p} 属于系统保留范围，请填 1024–65535");
+            }
+            Ok(p)
+        },
+        |s, v| s.listen_port = v,
+    );
 }
 

@@ -40,8 +40,18 @@ use net_pump::pump;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// 向对端重复通告本机地址的间隔。
 pub(super) const ADDR_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
-/// 拨号轮询间隔。
+/// 拨号重试的起始间隔。连不上时逐轮加倍，直至 [`DIAL_RETRY_MAX`]。
+///
+/// **为什么要退避**：原先恒定 3 秒一轮，对端不在线时就一直空转——笔记本合盖
+/// 带出门，它会整天以这个节奏挨个尝试每一个候选地址（每个还要等 TCP 超时）。
+/// 这既费电又毫无意义：对方不在，再频繁也连不上。
+///
+/// 退避只在"一轮下来一个都没连上"时推进；**任意一次连接成功即复位**，
+/// 所以回到家打开盖子，最迟一个 `DIAL_RETRY_MAX` 就能重新连上。
 const DIAL_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+/// 退避的上限。取 60 秒：断网一整天也只是每分钟试一次，而重新联网后
+/// 最坏等一分钟就恢复——对一个后台同步工具是合适的折中。
+const DIAL_RETRY_MAX: Duration = Duration::from_secs(60);
 /// 每隔多少轮拨号重采样一次本机网段（约 30 秒）。
 const REFRESH_NETWORKS_EVERY: u32 = 10;
 /// 空闲时的 TCP 读超时：较长以降低 CPU 占用。
@@ -144,6 +154,7 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
         .name("net-dialer".into())
         .spawn(move || {
             let mut round: u32 = 0;
+            let mut backoff = DIAL_RETRY_INTERVAL;
             loop {
                 // 周期性重采样本机网段：覆盖网上线/网络切换后，地址分类
                 // （同网段直连 vs 覆盖网）才能保持准确。
@@ -155,6 +166,7 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
 
                 // 每轮取一次快照：配对流程可能刚加进来一台新设备，
                 // 这样无需重启即可开始拨号。
+                let mut any_connected = false;
                 for peer in ctx.known.snapshot() {
                     // 方向去重：仅由 id 较小的一方主动拨号。
                     if ctx.local_device.as_str() >= peer.device.as_str() {
@@ -163,12 +175,28 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
                     if ctx.registry.contains(&peer.device) {
                         continue;
                     }
-                    dial_peer(&peer, &ctx);
+                    if dial_peer(&peer, &ctx) {
+                        any_connected = true;
+                    }
                 }
-                std::thread::sleep(DIAL_RETRY_INTERVAL);
+
+                backoff = next_backoff(backoff, any_connected);
+                std::thread::sleep(backoff);
             }
         })
         .expect("启动拨号线程失败")
+}
+
+/// 推进重试间隔：连上过就复位，否则加倍到上限。
+///
+/// 单独成函数只为能直接测——退避写错（比如忘了复位）的表现是"断网一次之后
+/// 就再也不积极重连了"，属于那种平时看不出、真出事才发现的问题。
+fn next_backoff(current: Duration, any_connected: bool) -> Duration {
+    if any_connected {
+        DIAL_RETRY_INTERVAL
+    } else {
+        (current * 2).min(DIAL_RETRY_MAX)
+    }
 }
 
 /// 输出地址簿概况，便于排查"为何连不上"。
@@ -191,27 +219,30 @@ fn log_addrbook_state(ctx: &NetCtx) {
 }
 
 /// 按优先级依次尝试该对端的候选地址，首个成功者进入收发循环（阻塞至断开）。
-fn dial_peer(peer: &KnownPeer, ctx: &NetCtx) {
+///
+/// 返回是否**握手成功过**——拨号线程据此决定要不要退避。
+fn dial_peer(peer: &KnownPeer, ctx: &NetCtx) -> bool {
     let candidates = ctx.addrbook.connect_order(&peer.device);
     if candidates.is_empty() {
         debug!("对端 {} 暂无候选地址（等待发现或配对信息）", peer.name);
-        return;
+        return false;
     }
 
     for cand in candidates {
         // 逐个尝试期间可能已由入站连接建立，及时收手。
         if ctx.registry.contains(&peer.device) {
-            return;
+            return true;
         }
         match dial_addr(peer, cand.addr, ctx) {
             Ok(true) => {
                 // 连接已结束（正常断开），本轮到此为止，等下一轮重试。
-                return;
+                return true;
             }
             Ok(false) => { /* 该地址不可用，试下一个 */ }
             Err(e) => debug!("连接 {} 失败: {e:#}", cand.addr),
         }
     }
+    false
 }
 
 /// 尝试单个地址。返回 `Ok(true)` 表示握手成功并已完成一次连接会话。
@@ -288,5 +319,42 @@ pub fn seed_addrbook_from_pairings(addrbook: &AddrBook, pairings: &[PairingRecor
         if !p.addrs.is_empty() {
             addrbook.add_addrs(&p.device, p.addrs.iter().copied(), AddrSource::Pairing);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 连不上时逐轮加倍并停在上限——不能无限增长，否则恢复联网后要等太久。
+    #[test]
+    fn backoff_grows_then_caps() {
+        let mut d = DIAL_RETRY_INTERVAL;
+        let mut seen = vec![d];
+        for _ in 0..10 {
+            d = next_backoff(d, false);
+            seen.push(d);
+        }
+        assert!(
+            seen.windows(2).all(|w| w[1] >= w[0]),
+            "间隔应单调不减，实际 {seen:?}"
+        );
+        assert_eq!(d, DIAL_RETRY_MAX, "应停在上限而不是无限增长");
+    }
+
+    /// 连上过就必须复位。忘了这一步的表现是"断网一次之后就再也不积极重连"。
+    #[test]
+    fn backoff_resets_after_success() {
+        let mut d = DIAL_RETRY_INTERVAL;
+        for _ in 0..8 {
+            d = next_backoff(d, false);
+        }
+        assert!(d > DIAL_RETRY_INTERVAL, "前置条件：已退避到较大间隔");
+
+        assert_eq!(
+            next_backoff(d, true),
+            DIAL_RETRY_INTERVAL,
+            "连上后应立刻回到起始间隔"
+        );
     }
 }
