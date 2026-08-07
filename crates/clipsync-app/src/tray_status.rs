@@ -122,7 +122,9 @@ impl TrayStatus {
                 st.p = p;
                 if st.logged.elapsed() >= PROGRESS_LOG_INTERVAL {
                     st.logged = Instant::now();
-                    tracing::info!("{}", describe(st));
+                    // 日志里保留完整文件名：它是事后排查唯一的凭据，截断等于
+                    // 丢信息。托盘那边才需要短——两者格式一致，只差这一点。
+                    tracing::info!("{}", describe(st, false));
                 }
             }
             // 换文件了：重新锚定，否则新文件的速度会被上一个的平均值污染。
@@ -158,14 +160,90 @@ impl TrayStatus {
             return None;
         }
         let g = self.progress.lock().unwrap();
-        Some(describe(g.as_ref()?))
+        Some(describe(g.as_ref()?, true))
     }
 }
 
-/// 把进度渲染成一行人话。托盘与日志共用。
-fn describe(st: &ProgressState) -> String {
+/// 进度里文件名允许占的显示宽度（半角为 1，全角/中日韩为 2）。
+///
+/// 菜单项过长在 macOS 上把整张菜单撑得很宽，在 Windows 上则直接被托盘提示
+/// 截断（`NOTIFYICONDATA` 的提示文本有硬上限），后半截连百分比都看不到。
+/// 28 列约等于 28 个英文字符或 14 个汉字，足够辨认是哪个文件。
+const NAME_MAX_WIDTH: usize = 28;
+
+/// 字符的显示宽度。东亚全角字符占两列。
+///
+/// 不引入 unicode-width 之类的依赖：这里只需要"别把菜单撑爆"，按区段粗判
+/// 足够，判错一两个字符最多让宽度差一列。
+fn char_width(c: char) -> usize {
+    let u = c as u32;
+    let wide = (0x1100..=0x115F).contains(&u)      // 韩文字母
+        || (0x2E80..=0xA4CF).contains(&u)          // CJK 部首、假名、汉字
+        || (0xAC00..=0xD7A3).contains(&u)          // 韩文音节
+        || (0xF900..=0xFAFF).contains(&u)          // CJK 兼容汉字
+        || (0xFE30..=0xFE6F).contains(&u)          // 竖排标点
+        || (0xFF00..=0xFF60).contains(&u)          // 全角字符
+        || (0xFFE0..=0xFFE6).contains(&u)
+        || (0x1F300..=0x1FAFF).contains(&u); // emoji
+    1 + wide as usize
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// 超宽时**从中间**省略：`一个很长的视频文件…part3.mp4`。
+///
+/// 不从尾部截：尾部截断会把扩展名切掉，只剩"很长很长的名字…"，连是视频
+/// 还是压缩包都看不出来。而文件名里最能区分彼此的信息，恰恰常在结尾
+/// （序号、日期、清晰度）。
+fn ellipsize_middle(s: &str, max_width: usize) -> String {
+    if display_width(s) <= max_width {
+        return s.to_string();
+    }
+    // 省略号自身占一列；余下的宽度前六后四分，保住扩展名又不至于头太短。
+    let budget = max_width.saturating_sub(1);
+    let tail_budget = budget * 4 / 10;
+    let head_budget = budget - tail_budget;
+
+    let mut head = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = char_width(c);
+        if w + cw > head_budget {
+            break;
+        }
+        head.push(c);
+        w += cw;
+    }
+
+    let mut tail: Vec<char> = Vec::new();
+    let mut w = 0;
+    for c in s.chars().rev() {
+        let cw = char_width(c);
+        if w + cw > tail_budget {
+            break;
+        }
+        tail.push(c);
+        w += cw;
+    }
+    tail.reverse();
+
+    format!("{head}…{}", tail.into_iter().collect::<String>())
+}
+
+/// 把进度渲染成一行人话。托盘与日志共用同一套格式。
+///
+/// `shorten` 只影响文件名：托盘要一眼扫过、且 Windows 的托盘提示有硬上限，
+/// 太长会被系统直接切掉；日志要完整，那是事后排查唯一的凭据。
+fn describe(st: &ProgressState, shorten: bool) -> String {
     {
         let dir = if st.p.sending { "发送" } else { "接收" };
+        let name = if shorten {
+            ellipsize_middle(&st.p.name, NAME_MAX_WIDTH)
+        } else {
+            st.p.name.clone()
+        };
         let pct = if st.p.total > 0 {
             st.p.done.saturating_mul(100) / st.p.total
         } else {
@@ -179,14 +257,13 @@ fn describe(st: &ProgressState) -> String {
         if moved > 0 && secs >= 0.5 {
             let rate = (moved as f64 / secs) as u64;
             format!(
-                "{dir} {} {pct}%（{} / {}，{}/s）",
-                st.p.name,
+                "{dir} {name} {pct}%（{} / {}，{}/s）",
                 crate::tray::human_bytes(st.p.done),
                 crate::tray::human_bytes(st.p.total),
                 crate::tray::human_bytes(rate)
             )
         } else {
-            format!("{dir} {} {pct}%", st.p.name)
+            format!("{dir} {name} {pct}%")
         }
     }
 }
@@ -359,5 +436,92 @@ mod tests {
         let sum = s.summary();
         assert!(sum.contains("50%"));
         assert!(!sum.contains("/s"), "刚开头不该报速度：{sum}");
+    }
+
+    /// 短名字原样保留，不该无端加省略号。
+    #[test]
+    fn short_names_pass_through() {
+        assert_eq!(ellipsize_middle("a.txt", 28), "a.txt");
+        assert_eq!(ellipsize_middle("报告.pdf", 28), "报告.pdf");
+        // 正好卡在上限也不截。
+        let exact = "a".repeat(28);
+        assert_eq!(ellipsize_middle(&exact, 28), exact);
+    }
+
+    /// 超宽时从中间省略，且**扩展名必须留着**。
+    ///
+    /// 从尾部截会切掉扩展名，只剩"很长很长的名字…"——连是视频还是压缩包都
+    /// 看不出来；而文件名里最能区分彼此的信息（序号、日期、清晰度）恰恰
+    /// 常在结尾。
+    #[test]
+    fn long_names_keep_head_and_extension() {
+        let s = "2026年度第三季度产品发布会现场录像完整版第三部分.mp4";
+        let out = ellipsize_middle(s, 28);
+
+        assert!(out.contains('…'), "应当省略：{out}");
+        assert!(out.ends_with(".mp4"), "扩展名必须留着：{out}");
+        assert!(out.starts_with("2026"), "开头也要留着：{out}");
+        assert!(display_width(&out) <= 28, "宽度超了：{out}");
+    }
+
+    /// 宽度按显示列算，不是按字符数——否则中文名会把菜单撑到两倍宽。
+    #[test]
+    fn width_counts_columns_not_chars() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("中文"), 4, "汉字占两列");
+        assert_eq!(display_width("a中"), 3);
+
+        // 14 个汉字 = 28 列，刚好到上限；15 个就得截。
+        let ok = "文".repeat(14);
+        assert_eq!(ellipsize_middle(&ok, 28), ok);
+        let too_long = "文".repeat(15);
+        assert!(display_width(&ellipsize_middle(&too_long, 28)) <= 28);
+    }
+
+    /// 截断后的整条摘要要短到能塞进 Windows 的托盘提示。
+    ///
+    /// `NOTIFYICONDATA` 的提示文本有硬上限，超了就被系统直接切掉，用户
+    /// 连百分比都看不到——实机上就是这个现象。
+    #[test]
+    fn summary_stays_short_enough_for_the_windows_tooltip() {
+        let s = TrayStatus::new(1);
+        s.note_transfer(TransferProgress {
+            sending: false,
+            name: "这是一个特别特别特别长的文件名用来测试截断是否生效.mkv".into(),
+            done: 42,
+            total: 100,
+        });
+        let sum = s.summary();
+        assert!(
+            sum.chars().count() < 100,
+            "摘要 {} 字符，Windows 托盘提示放不下：{sum}",
+            sum.chars().count()
+        );
+        assert!(sum.contains(".mkv"), "扩展名得看得见：{sum}");
+        assert!(sum.contains("42%"), "百分比不能被挤掉：{sum}");
+    }
+
+    /// 人工核对截断效果。
+    #[test]
+    #[ignore = "只为肉眼看效果"]
+    fn manual_show_truncation() {
+        for name in [
+            "report.pdf",
+            "2026年度第三季度产品发布会现场录像完整版第三部分.mp4",
+            "Ubuntu-24.04.1-desktop-amd64-live-server-installer.iso",
+            "会议纪要.docx",
+            "IMG_20260807_143052_HDR_Portrait_Enhanced_Final_v3.heic",
+            "备份-王信的Mac mini-2026-08-07-完整系统镜像.dmg",
+        ] {
+            let s = TrayStatus::new(1);
+            s.note_transfer(TransferProgress {
+                sending: false,
+                name: name.into(),
+                done: 4_200_000_000,
+                total: 10_000_000_000,
+            });
+            println!("原名 {name}");
+            println!("  → {}", s.summary());
+        }
     }
 }
