@@ -40,13 +40,32 @@ impl From<PairingRecord> for KnownPeer {
 #[derive(Clone, Default)]
 pub struct KnownPeers {
     inner: Arc<Mutex<Vec<KnownPeer>>>,
+    /// 变更计数。
+    ///
+    /// 各连接据此知道"设备表变了，该把新成员引荐出去了"。没有它就只能靠
+    /// 定时轮询：新配了一台设备，已建立的连接要等下一个周期才把它介绍出去
+    /// ——用户刚配完却发现另外两台互相不认识，只能干等。
+    ///
+    /// 每轮比对一个整数即可，不必拿锁拷贝整张表。
+    version: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl KnownPeers {
     pub fn new(peers: Vec<KnownPeer>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(peers)),
+            version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// 变更计数。值变了就说明设备表被动过。
+    pub fn version(&self) -> u64 {
+        self.version.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn bump(&self) {
+        self.version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// 当前全部已配对设备。
@@ -74,11 +93,14 @@ impl KnownPeers {
 
     /// 加入或更新一台设备（按 device id 去重）。
     pub fn upsert(&self, peer: KnownPeer) {
-        let mut g = self.inner.lock().unwrap();
-        match g.iter_mut().find(|p| p.device == peer.device) {
-            Some(existing) => *existing = peer,
-            None => g.push(peer),
+        {
+            let mut g = self.inner.lock().unwrap();
+            match g.iter_mut().find(|p| p.device == peer.device) {
+                Some(existing) => *existing = peer,
+                None => g.push(peer),
+            }
         }
+        self.bump();
     }
 
     /// 移除一台设备。返回是否确实移除了。
@@ -86,10 +108,16 @@ impl KnownPeers {
     /// 移除后拨号线程不再拨它，入站握手也查不到其公钥而拒绝连接——解除配对
     /// 因此立即生效，不必重启。
     pub fn remove(&self, device: &DeviceId) -> bool {
-        let mut g = self.inner.lock().unwrap();
-        let before = g.len();
-        g.retain(|p| &p.device != device);
-        g.len() != before
+        let changed = {
+            let mut g = self.inner.lock().unwrap();
+            let before = g.len();
+            g.retain(|p| &p.device != device);
+            g.len() != before
+        };
+        if changed {
+            self.bump();
+        }
+        changed
     }
 }
 

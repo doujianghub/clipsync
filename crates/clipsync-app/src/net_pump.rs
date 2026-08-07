@@ -54,7 +54,8 @@ pub(super) fn pump(
     let mut last_announce = Instant::now();
     // 对端协议版本；`None` 表示还没收到 Hello（旧版本永远不会发）。
     let mut peer_protocol: Option<u16> = None;
-    let mut introduced = false;
+    // 已按哪个版本的设备表引荐过；None 表示还没引荐过。
+    let mut introduced_version: Option<u64> = None;
 
     // 当前正在发送的文件流（同一时刻至多一个）。
     let mut stream: Option<OutgoingStream> = None;
@@ -157,10 +158,15 @@ pub(super) fn pump(
             last_announce = Instant::now();
         }
 
-        // 收到对端 Hello 后引荐一次，让它认识我们已知的其它设备。
-        if !introduced && peer_protocol.is_some() {
+        // 收到对端 Hello 后引荐一次；此后**设备表一变就再引荐**。
+        //
+        // 只引荐一次是不够的：A 与 B 连上时 B 可能还只认识 A，没什么可介绍；
+        // 等 B 后来又配了 C，那条已建立的连接若不再引荐，A 就永远不知道 C。
+        // 靠定时兜底则要等一整个周期，用户刚配完却发现没生效。
+        let peers_version = ctx.known.version();
+        if peer_protocol.is_some() && introduced_version != Some(peers_version) {
             introduce_peers(&mut conn, ctx, peer, peer_protocol)?;
-            introduced = true;
+            introduced_version = Some(peers_version);
         }
 
         // 4) 接收对端消息。
