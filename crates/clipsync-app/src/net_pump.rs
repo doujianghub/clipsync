@@ -281,8 +281,28 @@ fn learn_peers(ctx: &NetCtx, from: &KnownPeer, peers: Vec<clipsync_core::PeerInt
         if p.device == ctx.local_device {
             continue;
         }
-        let known = ctx.known.contains(&p.device);
-        if !known {
+        let is_new = !ctx.known.contains(&p.device);
+
+        // **地址必须先进地址簿，再把设备加进设备表。**
+        //
+        // `known.upsert` 会当场唤醒拨号线程（见 `KnownPeers::wait_for_change`），
+        // 而它醒来第一件事就是查地址簿。反过来写的话，它拿到的是一台一个地址
+        // 都没有的设备：拨不出去 → 记为"这轮没连上" → 退避翻倍 → 最长要等
+        // 60 秒才重试。实机日志里"经 KPC 认识了 MacBook Pro"到真正连上正好
+        // 隔了 60.019 秒，就是撞上了这个。
+        //
+        // 中间还夹着一次磁盘写入（落盘配对记录），窗口有好几毫秒，拨号线程
+        // 几乎必然抢先——这个顺序问题本来就在，是"立刻唤醒"把它从偶发变成
+        // 必现。
+        if !p.addrs.is_empty() {
+            ctx.addrbook.add_addrs(
+                &p.device,
+                p.addrs.clone(),
+                clipsync_net::peer::AddrSource::Peer,
+            );
+        }
+
+        if is_new {
             info!("经 {} 认识了新设备 {}（{}）", from.name, p.name, p.device);
             ctx.known.upsert(crate::known_peers::KnownPeer {
                 device: p.device.clone(),
@@ -294,16 +314,12 @@ fn learn_peers(ctx: &NetCtx, from: &KnownPeer, peers: Vec<clipsync_core::PeerInt
                 device: p.device.clone(),
                 name: p.name.clone(),
                 static_public_key: p.static_public_key.clone(),
-                addrs: p.addrs.clone(),
+                addrs: p.addrs,
                 introduced_by: Some(from.name.clone()),
             };
             if let Err(e) = crate::config::upsert_pairing(&ctx.config_dir, record) {
                 warn!("保存引荐来的设备失败: {e:#}");
             }
-        }
-        if !p.addrs.is_empty() {
-            ctx.addrbook
-                .add_addrs(&p.device, p.addrs, clipsync_net::peer::AddrSource::Peer);
         }
     }
 }
