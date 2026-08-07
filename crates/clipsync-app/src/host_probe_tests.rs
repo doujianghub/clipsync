@@ -178,3 +178,37 @@ fn manual_show_candidate_sources() {
     let found = find_hosts(47_685);
     println!("整轮探测耗时 {:?}，命中 {} 台", t0.elapsed(), found.len());
 }
+
+/// 覆盖网邻域兜底只针对**不可枚举**的接口，且要掐掉自己。
+///
+/// 回归自实机故障：Mac mini 上 Tailscale 通着，却因为 `tailscale` 命令不在
+/// 路径表里而取到 0 个对端；两台机器又不在同一局域网，于是彻底找不到人。
+/// 路径表永远列不全，所以要有一条不认厂商的兜底。
+#[test]
+fn overlay_neighborhood_covers_the_slash_24_around_own_address() {
+    let cands = overlay_neighborhood(47_685);
+    let own = own_ipv4();
+
+    for a in &cands {
+        let std::net::IpAddr::V4(ip) = a.ip() else {
+            panic!("只该产出 IPv4")
+        };
+        assert!(!own.contains(&ip), "不该探自己：{ip}");
+        assert_ne!(ip.octets()[3], 0, "网络号不该在内");
+        assert_ne!(ip.octets()[3], 255, "广播地址不该在内");
+        assert!(is_reachable_peer(ip), "只探私有/CGNAT 段");
+    }
+
+    // 本机若有 /32 的覆盖网接口（Tailscale 的 utun 就是），必须给出邻域；
+    // 没有这类接口时为空也是对的——那说明所有接口都有真实网段，
+    // subnet_candidates 已经覆盖。
+    let has_overlay_iface = clipsync_net::local::local_networks()
+        .v4
+        .into_iter()
+        .any(|(ip, mask)| u32::from(mask).count_ones() > 30 && is_reachable_peer(ip));
+    assert_eq!(
+        has_overlay_iface,
+        !cands.is_empty(),
+        "有不可枚举的覆盖网接口就该有邻域候选，反之为空"
+    );
+}

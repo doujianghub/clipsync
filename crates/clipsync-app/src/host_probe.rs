@@ -87,11 +87,17 @@ const OVERLAY_TOOLS: &[(&str, &[&str], &[&str])] = &[
     (
         "Tailscale",
         &[
+            // GUI 程序从 Finder / 开机自启起来时 PATH 只有
+            // `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 与 .app 里的命令一个
+            // 都不在里面，所以绝对路径必须一条条列全。
             "tailscale",
             "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-            "/usr/local/bin/tailscale",
+            "/opt/homebrew/bin/tailscale", // Apple Silicon 的 Homebrew
+            "/usr/local/bin/tailscale",    // Intel 的 Homebrew / 手动安装
             "/usr/bin/tailscale",
+            "/usr/sbin/tailscale",
             r"C:\Program Files\Tailscale\tailscale.exe",
+            r"C:\Program Files (x86)\Tailscale IPN\tailscale.exe",
         ],
         &["status"],
     ),
@@ -99,6 +105,7 @@ const OVERLAY_TOOLS: &[(&str, &[&str], &[&str])] = &[
         "NetBird",
         &[
             "netbird",
+            "/opt/homebrew/bin/netbird",
             "/usr/local/bin/netbird",
             "/Applications/NetBird.app/Contents/MacOS/netbird",
             r"C:\Program Files\NetBird\netbird.exe",
@@ -122,6 +129,8 @@ pub fn find_hosts(port: u16) -> Vec<(SocketAddr, TcpStream)> {
     // 合并之后，前 64 个工作线程一上来就把为数不多的覆盖网对端探完了，
     // 网段那些只是垫在后面慢慢来——先命中先停。
     let mut candidates = overlay_tool_candidates(port);
+    let tool_count = candidates.len();
+    candidates.extend(overlay_neighborhood(port));
     let overlay_count = candidates.len();
     candidates.extend(subnet_candidates(port));
 
@@ -132,8 +141,9 @@ pub fn find_hosts(port: u16) -> Vec<(SocketAddr, TcpStream)> {
         return Vec::new();
     }
     debug!(
-        "探测 {} 个候选（覆盖网 {overlay_count}，网段 {}）",
+        "探测 {} 个候选（组网工具 {tool_count}，覆盖网邻域 {}，本地网段 {}）",
         candidates.len(),
+        overlay_count - tool_count,
         candidates.len() - overlay_count
     );
     probe(candidates)
@@ -195,6 +205,41 @@ fn subnet_candidates(port: u16) -> Vec<SocketAddr> {
     out
 }
 
+/// 本机覆盖网地址所在 /24 的其余主机——组网工具那一路的通用兜底。
+///
+/// **为什么需要**：实机上 Mac mini 那次配对失败，日志是「覆盖网 0，网段 254」
+/// ——Tailscale 明明通着（配对成功后走的就是它），却一个对端都没取到，多半
+/// 是那台机器上的 `tailscale` 命令不在我们列的任何路径里。而两台机器又不在
+/// 同一局域网，覆盖网这一路一空就彻底没辙了。
+///
+/// 单靠往路径表里加条目治不了本：路径表永远列不全（Homebrew 换前缀、装到
+/// `~/Applications`、换个发行版……）。所以再加一条**完全不认厂商**的兜底：
+/// 覆盖网接口的地址是 /32（正因如此 [`subnet_candidates`] 跳过了它），但同一
+/// 个组网里的机器地址往往挨得很近——实测该用户的 tailnet 里 5 台设备都落在
+/// `100.88.88.0/24`。扫这个 /24 是 254 个候选，有界、便宜，且不需要任何外部
+/// 命令。
+///
+/// 这**不保证**命中：Tailscale 从 100.64.0.0/10 里分配，同一个组网完全可能
+/// 跨多个 /24（该用户的 tailnet 里就还有 `100.115.98.83`、`100.66.43.29`）。
+/// 所以它只是兜底，组网工具那一路仍然排在前面。
+fn overlay_neighborhood(port: u16) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for (ip, mask) in clipsync_net::local::local_networks().v4 {
+        // 只管**不可枚举**的覆盖网接口：有真实网段的已由 subnet_candidates
+        // 覆盖，再扫一遍只是重复。
+        if u32::from(mask).count_ones() <= 30 || !is_reachable_peer(ip) {
+            continue;
+        }
+        let base = u32::from(ip) & 0xffff_ff00;
+        for a in (base + 1)..(base | 0xff) {
+            if a != u32::from(ip) {
+                out.push(SocketAddr::from((Ipv4Addr::from(a), port)));
+            }
+        }
+    }
+    out
+}
+
 /// 依次问各组网工具要对端地址。
 fn overlay_tool_candidates(port: u16) -> Vec<SocketAddr> {
     let own = own_ipv4();
@@ -209,6 +254,13 @@ fn overlay_tool_candidates(port: u16) -> Vec<SocketAddr> {
         }
         info!("{name} 报告了 {} 个地址", ips.len());
         seen.extend(ips.into_iter().filter(|ip| !own.contains(ip)));
+    }
+    if seen.is_empty() {
+        // 说清楚是"没找到命令"还是"命令说没有对端"，否则下次只能靠猜。
+        debug!(
+            "没有组网工具报告对端（试过 {} 个可执行文件路径）",
+            OVERLAY_TOOLS.iter().map(|(_, b, _)| b.len()).sum::<usize>()
+        );
     }
     seen.into_iter()
         .take(MAX_CANDIDATES)
