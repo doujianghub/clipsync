@@ -63,10 +63,6 @@ fn main() -> Result<()> {
         .map(|s| s.verbose_log)
         .unwrap_or(false);
     let log_control = logging::init(&dir, verbose);
-    // 迁移发生在日志初始化之前（日志要写进配置目录），补记一条。
-    if let Some(note) = config::migration_note() {
-        info!("{note}");
-    }
     let identity = config::load_or_init_identity(&dir)?;
     let device_name = device_name::device_name_best_effort();
 

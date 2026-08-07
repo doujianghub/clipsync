@@ -1,8 +1,10 @@
 //! 配置与本地状态的持久化。
 //!
-//! 配置目录（`directories` 定位）：
+//! 配置目录（两平台结构一致，见 `project_root_dir`）：
 //!   - Windows：`%APPDATA%\ClipSync\`
 //!   - macOS：`~/Library/Application Support/ClipSync/`
+//!
+//! 日志在其下的 `logs/`，配对记录是 `pairings.json`，身份是 `identity.json`。
 //!
 //! 存放：本机 Noise 静态密钥、设备名、已配对记录、用户可调设置（大小上限、
 //! 类型开关等）。密钥文件权限在 M2 收紧（macOS 0600）。
@@ -22,24 +24,6 @@ use serde::{Deserialize, Serialize};
 const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "";
 const APPLICATION: &str = "ClipSync";
-
-/// 早期版本用过的目录名（organization 与 application 都填了 "ClipSync"）。
-///
-/// 留着只为**迁移一次**：里面有设备长期身份私钥与全部配对记录，直接换路径
-/// 等于让用户所有设备一夜之间互不相识，而且不会有任何提示。
-const LEGACY_DIR_NAMES: &[&str] = &["ClipSync.ClipSync", "ClipSync/ClipSync"];
-
-/// 迁移发生时留一句话，等日志系统起来后再打。
-///
-/// `config_dir()` 必须先于日志初始化（日志要写在配置目录里），所以迁移那一刻
-/// `tracing` 还没接管，直接 `info!` 会进虚空——而"配置目录搬过家"恰恰是
-/// 用户日后最需要在日志里查到的事。
-static MIGRATION_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// 取出迁移说明（若本次启动发生过迁移）。由 `main` 在日志就绪后调用。
-pub fn migration_note() -> Option<&'static str> {
-    MIGRATION_NOTE.get().map(|s| s.as_str())
-}
 
 /// 用户可调设置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,50 +119,35 @@ pub fn config_dir() -> Result<PathBuf> {
 
     let dirs =
         ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION).context("无法定位系统配置目录")?;
-    let dir = dirs.config_dir().to_path_buf();
 
-    // 目录名换过一次，把老位置的东西搬过来。见 LEGACY_DIR_NAMES。
-    if !dir.exists() {
-        migrate_legacy_dir(&dir);
-    }
+    // 用 `data_dir()` 的父目录而不是 `config_dir()`。
+    //
+    // `directories` 在 Windows 上会往 `%APPDATA%\ClipSync` 底下再塞一层
+    // `config\`，macOS 却不加——同一个程序在两个平台的目录结构对不上，
+    // 文档只能二选一地写错，用户照着找日志会扑空（实际就发生了）。
+    //
+    // 这里统一取项目根目录：Windows 是 `%APPDATA%\ClipSync`，
+    // macOS 是 `~/Library/Application Support/ClipSync`。两边一致，也和
+    // 文档、和用户的直觉一致。
+    let dir = project_root_dir(&dirs);
 
     std::fs::create_dir_all(&dir).with_context(|| format!("无法创建配置目录: {}", dir.display()))?;
     Ok(dir)
 }
 
-/// 把早期版本的配置目录整体搬到新位置。
+/// 项目的根配置目录（两平台结构一致）。
 ///
-/// 只在新目录**尚不存在**时做，且用 `rename`（同一卷内是原子的）——不会
-/// 覆盖任何已有数据。搬不动就算了：那只意味着用户要重新配对一次，而不该
-/// 让程序起不来。
-fn migrate_legacy_dir(new_dir: &Path) {
-    let Some(parent) = new_dir.parent() else {
-        return;
-    };
-    for name in LEGACY_DIR_NAMES {
-        let old = parent.join(name);
-        // 别把新目录自己当成老目录搬（两者同名时会发生）。
-        if old == new_dir || !old.join("identity.json").exists() {
-            continue;
-        }
-        match std::fs::rename(&old, new_dir) {
-            Ok(()) => {
-                let _ = MIGRATION_NOTE.set(format!(
-                    "配置目录已从 {} 迁移到 {}",
-                    old.display(),
-                    new_dir.display()
-                ));
-                return;
-            }
-            Err(e) => {
-                let _ = MIGRATION_NOTE.set(format!(
-                    "迁移旧配置目录失败（将按新装处理，需重新配对）: {} → {}: {e}",
-                    old.display(),
-                    new_dir.display()
-                ));
-            }
+/// macOS 上 `config_dir()` 就是根目录；Windows 上它是根目录下的 `config\`
+/// 子目录，取其父即可。用 `data_dir()`（Windows 下为 `...\data`）的父目录
+/// 也一样，这里统一走 `config_dir()` 再按需上跳一层。
+fn project_root_dir(dirs: &ProjectDirs) -> PathBuf {
+    let config = dirs.config_dir();
+    if config.file_name().and_then(|s| s.to_str()) == Some("config") {
+        if let Some(parent) = config.parent() {
+            return parent.to_path_buf();
         }
     }
+    config.to_path_buf()
 }
 
 /// 从配置目录加载设置；不存在或**已损坏**时回退到默认值。
