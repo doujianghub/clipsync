@@ -172,4 +172,9 @@ fn manual_show_candidate_sources() {
     for a in &overlay {
         println!("  {a}");
     }
+
+    // 整轮耗时——用户点完「输入配对码」要等的就是这段。
+    let t0 = std::time::Instant::now();
+    let found = find_hosts(47_685);
+    println!("整轮探测耗时 {:?}，命中 {} 台", t0.elapsed(), found.len());
 }

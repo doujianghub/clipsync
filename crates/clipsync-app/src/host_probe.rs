@@ -49,12 +49,21 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// 等对方开口的时间。
 ///
-/// 主持方 accept 之后**立刻**发出自己的 PAKE 帧，正常在毫秒级。给到 800ms
-/// 是为了容忍覆盖网的一次往返。
-const GREETING_TIMEOUT: Duration = Duration::from_millis(800);
+/// 主持方 accept 之后**立刻**发出自己的 PAKE 帧——本机实测 23ms。400ms 足够
+/// 容忍覆盖网经中继的一次往返，再长只是让"这不是主持方"这件事慢一点被确认。
+/// 开着 TUN 模式代理的机器上每个候选都会连上，这个值直接决定整轮的耗时。
+const GREETING_TIMEOUT: Duration = Duration::from_millis(400);
 
-/// 并发探测的线程数。64 × 300ms 下一个 /24 约 1.2 秒。
-const PROBE_CONCURRENCY: usize = 64;
+/// 并发探测的线程数。
+///
+/// 一个 /24 有 253 个候选，128 并发 = 2 轮，最坏 2×(300+400)ms ≈ 1.4 秒，
+/// 常见情况远快于此。线程只在这一次探测里活着，且都在等 I/O，栈也调小了，
+/// 开销可以忽略。
+const PROBE_CONCURRENCY: usize = 128;
+
+/// 探测线程的栈大小。它们只做 connect + peek，用不着默认的 2MiB；
+/// 128 个线程按默认栈会白占 256MiB 虚拟地址空间。
+const PROBE_STACK: usize = 64 * 1024;
 
 /// 候选地址总数上限。超过就不是"找一台机器"而是扫网了。
 const MAX_CANDIDATES: usize = 1024;
@@ -312,7 +321,10 @@ fn probe(candidates: Vec<SocketAddr>) -> Vec<(SocketAddr, TcpStream)> {
 
     std::thread::scope(|s| {
         for _ in 0..workers {
-            s.spawn(|| loop {
+            let b = std::thread::Builder::new().stack_size(PROBE_STACK);
+            // 线程建不出来就少一个工作线程，不影响正确性——队列共享，
+            // 剩下的线程会把活干完。
+            let _ = b.spawn_scoped(s, || loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
