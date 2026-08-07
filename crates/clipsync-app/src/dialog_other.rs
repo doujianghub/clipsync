@@ -20,3 +20,9 @@ pub fn confirm(title: &str, body: &str) -> Result<bool> {
     tracing::info!("[{title}] {body}（本平台无确认框，按取消处理）");
     Ok(false)
 }
+
+pub fn choose(title: &str, body: &str, items: &[String]) -> Result<Option<usize>> {
+    // 无图形环境，无从选择。
+    tracing::info!("[{title}] {body}（本平台无选择框；可选项：{}）", items.join(" / "));
+    Ok(None)
+}

@@ -67,6 +67,28 @@ pub fn confirm(title: &str, body: &str) -> bool {
     }
 }
 
+/// 弹出一个列表让用户点选，返回选中项的下标。
+///
+/// **为什么设置项优先用它而不是输入框**：选常用值这件事，点一下本来就比
+/// 打字省事。菜单里只留一行（`单次上限：100 MiB…`）保持清爽，把选择放进
+/// 点击后的对话框——两头都不牺牲。
+///
+/// 列表末尾通常留一个「自定义…」，选中它再走 [`prompt`]。
+///
+/// `None` 表示用户取消或弹不出窗。
+pub fn choose(title: &str, body: &str, items: &[String]) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+    match platform::choose(title, body, items) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("选择框弹出失败: {e:#}");
+            None
+        }
+    }
+}
+
 /// 弹出一个单行输入框，返回用户输入。
 ///
 /// `None` 表示用户取消、或弹不出窗（无图形会话、脚本宿主缺失）。两者都按
@@ -109,6 +131,26 @@ mod tests {
     ///      拉伸导致的毛边（那说明 DPI 声明没生效）；输入框应是等宽字体；
     ///   3. 输入内容点确定 → 打印 `RESULT=Some("...")`，值与所输一致；
     ///   4. 点取消 / 按 Esc → 打印 `RESULT=None`，且不报错。
+    /// 手动目视验证：弹出设置项的选择列表。
+    ///
+    /// 跑法：`cargo test -p clipsync-app --bin clipsync -- --ignored manual_choose`
+    ///
+    /// 判据：
+    ///   1. 是一个**干净的列表**，没有那个看着像"要输文件路径"的大图标
+    ///      （`display dialog` 在子进程里显示的是 osascript 自己的脚本图标）；
+    ///   2. 首项默认选中，双击或「确定」都能选定；
+    ///   3. 点「取消」返回 `None`。
+    #[test]
+    #[ignore = "会弹窗并阻塞，需人工/脚本关闭"]
+    fn manual_choose_dialog() {
+        let items: Vec<String> = ["10 MiB", "100 MiB（默认）", "500 MiB", "自定义…"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let r = super::choose("单次上限", "当前：100 MiB", &items);
+        println!("RESULT={r:?}");
+    }
+
     #[test]
     #[ignore = "会弹窗并阻塞，需人工/脚本关闭"]
     fn manual_prompt_dialog() {

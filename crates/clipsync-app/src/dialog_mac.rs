@@ -29,6 +29,33 @@ pub fn prompt(title: &str, body: &str) -> Result<Option<String>> {
     run_osascript(PROMPT_SCRIPT, title, body)
 }
 
+/// 列表选择。
+///
+/// 用 `choose from list` 而非 `display dialog`：后者会顶着一个大图标——
+/// 而在子进程里跑，那个图标是 **osascript 自己的脚本图标**，看着像在问你
+/// 要一个文件路径。`choose from list` 就是一个干净的列表，没有这个问题。
+///
+/// 返回选中项的**文本**，由调用方换算下标；取消时 AppleScript 返回 false，
+/// 这里映射为空串。
+const CHOOSE_SCRIPT: &str = r#"on run argv
+  set opts to items 3 thru -1 of argv
+  set r to choose from list opts with title (item 1 of argv) with prompt (item 2 of argv) default items {item 3 of argv} OK button name "确定" cancel button name "取消"
+  if r is false then return ""
+  return item 1 of r
+end run"#;
+
+pub fn choose(title: &str, body: &str, items: &[String]) -> Result<Option<usize>> {
+    let mut args: Vec<&str> = vec![title, body];
+    args.extend(items.iter().map(|s| s.as_str()));
+    let picked = run_osascript_args(CHOOSE_SCRIPT, &args)?;
+    let Some(picked) = picked else { return Ok(None) };
+    let picked = picked.trim();
+    if picked.is_empty() {
+        return Ok(None); // 用户取消
+    }
+    Ok(items.iter().position(|s| s == picked))
+}
+
 /// 确认框。默认按钮刻意设为「取消」——用它的都是破坏性操作
 /// （解除配对），手快连按回车不该把事情做了。
 const CONFIRM_SCRIPT: &str = r#"on run argv
@@ -47,12 +74,18 @@ pub fn confirm(title: &str, body: &str) -> Result<bool> {
 ///
 /// 返回 `Ok(None)` 表示脚本以非零码退出——对话框场景下就是用户取消。
 fn run_osascript(script: &str, title: &str, body: &str) -> Result<Option<String>> {
+    run_osascript_args(script, &[title, body])
+}
+
+/// 运行一段 osascript，脚本经 stdin 送入、**全部**用户内容经 argv 传参。
+///
+/// 参数化传递是注入防护的关键：脚本体是固定字面量，用户内容永远是数据。
+fn run_osascript_args(script: &str, args: &[&str]) -> Result<Option<String>> {
     use std::io::Write;
 
     let mut child = Command::new("osascript")
         .arg("-")
-        .arg(title)
-        .arg(body)
+        .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

@@ -165,24 +165,40 @@ pub(crate) fn run_tray(
 /// 托盘里点某台设备 → 确认 → 解除配对。
 ///
 
-/// 弹一个输入框改某项设置。
+/// 常用档 + 自定义：先让用户点选，选了「自定义…」再弹输入框。
 ///
-/// 三处设置（上限、限速、端口）流程完全一样：显示当前值 → 收输入 → 解析 →
-/// 写回或告知为什么没生效。差别只在**怎么解析**和**怎么描述**，抽出来后
-/// 各自只剩几行。
+/// **为什么不直接弹输入框**：选常用值这件事，点一下本来就比打字省事，
+/// 尤其是 `104857600` 这种数。而把档位摆进菜单又会让一级臃肿——所以
+/// 菜单只留一行（标签带当前值），选择放进点击后的对话框，两头都不牺牲。
 ///
 /// 输入非法时**再弹一次说明**而不是静默忽略：用户刚打完一串字，什么反馈
 /// 都没有只会让人以为程序坏了。
-fn prompt_setting<T>(
+fn pick_setting<T: Copy>(
     settings: &config::SettingsHandle,
     title: &str,
     current: &str,
-    hint: &str,
+    presets: &[(&str, T)],
+    custom_hint: &str,
     parse: impl Fn(&str) -> anyhow::Result<T>,
-    apply: impl FnOnce(&mut config::Settings, T),
+    apply: impl Fn(&mut config::Settings, T),
 ) {
-    let Some(input) = dialog::prompt(title, &format!("当前：{current}\n\n{hint}")) else {
+    let mut items: Vec<String> = presets.iter().map(|(label, _)| label.to_string()).collect();
+    items.push("自定义…".to_string());
+
+    let Some(idx) = dialog::choose(title, &format!("当前：{current}"), &items) else {
         return; // 用户取消
+    };
+
+    if let Some((label, value)) = presets.get(idx) {
+        let v = *value;
+        settings.update(|s| apply(s, v));
+        info!("{title}已设为 {label}");
+        return;
+    }
+
+    // 选了「自定义…」。
+    let Some(input) = dialog::prompt(title, custom_hint) else {
+        return;
     };
     match parse(&input) {
         Ok(v) => {
@@ -193,6 +209,24 @@ fn prompt_setting<T>(
     }
 }
 
+/// 单次上限的常用档。`usize::MAX` 表示不限。
+const MAX_BYTES_PRESETS: &[(&str, usize)] = &[
+    ("10 MiB", 10 << 20),
+    ("100 MiB（默认）", 100 << 20),
+    ("500 MiB", 500 << 20),
+    ("2 GiB", 2 << 30),
+    ("不限", usize::MAX),
+];
+
+/// 发送限速的常用档。`0` 表示不限。
+const RATE_PRESETS: &[(&str, u64)] = &[
+    ("不限（默认）", 0),
+    ("5 MB/s", 5_000_000),
+    ("10 MB/s", 10_000_000),
+    ("20 MB/s", 20_000_000),
+    ("50 MB/s", 50_000_000),
+];
+
 fn prompt_max_bytes(settings: &config::SettingsHandle) {
     let cur = settings.snapshot().max_bytes;
     let shown = if cur == usize::MAX {
@@ -200,14 +234,18 @@ fn prompt_max_bytes(settings: &config::SettingsHandle) {
     } else {
         tray::human_bytes(cur as u64)
     };
-    prompt_setting(
+    pick_setting(
         settings,
         "单次上限",
         &shown,
-        "例如 500MB、1.5GiB；填 0 表示不限",
-        size_parse::parse_byte_size,
-        // 0 在这里表示"不限"，而不是"一个字节都不许传"。
-        |s, v| s.max_bytes = if v == 0 { usize::MAX } else { v as usize },
+        MAX_BYTES_PRESETS,
+        "输入大小，例如 500MB、1.5GiB；填 0 表示不限",
+        |s| {
+            // 0 在这里表示"不限"，而不是"一个字节都不许传"。
+            let v = size_parse::parse_byte_size(s)?;
+            Ok(if v == 0 { usize::MAX } else { v as usize })
+        },
+        |s, v| s.max_bytes = v,
     );
 }
 
@@ -218,38 +256,71 @@ fn prompt_upload_limit(settings: &config::SettingsHandle) {
     } else {
         format!("{}/s", tray::human_bytes(cur))
     };
-    prompt_setting(
+    pick_setting(
         settings,
         "发送限速",
         &shown,
-        "例如 10MB/s、20mbps；填 0 表示不限",
+        RATE_PRESETS,
+        "输入速率，例如 10MB/s、20mbps；填 0 表示不限",
         size_parse::parse_rate,
         |s, v| s.upload_limit_bytes_per_sec = v,
     );
 }
 
-/// 端口与其它设置不同：**改了要重启才生效**。监听套接字在启动时就绑好了，
-/// 运行中换端口意味着断开所有连接重新监听，还要让对端重新学到新端口。
-/// 与其做一套半可靠的热切换，不如如实告诉用户重启一下。
+/// 端口没有"常用档"可言，直接输入。
+///
+/// 它与其它设置还有一点不同：**改了要重启才生效**。监听套接字在启动时就
+/// 绑好了，运行中换端口意味着断开所有连接重新监听，还要让对端重新学到新
+/// 端口。与其做一套半可靠的热切换，不如如实告诉用户重启一下。
 fn prompt_listen_port(settings: &config::SettingsHandle) {
     let cur = settings.snapshot().listen_port;
-    prompt_setting(
-        settings,
+    let Some(input) = dialog::prompt(
         "同步端口",
-        &cur.to_string(),
-        "填 1024–65535；重启后生效",
-        |s| {
-            let p: u16 = s
-                .trim()
-                .parse()
-                .map_err(|_| anyhow::anyhow!("「{s}」不是有效端口"))?;
-            // 1024 以下是特权端口，普通用户绑不上，提前拦住比启动时才失败好。
-            if p < 1024 {
-                anyhow::bail!("端口 {p} 属于系统保留范围，请填 1024–65535");
-            }
-            Ok(p)
-        },
-        |s, v| s.listen_port = v,
-    );
+        &format!("当前：{cur}\n\n填 1024–65535；重启后生效"),
+    ) else {
+        return;
+    };
+    match input.trim().parse::<u16>() {
+        // 1024 以下是特权端口，普通用户绑不上，提前拦住比启动时才失败好。
+        Ok(p) if p >= 1024 => {
+            settings.update(|s| s.listen_port = p);
+            info!("同步端口已设为 {p}（重启后生效）");
+        }
+        Ok(p) => dialog::show_info("同步端口", &format!("{p} 属于系统保留范围，请填 1024–65535")),
+        Err(_) => dialog::show_info("同步端口", &format!("「{input}」不是有效端口")),
+    }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 档位的标签与数值必须对得上。
+    ///
+    /// 这类常量表最容易手滑写错数量级（把 MiB 写成 MB、少一个零），而错了
+    /// 之后界面显示的是"100 MiB"、实际生效的却是别的数——用户没法察觉。
+    #[test]
+    fn presets_match_their_labels() {
+        assert_eq!(MAX_BYTES_PRESETS[0], ("10 MiB", 10 * 1024 * 1024));
+        assert_eq!(MAX_BYTES_PRESETS[1].1, 100 * 1024 * 1024);
+        assert_eq!(MAX_BYTES_PRESETS[2].1, 500 * 1024 * 1024);
+        assert_eq!(MAX_BYTES_PRESETS[3].1, 2 * 1024 * 1024 * 1024);
+        assert_eq!(MAX_BYTES_PRESETS[4].1, usize::MAX, "「不限」应为最大值");
+
+        // 速率按 1000 进制（网络惯例，与 MB/s 的通常含义一致）。
+        assert_eq!(RATE_PRESETS[0].1, 0, "「不限」应为 0");
+        assert_eq!(RATE_PRESETS[2], ("10 MB/s", 10_000_000));
+        assert_eq!(RATE_PRESETS[4].1, 50_000_000);
+    }
+
+    /// 档位应当递增，否则列表读起来很怪。
+    #[test]
+    fn presets_are_ordered() {
+        let sizes: Vec<usize> = MAX_BYTES_PRESETS.iter().map(|(_, v)| *v).collect();
+        assert!(sizes.windows(2).all(|w| w[0] < w[1]), "上限档应递增: {sizes:?}");
+
+        // 限速的「不限」排第一（0 表示不限，语义上是最大），其余递增。
+        let rates: Vec<u64> = RATE_PRESETS[1..].iter().map(|(_, v)| *v).collect();
+        assert!(rates.windows(2).all(|w| w[0] < w[1]), "限速档应递增: {rates:?}");
+    }
+}
