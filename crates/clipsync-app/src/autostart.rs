@@ -53,7 +53,7 @@ mod platform {
 
     pub fn is_enabled() -> Result<bool> {
         // 用 reg query 读取，避免为一个小功能引入注册表操作依赖。
-        let out = std::process::Command::new("reg")
+        let out = crate::win_util::hidden(&mut std::process::Command::new("reg"))
             .args(["query", RUN_KEY, "/v", APP_KEY])
             .output()
             .context("查询注册表失败")?;
@@ -66,13 +66,13 @@ mod platform {
         let out = if enable {
             // 路径含空格时需要引号，故整体再包一层。
             let value = format!("\"{}\"", exe.display());
-            std::process::Command::new("reg")
+            crate::win_util::hidden(&mut std::process::Command::new("reg"))
                 .args([
                     "add", RUN_KEY, "/v", APP_KEY, "/t", "REG_SZ", "/d", &value, "/f",
                 ])
                 .output()
         } else {
-            std::process::Command::new("reg")
+            crate::win_util::hidden(&mut std::process::Command::new("reg"))
                 .args(["delete", RUN_KEY, "/v", APP_KEY, "/f"])
                 .output()
         }

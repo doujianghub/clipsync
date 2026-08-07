@@ -43,6 +43,8 @@ mod ratelimit;
 mod size_parse;
 mod tray;
 mod tray_bridge;
+#[cfg(windows)]
+mod win_util;
 mod wiring;
 
 use std::sync::atomic::{AtomicBool, Ordering};
