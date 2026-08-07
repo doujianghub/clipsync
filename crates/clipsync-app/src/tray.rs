@@ -172,7 +172,7 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(status.summary())
+        .with_tooltip(status.tooltip())
         .with_icon(make_icon(IconState::of(&status), false)?)
         .build()
         .map_err(|e| anyhow::anyhow!("创建托盘图标失败: {e}"))?;
@@ -265,7 +265,9 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
         let summary = status.summary();
         if summary != last_summary {
             status_item.set_text(&summary);
-            let _ = tray.set_tooltip(Some(&summary));
+            // 提示与菜单项**不是**同一份文案：Windows 的托盘提示只有 63 个
+            // 字符，放不下菜单项那份带绝对字节数的详细版。
+            let _ = tray.set_tooltip(Some(&status.tooltip()));
             last_summary = summary;
         }
 
