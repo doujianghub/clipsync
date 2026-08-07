@@ -266,24 +266,24 @@ pub(crate) fn host_pairing_interactive(
 ) {
     let guard = match pairing.host_slot.try_acquire() {
         Ok(g) => g,
-        Err(code) => {
-            // 已有会话在等待——把同一个码再显示一遍即可。
+        Err(share) => {
+            // 已有会话在等待——把同一串再显示、再复制一遍即可。
             info!("配对会话已在进行中，重新显示当前配对码");
             dialog::show_info_and_copy(
                 "ClipSync 配对",
                 &format!(
-                    "配对码：{code}\n（已复制到剪贴板）\n\n\
+                    "配对码：{share}\n（已复制到剪贴板）\n\n\
                      本机仍在等待对方加入，请在对方设备上选「输入配对码…」。"
                 ),
-                &code,
+                &share,
             );
             return;
         }
     };
 
     let slot = pairing.host_slot.clone();
-    let result = pairing_cli::host(dir, identity, device_name, sync_port, true, |code| {
-        slot.set_code(code.as_str());
+    let result = pairing_cli::host(dir, identity, device_name, sync_port, true, |share| {
+        slot.set_code(share);
     });
     drop(guard); // 显式释放槽位，后续弹窗期间允许再次发起
 
@@ -315,9 +315,9 @@ pub(crate) fn host_pairing_interactive(
 /// 模式）。确认框走的是系统原生 TaskDialog，不受影响——**配对这条核心流程
 /// 因此不再依赖输入框**。
 ///
-/// **地址从哪来**，按代价从低到高：
-///   1. 码串里就带着（`ABCDEF@100.88.88.22`）——跨网络时的正路；
-///   2. 局域网自动发现——同网段最省事；
+/// **地址从哪来**，按代价从低到高，前一条连不通就自动试下一条：
+///   1. 码串里就带着（`ABCDEF@100.88.88.22`）——主持方复制给你的就是这一串；
+///   2. 局域网自动发现——主持方挑的是覆盖网地址而你只在局域网上时靠它兜底；
 ///   3. 都不行才问用户要地址。
 pub(crate) fn join_by_code_interactive(
     dir: &std::path::Path,
@@ -331,31 +331,48 @@ pub(crate) fn join_by_code_interactive(
     };
     let code = code.to_string();
 
-    // 码串里带了地址就直连，不必再试注定失败的组播发现。
-    if let Some(host) = host {
-        finish_join(
-            pairing_cli::join(dir, identity, device_name, Some(&host), &code, sync_port),
-            pairing,
-        );
-        return;
-    }
-
-    match pairing_cli::join(dir, identity, device_name, None, &code, sync_port) {
-        Ok(record) => {
-            finish_join(Ok(record), pairing);
-            return;
+    // 三条路依次试，前两条互不覆盖、都可能落空：
+    //   1. 码串自带的地址——主持方挑的是它自己**最可能被外面连到**的那个，
+    //      通常是覆盖网地址；
+    //   2. 局域网组播发现——覆盖网不转发组播，但同网段最省事；
+    //   3. 问用户要。
+    //
+    // 主持方同时接着 Tailscale 和局域网、而加入方只在局域网上时，第 1 条
+    // 必然连不通，此时第 2 条恰好能救回来。所以第 1 条失败不能直接跳到
+    // 问用户——那等于把程序能自己解决的事推给用户。
+    let mut stream = None;
+    if let Some(h) = &host {
+        match pairing_cli::connect_host(Some(h)) {
+            Ok(s) => stream = Some(s),
+            Err(e) => info!("码串里的地址 {h} 连不上，改试局域网发现: {e:#}"),
         }
-        Err(e) => info!("局域网未发现对方，改为询问地址: {e:#}"),
+    }
+    if stream.is_none() {
+        match pairing_cli::connect_host(None) {
+            Ok(s) => stream = Some(s),
+            Err(e) => info!("局域网未发现对方，改为询问地址: {e:#}"),
+        }
+    }
+    if stream.is_none() {
+        let Some(h) = dialog::prompt(
+            "输入配对码",
+            "没能自动找到对方。\n请输入对方的 IP（对方窗口里有）：",
+        ) else {
+            return;
+        };
+        match pairing_cli::connect_host(Some(h.trim())) {
+            Ok(s) => stream = Some(s),
+            Err(e) => {
+                warn!("配对失败: {e:#}");
+                dialog::show_info("配对失败", &format!("{e:#}"));
+                return;
+            }
+        }
     }
 
-    let Some(host) = dialog::prompt(
-        "输入配对码",
-        "没能在局域网里找到对方。\n请输入对方的 IP（对方窗口里有）：",
-    ) else {
-        return;
-    };
+    let mut stream = stream.expect("上面三条路都失败时已提前返回");
     finish_join(
-        pairing_cli::join(dir, identity, device_name, Some(&host), &code, sync_port),
+        pairing_cli::join_on(&mut stream, dir, identity, device_name, &code, sync_port),
         pairing,
     );
 }

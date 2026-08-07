@@ -76,19 +76,15 @@ fn accept_until_returns_connection_in_blocking_mode() {
 ///
 /// 跑法：`cargo test -p clipsync-app --bin clipsync -- --ignored pairing_dialog`
 ///
-/// 判据：窗口标题为「ClipSync 配对」，正文首行的配对码可读，
-/// 且该配对码已进入剪贴板（正文里"已复制到剪贴板"这句得是真的）。
+/// 判据：窗口标题为「ClipSync 配对」，正文首行的「码@地址」可读，
+/// 且**这一整串**已进入剪贴板（正文里"已复制到剪贴板"这句得是真的）。
 #[test]
 #[ignore = "会弹窗并阻塞，需人工/脚本关闭"]
 fn manual_pairing_dialog() {
-    let code = PairingCode::generate();
-    // 打到 stdout，供外部脚本比对窗口里显示的是不是同一个码。
-    println!("EXPECT_CODE={code}");
-    crate::dialog::show_info_and_copy(
-        "ClipSync 配对",
-        &dialog_body(&code, 47_684, true),
-        &code.to_string(),
-    );
+    let share = share_string(&PairingCode::generate(), 47_684);
+    // 打到 stdout，供外部脚本比对窗口里显示的是不是同一串。
+    println!("EXPECT_CODE={share}");
+    crate::dialog::show_info_and_copy("ClipSync 配对", &dialog_body(&share, true), &share);
 }
 
 /// 纯配对码：不带地址，调用方走局域网自动发现。
@@ -148,4 +144,35 @@ fn generated_string_round_trips() {
         assert_eq!(back.as_str(), code.as_str());
         assert!(host.is_some(), "{s} 应带地址");
     }
+}
+
+/// 进剪贴板的那一串必须**自带地址**，否则跨覆盖网配对必然卡壳。
+///
+/// 这是一条回归测试。此前 `host()` 复制的是裸的 6 位码，带地址那串只印在
+/// 弹窗正文里等用户自己选中——于是 Tailscale 场景下对方粘过来只有码，退回
+/// 局域网组播发现，而覆盖网不转发组播，最后还是得手敲 IP。整套"把地址并进
+/// 配对码"的设计因为那一行而完全没生效，而且从任何单元测试里都看不出来。
+#[test]
+fn share_string_carries_an_address() {
+    let code = PairingCode::parse("ABCDEF").unwrap();
+    let s = share_string(&code, 47_684);
+
+    // 无网卡的构建环境里退化成裸码，这时只要求它仍是个合法配对码。
+    let (parsed, host) = parse_pairing_input(&s).expect("复制出去的串必须能被解析回来");
+    assert_eq!(parsed.as_str(), "ABCDEF");
+    if best_addr_for_sharing(47_684).is_some() {
+        assert!(host.is_some(), "本机有可分享地址时，串里必须带上它");
+    }
+}
+
+/// 弹窗正文只给**一串**，且正是复制进剪贴板的那一串。
+///
+/// 分两串（裸码 + 带地址的）等于让用户自己判断"我们算不算同一个局域网"，
+/// 判断错了就配不上——而这恰恰是程序该替他判断的事。
+#[test]
+fn dialog_body_shows_exactly_what_was_copied() {
+    let share = "ABCDEF@100.88.88.22";
+    let body = dialog_body(share, true);
+    assert!(body.contains(share));
+    assert_eq!(body.matches("ABCDEF").count(), 1, "正文里不该出现第二串码");
 }
