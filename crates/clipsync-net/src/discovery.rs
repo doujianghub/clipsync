@@ -113,7 +113,7 @@ pub fn spawn_sender(
                     Ok(bytes) => {
                         let sent = send_multicast_on_all_ifaces(&bytes, target);
                         if sent == 0 && healthy {
-                            warn!("局域网信标一个网卡都发不出去，局域网自动发现将不可用");
+                            warn!("{}", beacon_blocked_hint());
                             healthy = false;
                         } else if sent > 0 && !healthy {
                             info!("局域网信标已恢复（{sent} 个网卡）");
@@ -170,6 +170,24 @@ fn send_multicast_on_all_ifaces(bytes: &[u8], target: SocketAddr) -> usize {
         }
     }
     sent
+}
+
+/// 组播发不出去时的提示。
+///
+/// 光说"发不出去"没法让人往下查。macOS 上最常见的原因不是网络，而是**本地
+/// 网络权限**：系统把组播/广播归入该隐私类别，未授权时 `send_to` 直接返回
+/// `EHOSTUNREACH`，看着像路由问题。同一份代码从终端跑却正常——终端自己有
+/// 这个权限——所以这条线索必须写进日志，否则很难联想到。
+fn beacon_blocked_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "局域网信标一个网卡都发不出去，局域网自动发现将不可用。\n         \
+         macOS 上多半是本地网络权限未授权：请到\n         \
+         「系统设置 › 隐私与安全性 › 本地网络」打开 ClipSync。\n         \
+         （覆盖网如 Tailscale 不受影响，配对与同步仍可用）"
+    } else {
+        "局域网信标一个网卡都发不出去，局域网自动发现将不可用。\n         \
+         请检查防火墙是否拦截了 UDP 组播（覆盖网不受影响）"
+    }
 }
 
 /// 在**每个**网卡上加入组播组，返回成功的网卡数。
@@ -319,9 +337,13 @@ pub fn spawn_pairing_announcer(
     std::thread::Builder::new()
         .name("pair-announce".into())
         .spawn(move || {
+            let mut warned = false;
             while !thread_stop.load(Ordering::SeqCst) {
-                if send_multicast_on_all_ifaces(&bytes, target) == 0 {
-                    debug!("配对信标一个网卡都发不出去");
+                // 只在第一轮说一次：宣告每 800ms 一轮，每轮记一条会把日志刷爆
+                // ——实机上就刷出了几十行一模一样的。
+                if send_multicast_on_all_ifaces(&bytes, target) == 0 && !warned {
+                    debug!("{}", beacon_blocked_hint());
+                    warned = true;
                 }
                 // 分片 sleep：整段睡完才检查停止标志的话，停止最多要等一个
                 // 完整间隔才生效，期间还会多广播一轮。

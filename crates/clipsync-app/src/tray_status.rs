@@ -29,7 +29,16 @@ struct ProgressState {
     /// 速度锚点：从这个时刻的这个字节数算起。
     since: Instant,
     since_bytes: u64,
+    /// 上次写进日志的时刻。
+    logged: Instant,
 }
+
+/// 传输进度写进日志的间隔。
+///
+/// 实机上一次 18.5 GB 的接收，8 分 19 秒里日志只有每分钟两条地址通告，
+/// 中间一片空白——出问题时完全无从判断卡在哪。托盘上有进度，但日志是
+/// 事后排查唯一的凭据。10 秒一条，长传输也就几十行。
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 速度锚点的重设间隔。
 ///
@@ -111,6 +120,10 @@ impl TrayStatus {
                     st.since_bytes = st.p.done;
                 }
                 st.p = p;
+                if st.logged.elapsed() >= PROGRESS_LOG_INTERVAL {
+                    st.logged = Instant::now();
+                    tracing::info!("{}", describe(st));
+                }
             }
             // 换文件了：重新锚定，否则新文件的速度会被上一个的平均值污染。
             _ => {
@@ -118,6 +131,7 @@ impl TrayStatus {
                     since_bytes: p.done,
                     p,
                     since: Instant::now(),
+                    logged: Instant::now(),
                 })
             }
         }
@@ -130,6 +144,9 @@ impl TrayStatus {
 
     /// 进度文案，例如 `接收 video.mp4 42% · 8.3 MB/s`；没有传输时为 `None`。
     ///
+    /// 与写进日志的是同一份文案（见 [`describe`]），托盘上看到什么、日志里
+    /// 就记什么，排查时不必在两套措辞之间对照。
+    ///
     /// **以 [`is_transferring`](Self::is_transferring) 为准，而不是靠各处出口
     /// 记得清进度**。传输的结束路径有一大把——传完、被新内容取代、对端
     /// `FileAbort`、解压失败、写盘失败、连接断开——挨个补一句 `clear_transfer`
@@ -141,7 +158,13 @@ impl TrayStatus {
             return None;
         }
         let g = self.progress.lock().unwrap();
-        let st = g.as_ref()?;
+        Some(describe(g.as_ref()?))
+    }
+}
+
+/// 把进度渲染成一行人话。托盘与日志共用。
+fn describe(st: &ProgressState) -> String {
+    {
         let dir = if st.p.sending { "发送" } else { "接收" };
         let pct = if st.p.total > 0 {
             st.p.done.saturating_mul(100) / st.p.total
@@ -155,15 +178,20 @@ impl TrayStatus {
         let secs = st.since.elapsed().as_secs_f64();
         if moved > 0 && secs >= 0.5 {
             let rate = (moved as f64 / secs) as u64;
-            Some(format!(
-                "{dir} {} {pct}% · {}/s",
+            format!(
+                "{dir} {} {pct}%（{} / {}，{}/s）",
                 st.p.name,
+                crate::tray::human_bytes(st.p.done),
+                crate::tray::human_bytes(st.p.total),
                 crate::tray::human_bytes(rate)
-            ))
+            )
         } else {
-            Some(format!("{dir} {} {pct}%", st.p.name))
+            format!("{dir} {} {pct}%", st.p.name)
         }
     }
+}
+
+impl TrayStatus {
 
     /// 眼下是否正在传文件（据此让托盘图标脉冲、摘要报进度）。
     pub fn is_transferring(&self) -> bool {
