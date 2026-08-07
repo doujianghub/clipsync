@@ -416,6 +416,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn clipboard_roundtrip_preserves_nfc_filename() {
+        let _guard = crate::clipboard_test_lock();
         let dir = std::env::temp_dir().join("clipsync_nfc_test");
         std::fs::create_dir_all(&dir).unwrap();
         // 显式用 NFC 形式的 é（U+00E9 单码位）建文件。
@@ -455,6 +456,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn written_files_survive_writer_exit() {
+        let _guard = crate::clipboard_test_lock();
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(_) => return,

@@ -53,7 +53,13 @@ clipsync autostart [on|off]   # 查询/设置开机自启
 `clipsync pair <配对码>` 即可自动找到对方。仅当两台设备不在同一局域网时，
 才需要用主持方打印出的地址显式指定。
 
-托盘菜单：当前状态 / 显示配对码 / 暂停同步 / 开机自启 / 退出。图标颜色即状态——绿=已连接、灰=未连接、琥珀=已暂停。
+**配对也可以全程不碰命令行**：托盘菜单里，一方选「显示配对码…」，另一方选
+「输入配对码…」，填入对方显示的 6 位码即可——同一局域网内会自动找到对方，
+不必输 IP。配对成功**立即生效，无需重启**。
+
+托盘菜单：当前状态 / 显示配对码 / 输入配对码 / 发送类型开关 / 大小上限 /
+发送限速 / 自动压缩 / 暂停同步 / 开机自启 / 退出。图标颜色即状态——绿=已连接、
+灰=未连接、琥珀=已暂停。
 
 环境变量：
 - `CLIPSYNC_LOG`：日志级别（如 `debug`）。
@@ -61,6 +67,8 @@ clipsync autostart [on|off]   # 查询/设置开机自启
 - `CLIPSYNC_PEERS`：手动补充对端地址（`ip:port` 逗号分隔），用于自动发现覆盖不到的场景（如公网端口转发）。
 - `CLIPSYNC_NO_WATCH`：禁用本地剪贴板监听，作为纯接收设备。
 - `CLIPSYNC_NO_TRAY`：禁用托盘，纯后台运行（服务器/无桌面环境）。
+- `CLIPSYNC_DEVICE_NAME`：自定义本机设备名（默认取系统名：Windows 的
+  `COMPUTERNAME`、macOS 的 `scutil --get ComputerName`）。
 
 ### 跨网络是如何工作的
 
@@ -173,5 +181,13 @@ clipsync autostart [on|off]   # 查询/设置开机自启
 
 ### 尚待完成
 
-- **macOS 平台代码**：开发环境为 Windows，以下 macOS 特定实现留有 TODO 且**未经编��验证**——`NSPasteboard` 的文件列表读写、敏感内容标记（`org.nspasteboard.ConcealedType`）探测、`changeCount` 廉价变更令牌、托盘的 `NSApplication` 事件循环。跨平台部分（arboard 文本/图片、网络、加密、缓存）本身是平台无关的。
+- **Windows 侧目视验证**：弹窗的 DPI 感知与字体改动、托盘新增的「输入配对码…」、
+  配对后免重启生效——这几项在 macOS 上完成，未在 Windows 实机确认。
+  详见 [`docs/CROSS_PLATFORM.md`](docs/CROSS_PLATFORM.md) 末尾。
+- **真实密码管理器验证**：两平台至今都用脚本模拟敏感标记。社区约定与"某个
+  软件实际是否遵守"是两回事，模拟测不出后者。
 - **打包**：Windows 免控制台窗口的 GUI 子系统构建、macOS `.app` 签名。
+
+> macOS 平台代码（`NSPasteboard` 文件列表读写、`ConcealedType` 敏感探测、
+> `changeCount` 变更令牌、`NSApplication` 事件循环、开机自启、私钥 0600）
+> **已全部补齐并实测**，见 [`docs/MACOS.md`](docs/MACOS.md)。

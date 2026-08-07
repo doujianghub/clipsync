@@ -15,8 +15,26 @@ pub mod arboard_backend;
 pub mod change_token;
 pub mod filelist;
 pub mod formats;
+#[cfg(target_os = "macos")]
+pub mod image_mac;
 pub mod sensitive;
 pub mod stub;
+
+/// 系统剪贴板是**全局单例**，而 `cargo test` 默认并行跑测试。
+///
+/// 任何"写入剪贴板 → 读回来断言"的测试若同时运行，就会读到另一个测试刚写
+/// 进去的内容，表现为随机失败——且失败信息指向被读的那个测试，与真正的
+/// 肇事者无关，极难定位。所有触碰系统剪贴板的测试都必须先取这把锁。
+///
+/// 锁中毒（某个测试 panic）时取回内部值继续：一个测试失败不应把其余全部
+/// 拖成连锁失败，那会掩盖真实的失败点。
+#[cfg(test)]
+pub(crate) fn clipboard_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub use arboard_backend::{ArboardClipboard, PollingWatcher};
 pub use sensitive::clipboard_is_sensitive;

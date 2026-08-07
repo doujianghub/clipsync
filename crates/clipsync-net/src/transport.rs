@@ -186,7 +186,13 @@ impl NoiseConnection {
 
     /// 读取并重组消息体（不含头帧），头帧已给出明文总长度 `total`。
     fn recv_body(&mut self, total: usize) -> Result<SyncMessage> {
-        let mut plaintext = Vec::with_capacity(total);
+        // 按声明长度**预留上限**而非照单全收：`total` 来自对端头帧，虽已由
+        // Noise 认证（只有已配对设备发得出），但一个 u32 就能声明 4 GB。
+        // 对端实现出错或内容异常时，照着分配会当场把内存打爆，而实际数据
+        // 可能一个字节都没到。这里只先要一小块，随实际收到的数据自然增长，
+        // 下面的 `> total` 检查负责拦住真正超长的消息。
+        const PREALLOC_CAP: usize = 1024 * 1024;
+        let mut plaintext = Vec::with_capacity(total.min(PREALLOC_CAP));
         while plaintext.len() < total {
             let chunk = self
                 .recv_encrypted()?

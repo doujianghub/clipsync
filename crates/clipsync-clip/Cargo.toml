@@ -36,5 +36,15 @@ windows-sys = { version = "0.60", features = [
 # NSPasteboard feature 已连带启用 NSArray/NSString/NSURL 等所需 Foundation 类型。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
+# NSBitmapImageRep/NSGraphicsContext/NSGraphics 供图片规范化使用：macOS 剪贴板
+# 里常见 16-bit 浮点 TIFF，arboard 内部的 image crate 解不了（实测返回
+# ConversionFailure），需要让 AppKit 自己重绘为 8-bit RGBA（见 image_mac.rs）。
+objc2-app-kit = { version = "0.3", features = [
+    "NSPasteboard",
+    "NSPasteboardItem",
+    "NSBitmapImageRep",
+    "NSImageRep",
+    "NSGraphicsContext",
+    "NSGraphics",
+] }
 objc2-foundation = "0.3"

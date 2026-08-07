@@ -46,7 +46,7 @@ fn main() -> Result<()> {
 
     let dir = config::config_dir()?;
     let identity = config::load_or_init_identity(&dir)?;
-    let device_name = hostname_best_effort();
+    let device_name = device_name_best_effort();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
@@ -55,6 +55,7 @@ fn main() -> Result<()> {
                 let settings = config::load_or_init_settings(&dir)?;
                 // 命令行下终端可见，不弹窗打断。
                 pairing_cli::host(&dir, &identity, &device_name, settings.listen_port, false)
+                    .map(|_| ())
             }
             Some(first) => {
                 let settings = config::load_or_init_settings(&dir)?;
@@ -67,6 +68,7 @@ fn main() -> Result<()> {
                     && args.get(2).is_none()
                 {
                     pairing_cli::join(&dir, &identity, &device_name, None, first, settings.listen_port)
+                        .map(|_| ())
                 } else {
                     let code = args.get(2).map(|s| s.as_str()).unwrap_or("");
                     pairing_cli::join(
@@ -77,6 +79,7 @@ fn main() -> Result<()> {
                         code,
                         settings.listen_port,
                     )
+                    .map(|_| ())
                 }
             }
             None => {
@@ -254,12 +257,15 @@ fn run_sync(
         },
     );
 
+    // 已配对设备表。运行期可增补——从托盘完成配对后立即生效，无需重启。
+    let known = net_manager::KnownPeers::new(pairings.iter().cloned().map(Into::into).collect());
+
     // 网络上下文。
     let identity_for_tray = identity.clone();
     let ctx = net_manager::NetCtx {
         local_device: device_id.clone(),
         identity: Arc::new(identity),
-        known: Arc::new(pairings.iter().cloned().map(Into::into).collect()),
+        known: known.clone(),
         hub: hub.clone(),
         registry: net_manager::ConnRegistry::new(),
         addrbook: addrbook.clone(),
@@ -270,7 +276,7 @@ fn run_sync(
     net_manager::spawn_listener(ctx.clone())?;
     net_manager::spawn_dialer(ctx.clone());
 
-    start_discovery(&device_id, &addrbook, &pairings, settings.listen_port);
+    start_discovery(&device_id, &addrbook, &known, settings.listen_port);
 
     // 剪贴板监听线程：本地变化 → 中枢。
     // 设 CLIPSYNC_NO_WATCH=1 可禁用（纯接收设备，或用于测试隔离）。
@@ -297,6 +303,11 @@ fn run_sync(
     }
 
     // 托盘必须在主线程运行；同步逻辑已全部在后台线程中。
+    let pairing = PairingDeps {
+        known,
+        addrbook,
+        status: status.clone(),
+    };
     run_tray(
         status,
         running,
@@ -305,7 +316,40 @@ fn run_sync(
         device_name,
         settings.listen_port,
         settings_handle,
+        pairing,
     )
+}
+
+/// 从托盘发起配对时，"配对成功"之后还需要让它**立刻**生效所需的东西。
+#[derive(Clone)]
+struct PairingDeps {
+    known: net_manager::KnownPeers,
+    addrbook: addrbook::AddrBook,
+    status: tray::TrayStatus,
+}
+
+impl PairingDeps {
+    /// 登记一台刚配对成功的设备。
+    ///
+    /// 两处都要更新，缺一台设备就连不上：
+    ///   - **设备表**——拨号线程据此决定拨谁，入站握手据此认证对端；
+    ///   - **地址簿**——配对时对方告知的可达地址，是首次连接的唯一线索
+    ///     （信标只覆盖同网段）。
+    ///
+    /// 顺带刷新托盘上的已配对台数，否则菜单首行会停在"尚未配对设备"，
+    /// 而同步其实已经跑起来了。
+    fn register(&self, record: &clipsync_net::pairing::PairingRecord) {
+        self.known.upsert(record.clone().into());
+        if !record.addrs.is_empty() {
+            self.addrbook
+                .add_addrs(&record.device, record.addrs.iter().copied(), AddrSource::Pairing);
+        }
+        self.status.set_paired(self.known.len());
+        info!(
+            "已登记新配对设备 {} ({})，无需重启即可开始同步",
+            record.name, record.device
+        );
+    }
 }
 
 /// 在主线程运行托盘，处理菜单动作直到用户退出。
@@ -317,6 +361,7 @@ fn run_tray(
     device_name: String,
     sync_port: u16,
     settings: config::SettingsHandle,
+    pairing: PairingDeps,
 ) -> Result<()> {
     let status_for_cb = status.clone();
     let running_for_cb = running.clone();
@@ -344,12 +389,32 @@ fn run_tray(
                 let dir = dir.clone();
                 let identity = identity.clone();
                 let name = device_name.clone();
+                let pairing = pairing.clone();
                 std::thread::spawn(move || {
                     // 托盘启动通常没有终端，必须弹窗，否则用户看不到配对码。
-                    if let Err(e) = pairing_cli::host(&dir, &identity, &name, sync_port, true) {
-                        warn!("配对失败: {e:#}");
-                        crate::dialog::show_info("ClipSync 配对失败", &format!("{e:#}"));
+                    match pairing_cli::host(&dir, &identity, &name, sync_port, true) {
+                        Ok(record) => {
+                            pairing.register(&record);
+                            crate::dialog::show_info(
+                                "ClipSync 配对成功",
+                                &format!("已与「{}」配对，现在可以互相同步了。", record.name),
+                            );
+                        }
+                        Err(e) => {
+                            warn!("配对失败: {e:#}");
+                            crate::dialog::show_info("ClipSync 配对失败", &format!("{e:#}"));
+                        }
                     }
+                });
+                true
+            }
+            tray::TrayAction::EnterPairingCode => {
+                let dir = dir.clone();
+                let identity = identity.clone();
+                let name = device_name.clone();
+                let pairing = pairing.clone();
+                std::thread::spawn(move || {
+                    join_by_code_interactive(&dir, &identity, &name, sync_port, &pairing);
                 });
                 true
             }
@@ -417,11 +482,78 @@ fn run_tray(
     Ok(())
 }
 
+/// 托盘「输入配对码…」的完整流程：要码 → 加入 → 告知结果。
+///
+/// 跑在后台线程（弹窗会阻塞到用户点掉，不能占着托盘事件循环）。
+///
+/// **地址从哪来**：先按局域网自动发现找主持方；找不到再问一次对方地址——
+/// 主持方那边的窗口里就列着可用地址，照抄即可。这样同局域网的常见情形
+/// 全程只需输一个配对码，跨网络也不至于卡死没有出路。
+fn join_by_code_interactive(
+    dir: &std::path::Path,
+    identity: &clipsync_net::crypto::StaticIdentity,
+    device_name: &str,
+    sync_port: u16,
+    pairing: &PairingDeps,
+) {
+    let Some(code) = dialog::prompt(
+        "ClipSync 配对",
+        "请输入对方显示的配对码：\n（在对方设备的托盘菜单里选「显示配对码…」）",
+    ) else {
+        return; // 用户取消
+    };
+
+    if clipsync_net::pairing::PairingCode::parse(&code).is_none() {
+        dialog::show_info(
+            "ClipSync 配对失败",
+            &format!("配对码「{code}」格式不正确，请核对后重试。"),
+        );
+        return;
+    }
+
+    // 先试局域网自动发现。
+    match pairing_cli::join(dir, identity, device_name, None, &code, sync_port) {
+        Ok(record) => {
+            pairing.register(&record);
+            dialog::show_info(
+                "ClipSync 配对成功",
+                &format!("已与「{}」配对，现在可以互相同步了。", record.name),
+            );
+            return;
+        }
+        Err(e) => {
+            info!("局域网自动发现未能完成配对，改为询问对方地址: {e:#}");
+        }
+    }
+
+    // 自动发现走不通（不同局域网、组播被拦），退而求其次问地址。
+    let Some(host) = dialog::prompt(
+        "ClipSync 配对",
+        "没能在局域网里找到对方。\n请输入对方设备的 IP 地址（对方窗口里有列出）：",
+    ) else {
+        return;
+    };
+
+    match pairing_cli::join(dir, identity, device_name, Some(&host), &code, sync_port) {
+        Ok(record) => {
+            pairing.register(&record);
+            dialog::show_info(
+                "ClipSync 配对成功",
+                &format!("已与「{}」配对，现在可以互相同步了。", record.name),
+            );
+        }
+        Err(e) => {
+            warn!("配对失败: {e:#}");
+            dialog::show_info("ClipSync 配对失败", &format!("{e:#}"));
+        }
+    }
+}
+
 /// 启动局域网信标：宣告本机 + 发现同网段的已配对设备。
 fn start_discovery(
     device_id: &clipsync_core::DeviceId,
     addrbook: &addrbook::AddrBook,
-    pairings: &[clipsync_net::pairing::PairingRecord],
+    known: &net_manager::KnownPeers,
     sync_port: u16,
 ) {
     use clipsync_net::discovery;
@@ -435,8 +567,10 @@ fn start_discovery(
     }
 
     // 接收：只接纳已配对设备的信标，其余忽略。
-    let known: std::collections::HashSet<clipsync_core::DeviceId> =
-        pairings.iter().map(|p| p.device.clone()).collect();
+    //
+    // 这里持有的是共享的设备表而非启动时的快照：运行期新配对的设备，其信标
+    // 也应当立刻被接纳，否则新设备要等到重启才会被局域网发现。
+    let known = known.clone();
     let book = addrbook.clone();
     match discovery::spawn_listener(device_id.clone(), move |found| {
         if !known.contains(&found.device) {
@@ -533,9 +667,139 @@ fn is_our_received_files(read: &clipsync_clip::ClipRead, received_dir: &std::pat
             .all(|p| p.starts_with(received_dir))
 }
 
-/// 尽力获取主机名（跨平台，不引额外依赖）。
-fn hostname_best_effort() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown-host".to_string())
+/// 尽力获取本机设备名（跨平台，不引额外依赖）。
+///
+/// 这个名字会在配对时发给对端并被其持久化，是用户在 `list` 与托盘里辨认
+/// "哪台机器"的唯一依据，因此不能轻易退化成占位符。
+///
+/// 依次尝试：
+///   1. `CLIPSYNC_DEVICE_NAME` —— 用户显式指定，优先级最高；
+///   2. `COMPUTERNAME` —— Windows 由系统设置，可靠；
+///   3. `scutil --get ComputerName` —— macOS 上用户在"设置 › 通用 › 关于本机"
+///      里看到的那个名字（可含空格与中文），比主机名更贴近用户认知；
+///   4. `hostname` 命令 —— 各 Unix 通用兜底，去掉 `.local` 之类的域名后缀；
+///   5. `HOSTNAME` 环境变量 —— 某些 shell 会导出。
+///
+/// **为什么不能只看环境变量**：`HOSTNAME` 是 bash 的 shell 变量，默认并不
+/// 导出；zsh 根本不设它，从 launchd/Finder 启动更是没有。实测在 macOS 上
+/// 两个变量都不存在，原实现必然退化为 `unknown-host`——两台 Mac 配对后
+/// 彼此都显示同一个名字，无法区分。
+fn device_name_best_effort() -> String {
+    if let Some(name) = non_empty(std::env::var("CLIPSYNC_DEVICE_NAME").ok()) {
+        return name;
+    }
+    if let Some(name) = non_empty(std::env::var("COMPUTERNAME").ok()) {
+        return name;
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(name) = non_empty(run_capture("scutil", &["--get", "ComputerName"])) {
+        return name;
+    }
+
+    #[cfg(unix)]
+    if let Some(name) = non_empty(run_capture("hostname", &[])) {
+        // `hostname` 常返回 `foo.local` / FQDN，取首段更适合展示。
+        let short = name.split('.').next().unwrap_or(&name).to_string();
+        if let Some(short) = non_empty(Some(short)) {
+            return short;
+        }
+    }
+
+    if let Some(name) = non_empty(std::env::var("HOSTNAME").ok()) {
+        return name;
+    }
+    "unknown-host".to_string()
+}
+
+/// 去掉首尾空白；结果为空则视为"没取到"。
+fn non_empty(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// 运行一个命令并取其标准输出。命令不存在或失败返回 `None`。
+///
+/// 只在启动时调用一次，进程开销可忽略；换来的是不必为取一个主机名引入
+/// `libc`/`hostname` 依赖。
+#[cfg(unix)]
+fn run_capture(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_empty_trims_and_rejects_blank() {
+        assert_eq!(non_empty(Some("  mac  ".into())), Some("mac".to_string()));
+        assert_eq!(non_empty(Some("   ".into())), None);
+        assert_eq!(non_empty(Some(String::new())), None);
+        assert_eq!(non_empty(None), None);
+    }
+
+    /// 回归：本机必须能取到一个真实设备名。
+    ///
+    /// 原实现只查 `COMPUTERNAME`/`HOSTNAME`，两者在 macOS 上都不存在
+    /// （`HOSTNAME` 是 bash 的 shell 变量，不导出；zsh 不设），于是设备名
+    /// 恒为 `unknown-host`——多台 Mac 配对后彼此重名，无法分辨。
+    ///
+    /// 这条断言在 Windows（`COMPUTERNAME`）与 Unix（`scutil`/`hostname`）
+    /// 上都应成立。
+    #[test]
+    fn device_name_is_not_placeholder_on_this_machine() {
+        let name = device_name_best_effort();
+        assert_ne!(
+            name, "unknown-host",
+            "未能取到本机设备名，配对后对端将无法分辨这台机器"
+        );
+        assert!(!name.trim().is_empty(), "设备名不应为空白");
+    }
+
+    /// 设备名不应带 `.local` 之类的域名后缀——展示用，越短越清楚。
+    #[cfg(unix)]
+    #[test]
+    fn unix_device_name_has_no_domain_suffix() {
+        // 仅在回退到 `hostname` 这条路径时才需要截断；显式指定或 scutil
+        // 的结果本就不带后缀，故这里只断言最终结果不含点分域名形态。
+        if std::env::var_os("CLIPSYNC_DEVICE_NAME").is_some() {
+            return; // 用户显式指定的名字原样保留，不做断言
+        }
+        let name = device_name_best_effort();
+        assert!(
+            !name.ends_with(".local"),
+            "设备名残留了 .local 后缀: {name}"
+        );
+    }
+
+    /// 只有**全部**路径都在落地目录下才算"我们自己刚写入的接收文件"。
+    ///
+    /// 若只要有一个命中就跳过，用户把收到的文件和自己的文件一起复制时，
+    /// 这次真实的复制会被误当作回声而丢失。
+    #[test]
+    fn received_files_detection_requires_all_paths_inside() {
+        use clipsync_clip::ClipRead;
+        use clipsync_core::{ClipContent, FileMeta};
+
+        let recv = std::path::PathBuf::from("/tmp/ClipSync/recv");
+        let mk = |paths: Vec<&str>| ClipRead {
+            content: ClipContent::Files(vec![FileMeta::new("a", 1, 1)]),
+            sensitive: false,
+            file_paths: paths.into_iter().map(std::path::PathBuf::from).collect(),
+        };
+
+        assert!(is_our_received_files(
+            &mk(vec!["/tmp/ClipSync/recv/0001/a.txt"]),
+            &recv
+        ));
+        assert!(!is_our_received_files(
+            &mk(vec!["/tmp/ClipSync/recv/0001/a.txt", "/Users/me/b.txt"]),
+            &recv
+        ));
+        assert!(!is_our_received_files(&mk(vec![]), &recv));
+    }
 }

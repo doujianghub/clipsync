@@ -139,10 +139,54 @@ mod platform {
 </plist>
 "#,
             label = APP_KEY.to_lowercase(),
-            exe = exe.display()
+            exe = xml_escape(&exe.display().to_string())
         );
         std::fs::write(&path, plist).context("写入 LaunchAgent 失败")?;
         Ok(())
+    }
+
+    /// 转义 XML 文本节点中的特殊字符。
+    ///
+    /// plist 是 XML，而可执行文件路径来自用户的目录结构——`~/Projects/A&B/`
+    /// 这样的目录并不罕见。未转义就拼进去会生成**语法非法的 plist**：
+    /// `std::fs::write` 照样成功，`is_enabled()` 也照样返回 true（它只看文件
+    /// 是否存在），只有到下次开机时 launchd 才会静默拒绝加载。属于"写的时候
+    /// 一切正常、要到重启才发现"的故障，故在写入前就杜绝。
+    fn xml_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&apos;"),
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::xml_escape;
+
+        #[test]
+        fn escapes_xml_metacharacters() {
+            assert_eq!(
+                xml_escape("/Users/me/A&B/clip<sync>"),
+                "/Users/me/A&amp;B/clip&lt;sync&gt;"
+            );
+            assert_eq!(xml_escape(r#"/a/"b"/'c'"#), "/a/&quot;b&quot;/&apos;c&apos;");
+        }
+
+        #[test]
+        fn leaves_ordinary_paths_untouched() {
+            let p = "/Users/wang/PythonProject/ClipSync/target/release/clipsync";
+            assert_eq!(xml_escape(p), p);
+            // 中文路径同样不受影响。
+            assert_eq!(xml_escape("/Users/王鑫/应用/clipsync"), "/Users/王鑫/应用/clipsync");
+        }
     }
 }
 

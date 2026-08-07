@@ -35,8 +35,9 @@
 > 配合）。单机侧已全部验证：剪贴板读写、探测、托盘、自启，以及用同机双实例
 > 跑通的文件传输/打断/续传/缓存命中（见文末"macOS 侧实测结果"）。
 >
-> **另发现一处遗留缺口**（不在这 7 项内，未修）：16-bit 浮点 TIFF 图片
-> 无法解码，导致该类图片同步失败。8-bit 图片正常。详见第 3 节末尾。
+> **另发现一处遗留缺口**（不在这 7 项内）：16-bit 浮点 TIFF 图片无法解码，
+> 导致该类图片同步失败。8-bit 图片正常。详见第 3 节末尾。
+> **已于 2026-08-07 修复**——见第 3 节末尾的「已修复」小节。
 
 ---
 
@@ -202,6 +203,34 @@ pub fn has_image() -> Option<bool> {
 >   `NSBitmapImageRep` 直接取 RGBA（顺带也解决 PNG-only 的情形）；
 >   ③ 等 `image` 支持浮点 TIFF。①② 都需要动 `arboard_backend.rs` 的读图路径，
 >   属于独立改动，建议单独评估。
+
+### ✅ 已修复（2026-08-07）
+
+取上述修法 ② 的**兜底版**：不改 arboard 的正常路径，只在它返回错误时才走
+平台路径。新增 `crates/clipsync-clip/src/image_mac.rs`，用 `NSBitmapImageRep`
+取像素，再让 AppKit 把它**重绘**到一块 8-bit RGBA 画布上，一次性归一位深、
+通道顺序（`AlphaFirst`）、alpha 预乘、行间 padding、色彩空间——各维度都可能
+不同，逐个分支处理不如让 AppKit 重绘一次干净。
+
+**两个实现上的坑**（都实测踩过）：
+
+- **画布不能建成非预乘**。`graphicsContextWithBitmapImageRep` 底层是
+  CGBitmapContext，Core Graphics **只支持预乘 alpha**，传
+  `NSBitmapFormat::AlphaNonpremultiplied` 会让它返回 `nil` 且不给任何错误原因，
+  表现为"画布建得出来、上下文却是空的"。改为按预乘绘制，读出时手动去预乘
+  （`ImageData.rgba` 的约定是非预乘，与 arboard 其它路径一致；不还原的话
+  半透明像素会明显偏暗）。
+- **尺寸不能硬编码**。Retina 屏 `backingScaleFactor = 2`，`NSImage` 的 40×30
+  对应位图是 80×60，断言要以 `pixelsWide()/pixelsHigh()` 为准。
+
+**验证**：`arboard_backend` 与 `image_mac` 各有一条回归测试，都先用
+`NSBitmapImageRep` **断言剪贴板里真是浮点采样**再继续（否则跳过并说明原因）
+——少了这道前置断言，测试可能只是在验证一张普通 8-bit 图。双实例实测同步
+该类图片 153600 字节完整送达。
+
+> ⚠️ 做这类对照实验前**务必确认没有 clipsync 进程在跑**。验证时曾因后台留着
+> 两个实例，它们把图片同步一圈后用 arboard 写回了剪贴板，对照程序读到的是
+> 已转成 8-bit 的版本，得出"缺口已消失"的错误结论，差点删掉整个修复。
 
 ---
 

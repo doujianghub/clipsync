@@ -115,8 +115,29 @@ pub fn run_pairing<S: std::io::Read + std::io::Write>(
         ));
     }
 
+    // 6) 设备 ID **自己算**，不采信对端自报的那个。
+    //
+    // `DeviceId` 就是静态公钥的指纹（`DeviceId::from_public_key`），是可推导
+    // 的——既然能算，就没有理由信别人报的。自报值与公钥不符时，后果全是
+    // "连得上但行为诡异"的那类问题，极难排查：
+    //   - **局域网发现失效**：信标里的 id 是发送方按公钥算的，与记录里存的
+    //     自报值对不上，信标会被当作陌生设备丢弃；
+    //   - **连接方向去重错乱**：谁拨号由 id 字典序决定，两边对 id 的认知不
+    //     一致时，会双双拨号（连接抖动）或双双不拨（永远连不上）。
+    //
+    // 公钥本身已由上面的标签校验认证过，据它派生的 id 因此也是可信的。
+    let device = clipsync_core::DeviceId::from_public_key(&their_auth.identity.static_public_key);
+    if device.as_str() != their_auth.identity.device_id {
+        // 正常实现不会走到这里；出现即说明对端版本/实现有问题，值得留痕。
+        tracing::warn!(
+            "对端自报的设备 ID（{}）与其公钥派生值（{}）不符，以派生值为准",
+            their_auth.identity.device_id,
+            device
+        );
+    }
+
     Ok(PairingRecord {
-        device: clipsync_core::DeviceId::from_hex(their_auth.identity.device_id),
+        device,
         name: their_auth.identity.name,
         static_public_key: their_auth.identity.static_public_key,
         addrs: their_auth.identity.addrs,
@@ -207,6 +228,42 @@ mod tests {
         assert!(server_rec
             .addrs
             .contains(&"192.168.1.1:47684".parse().unwrap()));
+    }
+
+    /// 记录里的设备 ID 必须由对端公钥派生，而不是照抄对端自报的值。
+    ///
+    /// 自报值与公钥不符时会引出一类极难排查的故障：局域网信标里的 id 是
+    /// 按公钥算的，与记录对不上就会被当陌生设备丢弃（发现失效）；而拨号
+    /// 方向由 id 字典序决定，两边认知不一致会双双拨号或双双不拨。
+    #[test]
+    fn device_id_comes_from_public_key_not_peer_claim() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 服务端谎报一个与自己公钥无关的设备 ID。
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let code = PairingCode::from_entropy(b"ABCDEF");
+            let mut liar = info(2, "server");
+            liar.device_id = "deadbeefdeadbeef".to_string();
+            run_pairing(&mut s, &code, &liar)
+        });
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        let code = PairingCode::from_entropy(b"ABCDEF");
+        let rec = run_pairing(&mut c, &code, &info(1, "client")).expect("配对本身应成功");
+        let _ = server.join().unwrap();
+
+        assert_eq!(
+            rec.device,
+            clipsync_core::DeviceId::from_public_key(&vec![2u8; 32]),
+            "应采用公钥派生值"
+        );
+        assert_ne!(
+            rec.device.as_str(),
+            "deadbeefdeadbeef",
+            "不得采信对端自报的设备 ID"
+        );
     }
 
     /// 配对码不一致时，认证必须失败（至少一方报错）。
