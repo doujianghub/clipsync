@@ -25,24 +25,6 @@ pub fn show_info(title: &str, body: &str) {
     }
 }
 
-/// 弹框的同时把 `copy_text` 放入剪贴板，省去用户手抄。
-///
-/// 注意：这会改变系统剪贴板，进而触发本程序自身的监听。调用方需自行
-/// 决定是否可接受（配对码是短文本，且配对时通常尚无对端可同步）。
-pub fn show_info_and_copy(title: &str, body: &str, copy_text: &str) {
-    use clipsync_clip::Clipboard as _;
-    match clipsync_clip::ArboardClipboard::new() {
-        Ok(mut cb) => {
-            let content = clipsync_core::ClipContent::Text(copy_text.to_string());
-            if let Err(e) = cb.write(&content) {
-                tracing::debug!("配对码写入剪贴板失败（不影响弹窗）: {e:#}");
-            }
-        }
-        Err(e) => tracing::debug!("打开剪贴板失败（不影响弹窗）: {e:#}"),
-    }
-    show_info(title, body);
-}
-
 #[cfg(target_os = "macos")]
 #[path = "dialog_mac.rs"]
 mod platform;

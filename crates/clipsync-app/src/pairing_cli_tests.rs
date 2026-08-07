@@ -69,29 +69,28 @@ fn accept_until_returns_connection_in_blocking_mode() {
 
 /// 手动目视验证：弹出与托盘「显示配对码」**完全一致**的窗口。
 ///
-/// 这里刻意复用真实的 `dialog_body` 与 `show_info_and_copy`，而不是另写
+/// 这里刻意复用真实的 `dialog_body` 与 `show_info`，而不是另写
 /// 一段相似的内容——照抄一遍只能证明抄得对，证明不了线上那条路径对。
 /// 唯一省略的是 `TcpListener` 与 `accept` 循环：它们与"窗口显示成什么样"
 /// 无关，却会让测试永久阻塞。
 ///
 /// 跑法：`cargo test -p clipsync-app --bin clipsync -- --ignored pairing_dialog`
 ///
-/// 判据：窗口标题为「ClipSync 配对」，正文首行的「码@地址」可读，
-/// 且**这一整串**已进入剪贴板（正文里"已复制到剪贴板"这句得是真的）。
+/// 判据：窗口标题为「ClipSync 配对」，正文首行的 4 位配对码清晰可读。
 #[test]
 #[ignore = "会弹窗并阻塞，需人工/脚本关闭"]
 fn manual_pairing_dialog() {
-    let share = share_string(&PairingCode::generate(), 47_684);
-    // 打到 stdout，供外部脚本比对窗口里显示的是不是同一串。
-    println!("EXPECT_CODE={share}");
-    crate::dialog::show_info_and_copy("ClipSync 配对", &dialog_body(&share, true), &share);
+    let code = PairingCode::generate();
+    // 打到 stdout，供外部脚本比对窗口里显示的是不是同一个码。
+    println!("EXPECT_CODE={code}");
+    crate::dialog::show_info("ClipSync 配对", &dialog_body(&code, 47_684));
 }
 
 /// 纯配对码：不带地址，调用方走局域网自动发现。
 #[test]
 fn parses_bare_code() {
-    let (code, host) = parse_pairing_input("ABCDEF").expect("应识别为配对码");
-    assert_eq!(code.as_str(), "ABCDEF");
+    let (code, host) = parse_pairing_input("1234").expect("应识别为配对码");
+    assert_eq!(code.as_str(), "1234");
     assert!(host.is_none(), "没带地址就该让调用方去自动发现");
 }
 
@@ -101,78 +100,70 @@ fn parses_bare_code() {
 /// 否则用户得先看一屏 IP 再手敲。
 #[test]
 fn parses_code_with_address() {
-    let (code, host) = parse_pairing_input("ABCDEF@100.88.88.22").unwrap();
-    assert_eq!(code.as_str(), "ABCDEF");
+    let (code, host) = parse_pairing_input("1234@100.88.88.22").unwrap();
+    assert_eq!(code.as_str(), "1234");
     assert_eq!(host.as_deref(), Some("100.88.88.22"));
 }
 
 /// IPv6 要从右往左切：地址里全是冒号，但不会有 @。
 #[test]
 fn parses_ipv6_address() {
-    let (code, host) = parse_pairing_input("ABCDEF@[fd7a:115c:a1e0::e201:c839]").unwrap();
-    assert_eq!(code.as_str(), "ABCDEF");
+    let (code, host) = parse_pairing_input("1234@[fd7a:115c:a1e0::e201:c839]").unwrap();
+    assert_eq!(code.as_str(), "1234");
     assert_eq!(host.as_deref(), Some("[fd7a:115c:a1e0::e201:c839]"));
 }
 
 /// 用户输入不会规整：大小写、空格、连字符都得认（沿用 PairingCode::parse）。
 #[test]
 fn tolerates_messy_input() {
-    assert_eq!(parse_pairing_input("  abcdef  ").unwrap().0.as_str(), "ABCDEF");
-    assert_eq!(parse_pairing_input("abc-def").unwrap().0.as_str(), "ABCDEF");
-    let (c, h) = parse_pairing_input(" abcdef@10.0.0.5 ").unwrap();
-    assert_eq!((c.as_str(), h.as_deref()), ("ABCDEF", Some("10.0.0.5")));
+    assert_eq!(parse_pairing_input("  1234  ").unwrap().0.as_str(), "1234");
+    assert_eq!(parse_pairing_input("12-34").unwrap().0.as_str(), "1234");
+    let (c, h) = parse_pairing_input(" 1234@10.0.0.5 ").unwrap();
+    assert_eq!((c.as_str(), h.as_deref()), ("1234", Some("10.0.0.5")));
 }
 
 #[test]
 fn rejects_malformed_input() {
     assert!(parse_pairing_input("").is_none());
-    assert!(parse_pairing_input("TOOLONGCODE").is_none());
-    assert!(parse_pairing_input("ABCDEF@").is_none(), "@ 后面空着不算有效地址");
-    // 字符集里没有 0/O/1/I/L，避免手抄时混淆。
-    assert!(parse_pairing_input("ABC0EF").is_none());
+    assert!(parse_pairing_input("1234567").is_none());
+    assert!(parse_pairing_input("1234@").is_none(), "@ 后面空着不算有效地址");
+    // 字符集只有数字：码要靠人念、人敲，字母大小写与 O/0、l/1 之类的混淆
+    // 在电话里说不清楚。
+    assert!(parse_pairing_input("12A4").is_none());
 }
 
-/// 生成的串必须能被自己解析回去——两边写法一旦不一致，用户复制粘贴就失败。
+/// `码@地址` 这个手动出口必须能被解析回来。
+///
+/// 它不再主动示人（自动发现覆盖了绝大多数情况），但仍是自动发现全落空时
+/// 唯一不用重来一遍的退路，命令行也照旧接受。
 #[test]
-fn generated_string_round_trips() {
-    let code = PairingCode::from_entropy(b"ABCDEF");
-    for addr in ["192.168.1.5:47684", "[fd7a:115c:a1e0::1]:47684"] {
-        let sa: std::net::SocketAddr = addr.parse().unwrap();
-        let s = format_pairing_string(&code, &sa);
-        let (back, host) = parse_pairing_input(&s)
-            .unwrap_or_else(|| panic!("自己生成的串应能解析回来: {s}"));
+fn manual_code_with_address_round_trips() {
+    let code = PairingCode::from_entropy(b"\x01\x02\x03\x04");
+    for host in ["192.168.1.5", "[fd7a:115c:a1e0::1]", "100.88.88.22"] {
+        let s = format!("{code}@{host}");
+        let (back, parsed) = parse_pairing_input(&s)
+            .unwrap_or_else(|| panic!("手动写法应能解析: {s}"));
         assert_eq!(back.as_str(), code.as_str());
-        assert!(host.is_some(), "{s} 应带地址");
+        assert_eq!(parsed.as_deref(), Some(host));
     }
 }
 
-/// 进剪贴板的那一串必须**自带地址**，否则跨覆盖网配对必然卡壳。
+/// 弹窗正文要把码、去哪儿输、多久过期这三件事说全，且不带任何"复制"字样。
 ///
-/// 这是一条回归测试。此前 `host()` 复制的是裸的 6 位码，带地址那串只印在
-/// 弹窗正文里等用户自己选中——于是 Tailscale 场景下对方粘过来只有码，退回
-/// 局域网组播发现，而覆盖网不转发组播，最后还是得手敲 IP。整套"把地址并进
-/// 配对码"的设计因为那一行而完全没生效，而且从任何单元测试里都看不出来。
+/// 曾经把码自动放进主持方剪贴板、让用户"复制粘贴过去"——这是循环依赖：
+/// 本工具要解决的正是"跨设备复制粘贴还没打通"。这条测试把那条弯路钉死。
 #[test]
-fn share_string_carries_an_address() {
-    let code = PairingCode::parse("ABCDEF").unwrap();
-    let s = share_string(&code, 47_684);
+fn dialog_body_tells_the_user_everything_and_mentions_no_clipboard() {
+    let code = PairingCode::from_entropy(b"\x01\x02\x03\x04");
+    let body = dialog_body(&code, 47_684);
 
-    // 无网卡的构建环境里退化成裸码，这时只要求它仍是个合法配对码。
-    let (parsed, host) = parse_pairing_input(&s).expect("复制出去的串必须能被解析回来");
-    assert_eq!(parsed.as_str(), "ABCDEF");
-    if best_addr_for_sharing(47_684).is_some() {
-        assert!(host.is_some(), "本机有可分享地址时，串里必须带上它");
-    }
+    assert!(body.contains(code.as_str()), "得有码");
+    assert!(body.contains("输入配对码"), "得说去哪儿输");
+    assert!(
+        body.contains(&HOST_SESSION_TIMEOUT.as_secs().to_string()),
+        "得说多久过期"
+    );
+    assert!(!body.contains("剪贴板"), "不该再提剪贴板");
+    assert!(!body.contains("复制"), "不该再提复制");
 }
 
-/// 弹窗正文只给**一串**，且正是复制进剪贴板的那一串。
-///
-/// 分两串（裸码 + 带地址的）等于让用户自己判断"我们算不算同一个局域网"，
-/// 判断错了就配不上——而这恰恰是程序该替他判断的事。
-#[test]
-fn dialog_body_shows_exactly_what_was_copied() {
-    let share = "ABCDEF@100.88.88.22";
-    let body = dialog_body(share, true);
-    assert!(body.contains(share));
-    assert_eq!(body.matches("ABCDEF").count(), 1, "正文里不该出现第二串码");
-}

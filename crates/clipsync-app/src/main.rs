@@ -33,6 +33,7 @@ mod device_name;
 mod dialog;
 mod filecache;
 mod filetransfer;
+mod host_probe;
 mod hub;
 mod known_peers;
 mod logging;
