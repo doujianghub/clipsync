@@ -325,9 +325,11 @@ impl HubState {
                 debug!("已更新 {} 的地址（{} 条通告）", from, n);
             }
 
-            // FileNeed 由连接层直接处理（需流式读盘，不经中枢）。
+            // 这几类都由连接层就地处理，不经中枢：
+            //   FileNeed 需流式读盘；Hello/Peers 属于连接自身的协商与设备管理。
             SyncMessage::FileNeed { .. }
             | SyncMessage::Hello { .. }
+            | SyncMessage::Peers { .. }
             | SyncMessage::Ping
             | SyncMessage::Pong => {}
         }

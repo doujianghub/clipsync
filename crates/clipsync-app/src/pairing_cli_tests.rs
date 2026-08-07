@@ -90,3 +90,62 @@ fn manual_pairing_dialog() {
         &code.to_string(),
     );
 }
+
+/// 纯配对码：不带地址，调用方走局域网自动发现。
+#[test]
+fn parses_bare_code() {
+    let (code, host) = parse_pairing_input("ABCDEF").expect("应识别为配对码");
+    assert_eq!(code.as_str(), "ABCDEF");
+    assert!(host.is_none(), "没带地址就该让调用方去自动发现");
+}
+
+/// 带地址的串：跨网络配对的正路。
+///
+/// Tailscale 这类覆盖网不转发组播，自动发现注定落空——地址必须随码带过来，
+/// 否则用户得先看一屏 IP 再手敲。
+#[test]
+fn parses_code_with_address() {
+    let (code, host) = parse_pairing_input("ABCDEF@100.88.88.22").unwrap();
+    assert_eq!(code.as_str(), "ABCDEF");
+    assert_eq!(host.as_deref(), Some("100.88.88.22"));
+}
+
+/// IPv6 要从右往左切：地址里全是冒号，但不会有 @。
+#[test]
+fn parses_ipv6_address() {
+    let (code, host) = parse_pairing_input("ABCDEF@[fd7a:115c:a1e0::e201:c839]").unwrap();
+    assert_eq!(code.as_str(), "ABCDEF");
+    assert_eq!(host.as_deref(), Some("[fd7a:115c:a1e0::e201:c839]"));
+}
+
+/// 用户输入不会规整：大小写、空格、连字符都得认（沿用 PairingCode::parse）。
+#[test]
+fn tolerates_messy_input() {
+    assert_eq!(parse_pairing_input("  abcdef  ").unwrap().0.as_str(), "ABCDEF");
+    assert_eq!(parse_pairing_input("abc-def").unwrap().0.as_str(), "ABCDEF");
+    let (c, h) = parse_pairing_input(" abcdef@10.0.0.5 ").unwrap();
+    assert_eq!((c.as_str(), h.as_deref()), ("ABCDEF", Some("10.0.0.5")));
+}
+
+#[test]
+fn rejects_malformed_input() {
+    assert!(parse_pairing_input("").is_none());
+    assert!(parse_pairing_input("TOOLONGCODE").is_none());
+    assert!(parse_pairing_input("ABCDEF@").is_none(), "@ 后面空着不算有效地址");
+    // 字符集里没有 0/O/1/I/L，避免手抄时混淆。
+    assert!(parse_pairing_input("ABC0EF").is_none());
+}
+
+/// 生成的串必须能被自己解析回去——两边写法一旦不一致，用户复制粘贴就失败。
+#[test]
+fn generated_string_round_trips() {
+    let code = PairingCode::from_entropy(b"ABCDEF");
+    for addr in ["192.168.1.5:47684", "[fd7a:115c:a1e0::1]:47684"] {
+        let sa: std::net::SocketAddr = addr.parse().unwrap();
+        let s = format_pairing_string(&code, &sa);
+        let (back, host) = parse_pairing_input(&s)
+            .unwrap_or_else(|| panic!("自己生成的串应能解析回来: {s}"));
+        assert_eq!(back.as_str(), code.as_str());
+        assert!(host.is_some(), "{s} 应带地址");
+    }
+}

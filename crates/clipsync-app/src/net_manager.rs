@@ -106,6 +106,8 @@ pub struct NetCtx {
     pub settings: crate::config::SettingsHandle,
     /// 本机同步监听端口（用于向对端通告自身地址）。
     pub sync_port: u16,
+    /// 配置目录：把对端引荐来的新设备落盘，否则重启就忘了。
+    pub config_dir: std::path::PathBuf,
 }
 
 /// 从设置取发送限速。`0` 表示不限速（`RateLimiter` 自身也把 0 当无限制，
@@ -218,8 +220,9 @@ fn log_addrbook_state(ctx: &NetCtx) {
     }
 }
 
-/// 按优先级依次尝试该对端的候选地址，首个成功者进入收发循环（阻塞至断开）。
+/// 按优先级依次尝试该对端的候选地址，首个握手成功者胜出。
 ///
+/// 连接本身交给独立线程跑，本函数即刻返回，好让拨号线程接着去连下一台设备。
 /// 返回是否**握手成功过**——拨号线程据此决定要不要退避。
 fn dial_peer(peer: &KnownPeer, ctx: &NetCtx) -> bool {
     let candidates = ctx.addrbook.connect_order(&peer.device);
@@ -245,7 +248,13 @@ fn dial_peer(peer: &KnownPeer, ctx: &NetCtx) -> bool {
     false
 }
 
-/// 尝试单个地址。返回 `Ok(true)` 表示握手成功并已完成一次连接会话。
+/// 尝试单个地址。返回 `Ok(true)` 表示握手成功、连接已交给独立线程。
+///
+/// **连接必须跑在独立线程里**：`run_connection` 会一直阻塞到断开。早先它直接
+/// 在拨号线程里跑，后果是拨通第一台设备后整个拨号线程就卡在那条连接上，
+/// **其余设备永远拨不到**。两台设备时看不出来（本来就只有一个对端），三台
+/// 才暴露：A 连上 B 之后再也没去连 C。入站监听一直是每连接一线程，出站这边
+/// 漏了。
 fn dial_addr(peer: &KnownPeer, addr: SocketAddr, ctx: &NetCtx) -> Result<bool> {
     let stream = match TcpStream::connect_timeout(&addr, DIAL_TIMEOUT) {
         Ok(s) => s,
@@ -258,7 +267,15 @@ fn dial_addr(peer: &KnownPeer, addr: SocketAddr, ctx: &NetCtx) -> Result<bool> {
         .context("出站 Noise 握手失败")?;
 
     info!("已通过 {} 连接 {}", addr, peer.name);
-    run_connection(conn, ctx, Some(addr))?;
+    let ctx = ctx.clone();
+    std::thread::Builder::new()
+        .name(format!("net-conn-{}", peer.device))
+        .spawn(move || {
+            if let Err(e) = run_connection(conn, &ctx, Some(addr)) {
+                debug!("出站连接结束: {e:#}");
+            }
+        })
+        .context("启动连接线程失败")?;
     Ok(true)
 }
 

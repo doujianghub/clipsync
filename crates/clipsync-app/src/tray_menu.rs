@@ -84,11 +84,14 @@ pub(super) fn rebuild_peer_menu(
     for p in peers {
         // ● 在线 / ○ 离线，一眼看出哪台连着。不在标签里写"解除配对"——
         // 那是点击后确认框的事，菜单只负责列出设备。
-        let item = MenuItem::new(
-            format!("{} {}", if p.online { '●' } else { '○' }, p.name),
-            true,
-            None,
-        );
+        //
+        // 引荐来的标出引荐人：那台设备不是你亲手加的，信任是从别处传递
+        // 过来的，不标出来等于把这件事藏起来。
+        let label = match &p.introduced_by {
+            Some(by) => format!("{} {}（经 {by}）", if p.online { '●' } else { '○' }, p.name),
+            None => format!("{} {}", if p.online { '●' } else { '○' }, p.name),
+        };
+        let item = MenuItem::new(label, true, None);
         menu.append(&item)
             .map_err(|e| anyhow::anyhow!("构建设备子菜单失败: {e}"))?;
         mapping.push((item, p.device.clone()));

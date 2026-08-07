@@ -23,6 +23,61 @@ use crate::config;
 /// 配对使用的 TCP 端口（与同步端口区分）。
 pub const PAIRING_PORT: u16 = 47_685;
 
+/// 把配对码与主持方地址拼成一个可整体复制的串：`ABCDEF@100.88.88.22`。
+///
+/// **为什么需要它**：局域网内靠 UDP 组播就能自动找到对方，但**覆盖网不转发
+/// 组播**——Tailscale、ZeroTier 这类 L3 overlay 都是如此（mDNS/SSDP 在上面
+/// 同样不工作）。于是跨网络配对时自动发现必然落空，用户得先看主持方屏幕上
+/// 的一串 IP、再手动敲进去，两次输入、两处出错机会。
+///
+/// 把地址并进配对码后，跨网络也只需复制粘贴**一次**。
+pub fn format_pairing_string(code: &PairingCode, addr: &std::net::SocketAddr) -> String {
+    format!("{code}@{}", fmt_host(addr))
+}
+
+/// 解析用户输入：纯配对码，或 `配对码@地址`。
+///
+/// 返回 `(配对码, 地址)`；地址为 `None` 时调用方走局域网自动发现。
+/// 无法识别为合法配对码时返回 `None`。
+pub fn parse_pairing_input(input: &str) -> Option<(PairingCode, Option<String>)> {
+    let s = input.trim();
+    match s.rsplit_once('@') {
+        // 从右往左切：IPv6 字面量里没有 @，但地址部分可能含冒号与方括号。
+        Some((code, host)) => {
+            let host = host.trim();
+            if host.is_empty() {
+                return None;
+            }
+            Some((PairingCode::parse(code)?, Some(host.to_string())))
+        }
+        None => Some((PairingCode::parse(s)?, None)),
+    }
+}
+
+/// 挑一个最适合放进配对串的本机地址。
+///
+/// 优先覆盖网（Tailscale 等）：局域网那种情况自动发现本来就能搞定，真正需要
+/// 手动带地址的恰恰是组播过不去的覆盖网。没有覆盖网地址时退而给局域网地址，
+/// 总比什么都不给强。
+fn best_addr_for_sharing(port: u16) -> Option<std::net::SocketAddr> {
+    use clipsync_net::local::{local_candidates, local_networks};
+    use clipsync_net::peer::{classify, AddrClass};
+
+    let nets = local_networks();
+    let cands = local_candidates(port);
+    let pick = |want: AddrClass| {
+        cands
+            .iter()
+            .find(|sa| classify(sa.ip(), &nets) == Some(want) && sa.is_ipv4())
+            .or_else(|| cands.iter().find(|sa| classify(sa.ip(), &nets) == Some(want)))
+            .copied()
+    };
+    // IPv4 优先只是因为它短、好念、好核对，不影响可达性。
+    pick(AddrClass::Overlay)
+        .or_else(|| pick(AddrClass::LanDirect))
+        .or_else(|| pick(AddrClass::Public))
+}
+
 /// 主持配对的有效期。到期自动结束：释放端口、停止组播宣告。
 ///
 /// **为什么必须有这个**：配对码是一次性凭证，"永远有效"既是安全问题，更是
@@ -227,24 +282,20 @@ fn fmt_host(sa: &std::net::SocketAddr) -> String {
 ///
 /// 跨网地址最多列 3 条：多数机器有一堆虚拟网卡（Tailscale、Docker、
 /// 各种 utun），全列出来会把窗口撑得很长，反而让人找不到重点。
-fn dialog_body(code: &PairingCode, sync_port: u16, announcing: bool) -> String {
+fn dialog_body(code: &PairingCode, sync_port: u16, _announcing: bool) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     let _ = write!(s, "配对码：{code}\n（已复制到剪贴板）\n\n");
+    let _ = write!(s, "在对方设备上选「输入配对码…」，填入上面这串。\n");
 
-    if announcing {
-        let _ = write!(s, "在另一台设备上运行，无需输入 IP：\n    clipsync pair {code}\n");
-    }
-
-    let addrs = clipsync_net::local::local_candidates(sync_port);
-    if !addrs.is_empty() {
-        let _ = write!(s, "\n若不在同一局域网，改用：\n");
-        for sa in addrs.iter().take(3) {
-            let _ = writeln!(s, "    clipsync pair {} {}", fmt_host(sa), code);
-        }
-        if addrs.len() > 3 {
-            let _ = writeln!(s, "    （另有 {} 个地址，见终端输出）", addrs.len() - 3);
-        }
+    // 跨网络时另给一串带地址的：覆盖网不转发组播，自动发现在那边不管用，
+    // 与其让用户先看一屏 IP 再手敲，不如给一串能直接粘贴的。
+    if let Some(addr) = best_addr_for_sharing(sync_port) {
+        let _ = write!(
+            s,
+            "\n若两台设备不在同一局域网（如通过 Tailscale），改填：\n    {}\n",
+            format_pairing_string(code, &addr)
+        );
     }
 
     let _ = write!(s, "\n正在等待对方连接…");

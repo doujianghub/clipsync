@@ -337,6 +337,11 @@ pub fn load_pairings(dir: &Path) -> Result<Vec<clipsync_net::pairing::PairingRec
 
 /// 追加或更新一条配对记录（按设备 ID 去重），并保存。
 pub fn upsert_pairing(dir: &Path, record: clipsync_net::pairing::PairingRecord) -> Result<()> {
+    // 亲手配对是明确授权，应当压过此前的"拒绝"。引荐来的不解除拒绝——
+    // 否则用户刚移除的设备会被对端引荐回来，绕过整个机制。
+    if record.introduced_by.is_none() {
+        let _ = unblock_device(dir, &record.device);
+    }
     let mut list = load_pairings(dir)?;
     if let Some(existing) = list.iter_mut().find(|r| r.device == record.device) {
         *existing = record;
@@ -344,6 +349,53 @@ pub fn upsert_pairing(dir: &Path, record: clipsync_net::pairing::PairingRecord) 
         list.push(record);
     }
     save_pairings(dir, &list)
+}
+
+/// 被用户主动移除过的设备，不再接受任何引荐。
+///
+/// **为什么必须有**：引荐是"只要不认识就加进来"。用户在列表里解除某台设备，
+/// 下一次对端引荐又会原封不动把它加回来——「解除配对」于是成了一个只在
+/// 下次引荐之前有效的假动作。记下来才能让解除真正生效。
+///
+/// 用户重新**亲手**配对该设备时会从名单里移除（那是明确的授权，理应压过
+/// 之前的拒绝）。
+pub fn load_blocklist(dir: &Path) -> Vec<clipsync_core::DeviceId> {
+    let path = dir.join("blocked.json");
+    if !path.exists() {
+        return Vec::new();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_blocklist(dir: &Path, list: &[clipsync_core::DeviceId]) -> Result<()> {
+    let path = dir.join("blocked.json");
+    let text = serde_json::to_string_pretty(list).context("序列化拒绝名单失败")?;
+    std::fs::write(&path, text)
+        .with_context(|| format!("写入拒绝名单失败: {}", path.display()))
+}
+
+/// 把设备记入拒绝名单（用户主动解除配对时）。
+pub fn block_device(dir: &Path, device: &clipsync_core::DeviceId) -> Result<()> {
+    let mut list = load_blocklist(dir);
+    if !list.contains(device) {
+        list.push(device.clone());
+        save_blocklist(dir, &list)?;
+    }
+    Ok(())
+}
+
+/// 把设备移出拒绝名单（用户重新亲手配对时）。
+pub fn unblock_device(dir: &Path, device: &clipsync_core::DeviceId) -> Result<()> {
+    let mut list = load_blocklist(dir);
+    let before = list.len();
+    list.retain(|d| d != device);
+    if list.len() != before {
+        save_blocklist(dir, &list)?;
+    }
+    Ok(())
 }
 
 /// 删除一条配对记录。返回被删设备的名字；设备不存在时返回 `None`。

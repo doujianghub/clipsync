@@ -82,3 +82,38 @@ fn unknown_static_key_is_not_found() {
         "未配对的公钥必须查不到——这是拒绝陌生连接的依据"
     );
 }
+
+/// 引荐机制的核心不变量：学到新设备后，它对拨号与入站认证立即可见。
+///
+/// 场景：A 分别与 B、C 配对，B 和 C 互不认识。A 连上 B 时把 C 引荐过去，
+/// B 学到 C 之后就该能直连它——**即便 A 随后关机**。
+#[test]
+fn introduced_device_becomes_connectable() {
+    let b_side = KnownPeers::new(vec![peer("a", 1)]); // B 起初只认识 A
+    let c = peer("c", 3);
+
+    assert!(!b_side.contains(&c.device), "前置条件：B 还不认识 C");
+    assert!(
+        b_side.find_by_static_key(&c.static_public_key).is_none(),
+        "前置条件：C 来连会被「对端未配对」拒绝"
+    );
+
+    // A 把 C 引荐给 B。
+    b_side.upsert(c.clone());
+
+    assert!(b_side.contains(&c.device), "拨号线程现在会拨 C");
+    assert_eq!(
+        b_side.find_by_static_key(&c.static_public_key).map(|p| p.name),
+        Some("c".to_string()),
+        "C 主动连过来时也能通过认证——A 在不在线都不影响"
+    );
+}
+
+/// 重复引荐不得产生第二条记录，也不得把已有配对顶掉。
+#[test]
+fn repeated_introduction_is_idempotent() {
+    let known = KnownPeers::new(vec![peer("a", 1), peer("c", 3)]);
+    known.upsert(peer("c", 3));
+    known.upsert(peer("c", 3));
+    assert_eq!(known.len(), 2, "同一设备被反复引荐仍只有一条");
+}
