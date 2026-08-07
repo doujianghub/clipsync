@@ -69,10 +69,12 @@ pub(crate) struct PairingDeps {
     pub(crate) status: tray::TrayStatus,
     /// 主持会话的单例槽位，避免重复点击撞上端口占用。
     pub(crate) host_slot: PairingHostSlot,
-    /// 中枢句柄：解除配对时通知它断开对应连接。
+    /// 中枢句柄：移出设备时通知它断开对应连接。
     pub(crate) hub: hub::HubHandle,
-    /// 配置目录：解除配对要落盘。
+    /// 配置目录：配对表的增删要落盘。
     pub(crate) dir: std::path::PathBuf,
+    /// 本机的 device id——退出设备组时要告诉对端"删的是我"。
+    pub(crate) local_device: clipsync_core::DeviceId,
 }
 
 impl PairingDeps {
@@ -125,39 +127,66 @@ impl PairingDeps {
             .collect()
     }
 
-    /// 解除与某台设备的配对。
+    /// 把某台设备移出设备组。
     ///
-    /// 四处都要清，漏一处就会留下"解除了但还在连"或"列表里没了却仍被信标
-    /// 接纳"这类半吊子状态：
+    /// 引荐让若干设备构成了一个组，所以移出也是**组语义**：本机清干净之后，
+    /// 还要告诉所有在线成员一起清——只清自己没用，下一轮别人就把它引荐回来了。
+    ///
+    /// 本机这边四处都要清，漏一处就会留下"移出了但还在连"或"列表里没了却仍被
+    /// 信标接纳"这类半吊子状态：
     ///   - **磁盘记录**：否则重启后它又回来了；
     ///   - **设备表**：拨号线程与入站认证都查它，清掉才算真的断绝关系；
-    ///   - **地址簿**：留着会让诊断输出显示一台已解除的设备；
+    ///   - **地址簿**：留着会让诊断输出显示一台已移出的设备；
     ///   - **中枢**：丢掉发送通道，当场切断已建立的连接。
-    pub(crate) fn unpair(&self, device_id: &str) -> Result<Option<String>> {
+    pub(crate) fn remove_peer(&self, device_id: &str) -> Result<Option<String>> {
         let device = clipsync_core::DeviceId::from_hex(device_id);
         let name = config::remove_pairing(&self.dir, &device)?;
         if name.is_none() {
             return Ok(None); // 已经不在了，无需再做
         }
-        // 记下"用户不要这台"，否则下次对端一引荐它就回来了。
-        // 重新亲手配对会自动解除（见 config::upsert_pairing）。
-        config::block_device(&self.dir, &device)?;
-        self.known.remove(&device);
-        self.addrbook.forget(&device);
+        // 先广播后断开：切断之后中枢就没有通往它的通道了，那台设备自己
+        // 收不到通知。
+        self.hub.send(hub::HubEvent::AnnounceRemoval {
+            device: device.clone(),
+        });
+        self.forget_locally(&device);
+        self.status.set_paired(self.known.len());
+        Ok(name)
+    }
+
+    /// 本机退出设备组：清空全部配对，并告知其它成员把本机删掉。
+    ///
+    /// 返回退出前的设备台数。不通知对端的话，它们会带着一条永远连不上的
+    /// 记录一直重试，列表里也永远挂着一台离线设备。
+    pub(crate) fn leave_group(&self) -> Result<usize> {
+        let peers = self.known.snapshot();
+        self.hub.send(hub::HubEvent::AnnounceRemoval {
+            device: self.local_device.clone(),
+        });
+        for p in &peers {
+            self.forget_locally(&p.device);
+        }
+        config::clear_pairings(&self.dir)?;
+        self.status.set_paired(0);
+        Ok(peers.len())
+    }
+
+    /// 从本机的三处运行期状态里抹掉一台设备（磁盘记录由调用方负责）。
+    fn forget_locally(&self, device: &clipsync_core::DeviceId) {
+        self.known.remove(device);
+        self.addrbook.forget(device);
         self.hub.send(hub::HubEvent::Unpaired {
             device: device.clone(),
         });
-        self.status.set_paired(self.known.len());
-        Ok(name)
     }
 }
 
 
-/// 托盘里点某台设备 → 确认 → 解除配对。
+/// 托盘里点某台设备 → 确认 → 把它移出设备组。
 ///
-/// 先确认再动手：这是不可撤销的操作，解除后要重新走一遍配对流程才能恢复。
-pub(crate) fn unpair_interactive(pairing: &PairingDeps, device_id: &str) {
-    // 名字从当前设备表取，弹窗里要让用户看清解除的是哪一台。
+/// 先确认再动手：这会影响组里所有设备，不只是本机。
+pub(crate) fn remove_peer_interactive(pairing: &PairingDeps, device_id: &str) {
+    // 名字从当前设备表取，弹窗里要让用户看清移出的是哪一台。
     let name = pairing
         .known
         .snapshot()
@@ -166,37 +195,62 @@ pub(crate) fn unpair_interactive(pairing: &PairingDeps, device_id: &str) {
         .map(|p| p.name)
         .unwrap_or_else(|| device_id.to_string());
 
-    // 后果必须说全。解除不只是"断开这一次"——它还会把设备记进拒绝名单，
-    // 此后别的设备再引荐它也一概不收。不写出来的话，用户日后会遇到
-    // "引荐怎么不工作了"，而完全想不到是自己点过这里。
+    // 说清这是**全组**操作。只写"本机不再同步"会让人以为别人那边还留着，
+    // 而实际上其它设备也会一起把它删掉。
     if !dialog::confirm(
-        "解除配对",
+        "移出设备组",
         &format!(
-            "确定要解除与「{name}」的配对吗？\n\n\
-             解除后立即断开、不再同步，\n\
-             也不会再经由其它设备自动加回。\n\
-             想恢复的话，重新配对一次即可。"
+            "确定把「{name}」移出设备组吗？\n\n\
+             组里所有设备都会移除它，它自己也会清空配对。\n\
+             想加回来的话，重新配对一次即可。"
         ),
     ) {
         return;
     }
 
-    match pairing.unpair(device_id) {
+    match pairing.remove_peer(device_id) {
         Ok(Some(name)) => {
-            info!("已解除与 {name} 的配对");
-            dialog::show_info("ClipSync", &format!("已解除与「{name}」的配对。"));
+            info!("已把 {name} 移出设备组");
+            dialog::show_info("ClipSync", &format!("已把「{name}」移出设备组。"));
         }
-        Ok(None) => info!("设备 {device_id} 已不在配对列表中，无需解除"),
+        Ok(None) => info!("设备 {device_id} 已不在配对列表中，无需移出"),
         Err(e) => {
-            warn!("解除配对失败: {e:#}");
-            dialog::show_info("ClipSync 解除配对失败", &format!("{e:#}"));
+            warn!("移出设备失败: {e:#}");
+            dialog::show_info("ClipSync", &format!("移出失败：{e}"));
         }
     }
 }
 
-/// 弹框自定义单次大小上限。
-///
-/// 输入非法时**再弹一次说明**而不是静默忽略：用户刚打完一串字，什么反馈都
+/// 托盘里点「退出设备组」→ 确认 → 本机离开。
+pub(crate) fn leave_group_interactive(pairing: &PairingDeps) {
+    let count = pairing.known.len();
+    if count == 0 {
+        dialog::show_info("ClipSync", "本机尚未配对任何设备。");
+        return;
+    }
+
+    if !dialog::confirm(
+        "退出设备组",
+        &format!(
+            "确定退出设备组吗？\n\n\
+             本机将清空全部 {count} 台配对，其它设备也会移除本机。\n\
+             想回来的话，重新配对一次即可。"
+        ),
+    ) {
+        return;
+    }
+
+    match pairing.leave_group() {
+        Ok(n) => {
+            info!("已退出设备组，清空 {n} 台配对");
+            dialog::show_info("ClipSync", "已退出设备组。");
+        }
+        Err(e) => {
+            warn!("退出设备组失败: {e:#}");
+            dialog::show_info("ClipSync", &format!("退出失败：{e}"));
+        }
+    }
+}
 
 /// 托盘「显示配对码…」的完整流程，含单例控制。
 ///

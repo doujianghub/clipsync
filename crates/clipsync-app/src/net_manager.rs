@@ -316,12 +316,12 @@ fn run_connection(conn: NoiseConnection, ctx: &NetCtx, via: Option<SocketAddr>) 
 
     // 刚连上就断，几乎总是"对端不认识我们"——它认证失败后直接关闭，而我们
     // 这边只看到一句"正常关闭连接"，完全看不出原因。这个现象用户没法自己
-    // 诊断（要去翻对端的 pairings.json / blocked.json 才知道），所以直接
+    // 诊断（要去翻对端的 pairings.json 才知道），所以直接
     // 把最可能的原因说出来。
     if started.elapsed() < Duration::from_secs(2) {
         info!(
             "与 {} 的连接刚建立就被对方关闭——多半是对端不认识本机：\
-             它那边尚未配对，或曾在设备列表里解除过本机（解除后不会再被自动加回）",
+             它那边尚未配对，或曾把本机移出设备组",
             peer.name
         );
     }

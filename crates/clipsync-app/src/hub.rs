@@ -48,6 +48,16 @@ pub enum HubEvent {
     },
     /// 某对端断开。
     PeerDisconnected { device: DeviceId },
+    /// 把某台设备移出设备组，并告知所有还连着的对端。
+    ///
+    /// `device` 是本机自己时表示"我退出组了"，对端收到后把本机删掉。
+    /// 消息也会发给被移出的那台（若它在线），让它自己也清理干净，
+    /// 免得它此后一直徒劳重连。
+    ///
+    /// 不按协议版本区分对端：`Removed` 是 v3 新增的，v2 的对端解不出这个
+    /// 变体会断开重连——不好看，但不会出错，而且只在混版运行时出现一次。
+    /// 为此在中枢里再记一份每对端的协议版本，代价高于收益。
+    AnnounceRemoval { device: DeviceId },
     /// 用户解除了与某设备的配对：立即断开与它的连接。
     ///
     /// 中枢是唯一持有各对端发送通道的地方，移除该通道会让对应连接的收发泵
@@ -149,6 +159,16 @@ fn hub_loop(engine: SyncEngine, deps: HubDeps, rx: Receiver<HubEvent>) {
                 info!("对端已连接: {} ({})", name, device);
                 st.peers.insert(device, Peer { name, tx });
                 st.sync_connected_status();
+            }
+            HubEvent::AnnounceRemoval { device } => {
+                let msg = SyncMessage::Removed {
+                    device: device.clone(),
+                };
+                // 发给**所有**对端，包括被移出的那台自己。
+                for peer in st.peers.values() {
+                    let _ = peer.tx.send(msg.clone());
+                }
+                info!("已通知 {} 台在线设备：移出 {}", st.peers.len(), device);
             }
             HubEvent::Unpaired { device } => {
                 // 丢掉发送通道即切断连接：对应 pump 会读到 Disconnected 并退出。
@@ -330,6 +350,7 @@ impl HubState {
             SyncMessage::FileNeed { .. }
             | SyncMessage::Hello { .. }
             | SyncMessage::Peers { .. }
+            | SyncMessage::Removed { .. }
             | SyncMessage::Ping
             | SyncMessage::Pong => {}
         }

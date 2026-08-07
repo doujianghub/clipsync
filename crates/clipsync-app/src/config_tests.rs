@@ -124,61 +124,34 @@ fn settings_roundtrip_custom_values() {
     assert_eq!(back.upload_limit_bytes_per_sec, 33_000_000);
 }
 
-/// 解除配对必须压得住引荐——否则「解除」只是个假动作。
-///
-/// 引荐的逻辑是"只要不认识就加进来"。用户在列表里移除某台设备，下一次对端
-/// 一引荐它就原样回来了，而用户以为自己已经断绝了关系。
+/// 退出设备组要把配对表清空——留下任何一条，重启后那台设备又回来了。
 #[test]
-fn removed_device_stays_blocked_against_reintroduction() {
+fn leaving_the_group_clears_every_pairing() {
     use clipsync_net::pairing::PairingRecord;
 
-    let dir = std::env::temp_dir().join("clipsync_blocklist_test");
+    let dir = std::env::temp_dir().join("clipsync_leave_group_test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let dev = clipsync_core::DeviceId::from_public_key(&[9u8; 32]);
-    assert!(load_blocklist(&dir).is_empty(), "起初没有拒绝记录");
+    for i in 0..3u8 {
+        upsert_pairing(
+            &dir,
+            PairingRecord {
+                device: clipsync_core::DeviceId::from_public_key(&[i; 32]),
+                name: format!("设备{i}"),
+                static_public_key: vec![i; 32],
+                addrs: vec![],
+                introduced_by: None,
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(load_pairings(&dir).unwrap().len(), 3);
 
-    // 用户主动移除。
-    block_device(&dir, &dev).unwrap();
-    assert!(load_blocklist(&dir).contains(&dev), "移除后应记入名单");
-
-    // 重复记入不产生第二条。
-    block_device(&dir, &dev).unwrap();
-    assert_eq!(load_blocklist(&dir).len(), 1);
-
-    // 被引荐回来的记录**不该**解除拒绝——那会让整个机制形同虚设。
-    upsert_pairing(
-        &dir,
-        PairingRecord {
-            device: dev.clone(),
-            name: "回来的设备".into(),
-            static_public_key: vec![9u8; 32],
-            addrs: vec![],
-            introduced_by: Some("某台设备".into()),
-        },
-    )
-    .unwrap();
+    clear_pairings(&dir).unwrap();
     assert!(
-        load_blocklist(&dir).contains(&dev),
-        "引荐不得解除用户的拒绝"
-    );
-
-    // 但用户**亲手**重新配对是明确授权，应当解除拒绝。
-    upsert_pairing(
-        &dir,
-        PairingRecord {
-            device: dev.clone(),
-            name: "亲手配的".into(),
-            static_public_key: vec![9u8; 32],
-            addrs: vec![],
-            introduced_by: None,
-        },
-    )
-    .unwrap();
-    assert!(
-        !load_blocklist(&dir).contains(&dev),
-        "亲手配对应当压过之前的拒绝"
+        load_pairings(&dir).unwrap().is_empty(),
+        "退出设备组后不该剩下任何配对"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

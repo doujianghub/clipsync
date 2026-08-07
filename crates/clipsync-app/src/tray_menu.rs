@@ -49,31 +49,30 @@ pub(crate) fn port_label(port: u16) -> String {
     format!("同步端口：{port}…")
 }
 
+/// 设备子菜单里「退出设备组」那一项占用的假 device id。
+///
+/// 真实 device id 是十六进制串，永远不会等于它，所以拿它做哨兵不会撞车；
+/// 换来的是子菜单仍只需返回一张 (菜单项, id) 表，不必为一个按钮再开一路。
+pub(super) const LEAVE_GROUP_ID: &str = "\u{1}leave-group";
+
 /// 重建「已配对设备」子菜单。
 ///
-/// 设备列表在运行期会变（配对、解除配对），而菜单项是构建时创建的，所以每次
+/// 设备列表在运行期会变（配对、被移出），而菜单项是构建时创建的，所以每次
 /// 变化都要整体重来一遍。返回新的 (菜单项, device id) 映射供点击时反查。
 ///
 /// 列表为空时放一个禁用的提示项而不是留空白——空子菜单在两个平台上都显示为
 /// 一个什么都没有的小方块，看着像坏了。
 pub(super) fn rebuild_peer_menu(
     menu: &tray_icon::menu::Submenu,
-    old: &[(tray_icon::menu::MenuItem, String)],
     peers: &[TrayPeer],
 ) -> anyhow::Result<Vec<(tray_icon::menu::MenuItem, String)>> {
-    use tray_icon::menu::MenuItem;
+    use tray_icon::menu::{MenuItem, PredefinedMenuItem};
 
-    for (item, _) in old {
-        let _ = menu.remove(item);
-    }
-    // 上一轮的占位项也要清掉，否则会越堆越多。
-    while menu.items().len() > old.len().min(menu.items().len()) && !menu.items().is_empty() {
-        if menu.remove_at(0).is_none() {
-            break;
-        }
-    }
+    // 整体清空再重建。逐项对照着删既啰嗦又容易漏——分隔符不在映射表里，
+    // 漏删就会一轮叠一轮。
+    while menu.remove_at(0).is_some() {}
 
-    let mut mapping = Vec::with_capacity(peers.len());
+    let mut mapping = Vec::with_capacity(peers.len() + 1);
     if peers.is_empty() {
         let empty = MenuItem::new("（尚未配对）", false, None);
         menu.append(&empty)
@@ -82,7 +81,7 @@ pub(super) fn rebuild_peer_menu(
     }
 
     for p in peers {
-        // ● 在线 / ○ 离线，一眼看出哪台连着。不在标签里写"解除配对"——
+        // ● 在线 / ○ 离线，一眼看出哪台连着。不在标签里写"移出"——
         // 那是点击后确认框的事，菜单只负责列出设备。
         //
         // 引荐来的标出引荐人：那台设备不是你亲手加的，信任是从别处传递
@@ -96,6 +95,15 @@ pub(super) fn rebuild_peer_menu(
             .map_err(|e| anyhow::anyhow!("构建设备子菜单失败: {e}"))?;
         mapping.push((item, p.device.clone()));
     }
+
+    // 两件事分开摆：点设备是"把它移出组"，点这里是"我自己退出"。
+    let sep = PredefinedMenuItem::separator();
+    let leave = MenuItem::new("退出设备组…", true, None);
+    menu.append(&sep)
+        .and_then(|_| menu.append(&leave))
+        .map_err(|e| anyhow::anyhow!("构建设备子菜单失败: {e}"))?;
+    mapping.push((leave, LEAVE_GROUP_ID.to_string()));
+
     Ok(mapping)
 }
 

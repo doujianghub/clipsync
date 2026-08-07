@@ -198,6 +198,12 @@ pub(super) fn pump(
                     peer_protocol = Some(protocol);
                 } else if let SyncMessage::Peers { peers } = msg {
                     learn_peers(ctx, peer, peers);
+                } else if let SyncMessage::Removed { device } = msg {
+                    apply_removal(ctx, peer, &device);
+                    // 被移出的是自己，或是本连接的对端——这条连接没必要留了。
+                    if device == ctx.local_device || device == peer.device {
+                        return Ok(());
+                    }
                 } else {
                     ctx.hub.send(HubEvent::Remote {
                         from: peer.device.clone(),
@@ -268,34 +274,9 @@ fn introduce_peers(
 /// 已认识的设备只更新地址，不覆盖记录——避免对端用一个同 id 但不同公钥的
 /// 条目把已有配对顶掉。
 fn learn_peers(ctx: &NetCtx, from: &KnownPeer, peers: Vec<clipsync_core::PeerIntro>) {
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    // 哪些"被拒设备"已经提示过了，避免每轮引荐都刷一行。
-    static ANNOUNCED: Mutex<Option<HashSet<clipsync_core::DeviceId>>> = Mutex::new(None);
-    let mut guard = ANNOUNCED.lock().unwrap_or_else(|e| e.into_inner());
-    let announced_blocked = guard.get_or_insert_with(HashSet::new);
-
-    // 用户主动移除过的设备一律不收。没有这道关卡，「解除配对」只能维持到
-    // 下一次引荐——那等于这个功能不存在。
-    let blocked = crate::config::load_blocklist(&ctx.config_dir);
-
     for p in peers {
         // 别把自己学进去。
         if p.device == ctx.local_device {
-            continue;
-        }
-        if blocked.contains(&p.device) {
-            // 记 info 而不是 debug：这是"引荐看起来不工作"的头号原因，
-            // 而用户往往不记得自己解除过。埋在 debug 里等于查不到——
-            // 实际排查时正是靠翻 blocked.json 才发现的。
-            //
-            // 每条连接每轮都会引荐，所以只在**第一次**遇到某台设备时说一声。
-            if announced_blocked.insert(p.device.clone()) {
-                info!(
-                    "{} 引荐了 {}，但你此前解除过与它的配对，已忽略（想恢复请重新配对一次）",
-                    from.name, p.name
-                );
-            }
             continue;
         }
         let known = ctx.known.contains(&p.device);
@@ -321,6 +302,38 @@ fn learn_peers(ctx: &NetCtx, from: &KnownPeer, peers: Vec<clipsync_core::PeerInt
         if !p.addrs.is_empty() {
             ctx.addrbook
                 .add_addrs(&p.device, p.addrs, clipsync_net::peer::AddrSource::Peer);
+        }
+    }
+}
+
+/// 处理对端发来的"移出设备组"。
+///
+/// 组内任何成员都可以移出任何人——这些本就是同一个人的设备，不设管理员。
+/// 消息由已配对且通过 Noise 认证的对端发来，不存在陌生人乱踢的问题。
+fn apply_removal(ctx: &NetCtx, from: &KnownPeer, device: &clipsync_core::DeviceId) {
+    if device == &ctx.local_device {
+        // 自己被移出组了：清空全部配对，安静退出这个组。
+        // 不这么做的话，本机会带着一份别人早已作废的名单不停重连。
+        info!("{} 把本机移出了设备组，已清空本机的配对记录", from.name);
+        for p in ctx.known.snapshot() {
+            ctx.known.remove(&p.device);
+            ctx.addrbook.forget(&p.device);
+            ctx.hub.send(HubEvent::Unpaired { device: p.device });
+        }
+        if let Err(e) = crate::config::clear_pairings(&ctx.config_dir) {
+            warn!("清空配对记录失败: {e:#}");
+        }
+        return;
+    }
+
+    if ctx.known.remove(device) {
+        info!("{} 将 {} 移出了设备组", from.name, device);
+        ctx.addrbook.forget(device);
+        ctx.hub.send(HubEvent::Unpaired {
+            device: device.clone(),
+        });
+        if let Err(e) = crate::config::remove_pairing(&ctx.config_dir, device) {
+            warn!("移除配对记录失败: {e:#}");
         }
     }
 }
