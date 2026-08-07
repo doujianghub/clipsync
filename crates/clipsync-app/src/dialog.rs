@@ -43,6 +43,20 @@ pub fn show_info_and_copy(title: &str, body: &str, copy_text: &str) {
     show_info(title, body);
 }
 
+/// 弹出一个确认框，返回用户是否确认。
+///
+/// 弹不出窗时返回 `false`——**破坏性操作在没法征得同意时必须当作"不要做"**，
+/// 而不是默认执行。
+pub fn confirm(title: &str, body: &str) -> bool {
+    match platform::confirm(title, body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("确认框弹出失败，按「取消」处理: {e:#}");
+            false
+        }
+    }
+}
+
 /// 弹出一个单行输入框，返回用户输入。
 ///
 /// `None` 表示用户取消、或弹不出窗（无图形会话、脚本宿主缺失）。两者都按
@@ -85,6 +99,20 @@ end run"#;
 
     pub fn prompt(title: &str, body: &str) -> Result<Option<String>> {
         run_osascript(PROMPT_SCRIPT, title, body)
+    }
+
+    /// 确认框。默认按钮刻意设为「取消」——用它的都是破坏性操作
+    /// （解除配对），手快连按回车不该把事情做了。
+    const CONFIRM_SCRIPT: &str = r#"on run argv
+  display dialog (item 2 of argv) with title (item 1 of argv) buttons {"取消", "确定"} default button 1 with icon caution
+  return button returned of result
+end run"#;
+
+    pub fn confirm(title: &str, body: &str) -> Result<bool> {
+        // 用户点「取消」时 osascript 以 -128 退出 → None → false。
+        Ok(run_osascript(CONFIRM_SCRIPT, title, body)?
+            .map(|s| s.trim() == "确定")
+            .unwrap_or(false))
     }
 
     /// 运行一段 osascript，脚本经 stdin 送入、用户内容经 argv 传参。
@@ -292,6 +320,23 @@ if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         run_powershell(PROMPT_SCRIPT, title, body, true)
     }
 
+    /// 确认框。默认按钮设为「否」——破坏性操作不该被一次回车带过。
+    const CONFIRM_SCRIPT: &str = r#"Add-Type -AssemblyName System.Windows.Forms | Out-Null
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$r = [System.Windows.Forms.MessageBox]::Show(
+  $env:CLIPSYNC_DLG_BODY, $env:CLIPSYNC_DLG_TITLE,
+  [System.Windows.Forms.MessageBoxButtons]::YesNo,
+  [System.Windows.Forms.MessageBoxIcon]::Warning,
+  [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+if ($r -eq [System.Windows.Forms.DialogResult]::Yes) { [Console]::Out.Write("yes") }
+"#;
+
+    pub fn confirm(title: &str, body: &str) -> Result<bool> {
+        Ok(run_powershell(CONFIRM_SCRIPT, title, body, true)?
+            .map(|s| s.trim() == "yes")
+            .unwrap_or(false))
+    }
+
     /// 运行一段 PowerShell 脚本，用户内容经环境变量传入。
     ///
     /// `capture` 为真时收集 stdout 作为返回值；脚本非零退出或无输出时返回
@@ -355,6 +400,12 @@ mod platform {
         // 无图形环境可用，调用方会退回命令行路径。
         tracing::info!("[{title}] {body}（本平台无输入框，请用命令行 `clipsync pair <配对码>`）");
         Ok(None)
+    }
+
+    pub fn confirm(title: &str, body: &str) -> Result<bool> {
+        // 无从征得同意，一律当作否——破坏性操作不能默认执行。
+        tracing::info!("[{title}] {body}（本平台无确认框，按取消处理）");
+        Ok(false)
     }
 }
 

@@ -21,6 +21,7 @@ mod dialog;
 mod filecache;
 mod filetransfer;
 mod hub;
+mod logging;
 mod net_manager;
 mod pairing_cli;
 mod ratelimit;
@@ -35,16 +36,16 @@ use clipsync_core::SyncEngine;
 use clipsync_net::peer::AddrSource;
 use tracing::{info, warn};
 
-fn init_logging() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_env("CLIPSYNC_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).with_target(false).init();
-}
-
 fn main() -> Result<()> {
-    init_logging();
-
+    // 日志要先于一切初始化，但它需要配置目录（日志写在那儿），而定位配置
+    // 目录本身也可能出错——那一步的错误只能走 stderr，此时还没有日志设施。
     let dir = config::config_dir()?;
+    // 读设置只为拿 verbose 开关；失败就按默认（不详细）来，不能因为设置文件
+    // 有问题就连日志都不初始化——那正是最需要日志的时候。
+    let verbose = config::load_or_init_settings(&dir)
+        .map(|s| s.verbose_log)
+        .unwrap_or(false);
+    let log_control = logging::init(&dir, verbose);
     let identity = config::load_or_init_identity(&dir)?;
     let device_name = device_name_best_effort();
 
@@ -54,8 +55,17 @@ fn main() -> Result<()> {
             Some("--host") | Some("-h") => {
                 let settings = config::load_or_init_settings(&dir)?;
                 // 命令行下终端可见，不弹窗打断。
-                pairing_cli::host(&dir, &identity, &device_name, settings.listen_port, false)
-                    .map(|_| ())
+                // 命令行下终端可见，不弹窗打断；也无需单例槽位（进程本身
+                // 就是一次性的）。
+                pairing_cli::host(
+                    &dir,
+                    &identity,
+                    &device_name,
+                    settings.listen_port,
+                    false,
+                    |_| {},
+                )
+                .map(|_| ())
             }
             Some(first) => {
                 let settings = config::load_or_init_settings(&dir)?;
@@ -139,7 +149,7 @@ fn main() -> Result<()> {
             eprintln!("用法: clipsync [pair|list|addrs|autostart]");
             Ok(())
         }
-        None => run_sync(dir, identity, device_name),
+        None => run_sync(dir, identity, device_name, log_control),
     }
 }
 
@@ -203,10 +213,12 @@ fn run_sync(
     dir: std::path::PathBuf,
     identity: clipsync_net::crypto::StaticIdentity,
     device_name: String,
+    log_control: logging::LogControl,
 ) -> Result<()> {
     let settings = config::load_or_init_settings(&dir)?;
     let device_id = identity.device_id();
     info!("配置目录: {}", dir.display());
+    info!("日志文件: {}", log_control.dir().join("clipsync.log").display());
     info!("本机设备: {} ({})", device_name, device_id);
     info!(
         "设置: 上限={} MiB, 图片={}, 文件={}, 同步端口={}",
@@ -245,7 +257,7 @@ fn run_sync(
     let status = tray::TrayStatus::new(pairings.len());
     // 设置句柄：托盘改动后中枢立即读到新值，无需重启。
     let settings_handle = config::SettingsHandle::new(dir.clone(), settings.clone());
-    let (hub, _hub_thread) = hub::start_hub(
+    let (hub, hub_thread) = hub::start_hub(
         engine,
         hub::HubDeps {
             clipboard,
@@ -307,6 +319,9 @@ fn run_sync(
         known,
         addrbook,
         status: status.clone(),
+        host_slot: PairingHostSlot::default(),
+        hub: hub.clone(),
+        dir: dir.clone(),
     };
     run_tray(
         status,
@@ -317,7 +332,56 @@ fn run_sync(
         settings.listen_port,
         settings_handle,
         pairing,
+        log_control,
+        hub_thread,
     )
+}
+
+/// 保证同一时刻只有一个"主持配对"会话在跑。
+///
+/// 没有这层控制时，用户第二次点「显示配对码」会新起一个线程去 bind 已被占用
+/// 的 47685，直接抛出 `os error 10048`（Windows）/ `48`（macOS）给用户看。
+/// 而用户的真实意图通常只是**再看一眼那个码**——所以这里不报错、也不新开
+/// 会话，而是把当前会话的配对码重新弹出来。
+#[derive(Clone, Default)]
+struct PairingHostSlot {
+    /// 会话进行中时持有当前配对码；结束后自动清空。
+    active: Arc<Mutex<Option<String>>>,
+}
+
+impl PairingHostSlot {
+    /// 尝试占用槽位。已被占用时返回当前会话的配对码。
+    fn try_acquire(&self) -> Result<PairingHostGuard, String> {
+        let mut g = self.active.lock().unwrap();
+        match g.as_ref() {
+            Some(code) => Err(code.clone()),
+            None => {
+                *g = Some(String::new()); // 先占位，拿到码后再补
+                Ok(PairingHostGuard {
+                    slot: self.clone(),
+                })
+            }
+        }
+    }
+
+    fn set_code(&self, code: &str) {
+        *self.active.lock().unwrap() = Some(code.to_string());
+    }
+
+    fn release(&self) {
+        *self.active.lock().unwrap() = None;
+    }
+}
+
+/// 持有期间槽位被占用；**丢弃即释放**，包括 host() 提前返回错误的路径。
+struct PairingHostGuard {
+    slot: PairingHostSlot,
+}
+
+impl Drop for PairingHostGuard {
+    fn drop(&mut self) {
+        self.slot.release();
+    }
 }
 
 /// 从托盘发起配对时，"配对成功"之后还需要让它**立刻**生效所需的东西。
@@ -326,6 +390,12 @@ struct PairingDeps {
     known: net_manager::KnownPeers,
     addrbook: addrbook::AddrBook,
     status: tray::TrayStatus,
+    /// 主持会话的单例槽位，避免重复点击撞上端口占用。
+    host_slot: PairingHostSlot,
+    /// 中枢句柄：解除配对时通知它断开对应连接。
+    hub: hub::HubHandle,
+    /// 配置目录：解除配对要落盘。
+    dir: std::path::PathBuf,
 }
 
 impl PairingDeps {
@@ -350,6 +420,43 @@ impl PairingDeps {
             record.name, record.device
         );
     }
+
+    /// 当前已配对设备及其在线状态，供托盘渲染设备列表。
+    fn peers_for_tray(&self) -> Vec<tray::TrayPeer> {
+        let connected = self.status.connected_devices();
+        self.known
+            .snapshot()
+            .into_iter()
+            .map(|p| tray::TrayPeer {
+                online: connected.contains(p.device.as_str()),
+                device: p.device.to_string(),
+                name: p.name,
+            })
+            .collect()
+    }
+
+    /// 解除与某台设备的配对。
+    ///
+    /// 四处都要清，漏一处就会留下"解除了但还在连"或"列表里没了却仍被信标
+    /// 接纳"这类半吊子状态：
+    ///   - **磁盘记录**：否则重启后它又回来了；
+    ///   - **设备表**：拨号线程与入站认证都查它，清掉才算真的断绝关系；
+    ///   - **地址簿**：留着会让诊断输出显示一台已解除的设备；
+    ///   - **中枢**：丢掉发送通道，当场切断已建立的连接。
+    fn unpair(&self, device_id: &str) -> Result<Option<String>> {
+        let device = clipsync_core::DeviceId::from_hex(device_id);
+        let name = config::remove_pairing(&self.dir, &device)?;
+        if name.is_none() {
+            return Ok(None); // 已经不在了，无需再做
+        }
+        self.known.remove(&device);
+        self.addrbook.forget(&device);
+        self.hub.send(hub::HubEvent::Unpaired {
+            device: device.clone(),
+        });
+        self.status.set_paired(self.known.len());
+        Ok(name)
+    }
 }
 
 /// 在主线程运行托盘，处理菜单动作直到用户退出。
@@ -362,7 +469,10 @@ fn run_tray(
     sync_port: u16,
     settings: config::SettingsHandle,
     pairing: PairingDeps,
+    log_control: logging::LogControl,
+    hub_thread: std::thread::JoinHandle<()>,
 ) -> Result<()> {
+    let pairing_for_peers = pairing.clone();
     let status_for_cb = status.clone();
     let running_for_cb = running.clone();
     let settings_for_cb = settings.clone();
@@ -391,20 +501,7 @@ fn run_tray(
                 let name = device_name.clone();
                 let pairing = pairing.clone();
                 std::thread::spawn(move || {
-                    // 托盘启动通常没有终端，必须弹窗，否则用户看不到配对码。
-                    match pairing_cli::host(&dir, &identity, &name, sync_port, true) {
-                        Ok(record) => {
-                            pairing.register(&record);
-                            crate::dialog::show_info(
-                                "ClipSync 配对成功",
-                                &format!("已与「{}」配对，现在可以互相同步了。", record.name),
-                            );
-                        }
-                        Err(e) => {
-                            warn!("配对失败: {e:#}");
-                            crate::dialog::show_info("ClipSync 配对失败", &format!("{e:#}"));
-                        }
-                    }
+                    host_pairing_interactive(&dir, &identity, &name, sync_port, &pairing);
                 });
                 true
             }
@@ -459,6 +556,48 @@ fn run_tray(
                 }
                 true
             }
+            // 三个「自定义…」都要弹框，而弹框会阻塞到用户点掉——放在托盘
+            // 事件循环里会让整个菜单卡住，故一律丢到后台线程。
+            tray::TrayAction::PromptMaxBytes => {
+                let s = settings_for_cb.clone();
+                std::thread::spawn(move || prompt_max_bytes(&s));
+                true
+            }
+            tray::TrayAction::PromptUploadLimit => {
+                let s = settings_for_cb.clone();
+                std::thread::spawn(move || prompt_upload_limit(&s));
+                true
+            }
+            tray::TrayAction::PromptListenPort => {
+                let s = settings_for_cb.clone();
+                std::thread::spawn(move || prompt_listen_port(&s));
+                true
+            }
+            tray::TrayAction::ToggleVerboseLog => {
+                let now = !settings_for_cb.snapshot().verbose_log;
+                match log_control.set_verbose(now) {
+                    Ok(()) => settings_for_cb.update(|s| s.verbose_log = now),
+                    // 切不动就别改设置，免得界面显示"已开启"而实际没生效。
+                    Err(e) => warn!("切换日志级别失败: {e:#}"),
+                }
+                true
+            }
+            tray::TrayAction::OpenLogDir => {
+                if let Err(e) = logging::open_in_file_manager(log_control.dir()) {
+                    warn!("打开日志文件夹失败: {e:#}");
+                    crate::dialog::show_info(
+                        "ClipSync 日志",
+                        &format!("日志位于：\n{}\n\n（自动打开失败：{e}）", log_control.dir().display()),
+                    );
+                }
+                true
+            }
+            tray::TrayAction::Unpair(device_id) => {
+                // 确认框会阻塞到用户点掉，丢到后台线程免得卡住托盘。
+                let pairing = pairing.clone();
+                std::thread::spawn(move || unpair_interactive(&pairing, &device_id));
+                true
+            }
         }),
         current_settings: Box::new(move || {
             let s = settings_for_read.snapshot();
@@ -468,8 +607,14 @@ fn run_tray(
                 compress: s.compress_transfers,
                 max_bytes: s.max_bytes,
                 upload_limit: s.upload_limit_bytes_per_sec,
+                listen_port: s.listen_port,
+                verbose_log: s.verbose_log,
             }
         }),
+        current_peers: Box::new(move || pairing_for_peers.peers_for_tray()),
+        // 中枢线程一旦结束（正常退出或 panic），同步就全停了。托盘据此
+        // 切到故障状态，而不是继续显示一切正常。
+        hub_alive: Box::new(move || !hub_thread.is_finished()),
     };
 
     if let Err(e) = tray::run(status, callbacks) {
@@ -480,6 +625,204 @@ fn run_tray(
         }
     }
     Ok(())
+}
+
+/// 托盘里点某台设备 → 确认 → 解除配对。
+///
+/// 先确认再动手：这是不可撤销的操作，解除后要重新走一遍配对流程才能恢复。
+fn unpair_interactive(pairing: &PairingDeps, device_id: &str) {
+    // 名字从当前设备表取，弹窗里要让用户看清解除的是哪一台。
+    let name = pairing
+        .known
+        .snapshot()
+        .into_iter()
+        .find(|p| p.device.as_str() == device_id)
+        .map(|p| p.name)
+        .unwrap_or_else(|| device_id.to_string());
+
+    if !dialog::confirm(
+        "ClipSync 解除配对",
+        &format!(
+            "确定要解除与「{name}」的配对吗？\n\n\
+             解除后双方将立即断开、不再同步。\n\
+             要恢复需要重新走一次配对流程。"
+        ),
+    ) {
+        return;
+    }
+
+    match pairing.unpair(device_id) {
+        Ok(Some(name)) => {
+            info!("已解除与 {name} 的配对");
+            dialog::show_info("ClipSync", &format!("已解除与「{name}」的配对。"));
+        }
+        Ok(None) => info!("设备 {device_id} 已不在配对列表中，无需解除"),
+        Err(e) => {
+            warn!("解除配对失败: {e:#}");
+            dialog::show_info("ClipSync 解除配对失败", &format!("{e:#}"));
+        }
+    }
+}
+
+/// 弹框自定义单次大小上限。
+///
+/// 输入非法时**再弹一次说明**而不是静默忽略：用户刚打完一串字，什么反馈都
+/// 没有只会让人以为程序坏了。
+fn prompt_max_bytes(settings: &config::SettingsHandle) {
+    let current = settings.snapshot().max_bytes;
+    let Some(input) = dialog::prompt(
+        "ClipSync 单次大小上限",
+        &format!(
+            "当前：{}\n\n输入新的上限，例如 500MB、1.5GiB、200m：\n（填 0 表示不限制）",
+            describe_bytes(current)
+        ),
+    ) else {
+        return;
+    };
+
+    match config::parse_byte_size(&input) {
+        Ok(0) => {
+            settings.update(|s| s.max_bytes = usize::MAX);
+            info!("单次大小上限：不限制");
+        }
+        Ok(v) => {
+            let v = v as usize;
+            settings.update(|s| s.max_bytes = v);
+            info!("单次大小上限：{} 字节", v);
+        }
+        Err(e) => dialog::show_info("ClipSync 设置未生效", &format!("{e}")),
+    }
+}
+
+/// 弹框自定义发送限速。
+fn prompt_upload_limit(settings: &config::SettingsHandle) {
+    let current = settings.snapshot().upload_limit_bytes_per_sec;
+    let shown = if current == 0 {
+        "不限速".to_string()
+    } else {
+        format!("{}/s", describe_bytes(current as usize))
+    };
+    let Some(input) = dialog::prompt(
+        "ClipSync 发送限速",
+        &format!(
+            "当前：{shown}\n\n输入新的限速，例如 10MB/s、20mbps、5M：\n（填 0 表示不限速）"
+        ),
+    ) else {
+        return;
+    };
+
+    match config::parse_rate(&input) {
+        Ok(v) => {
+            settings.update(|s| s.upload_limit_bytes_per_sec = v);
+            if v == 0 {
+                info!("发送限速：不限速");
+            } else {
+                info!("发送限速：{} 字节/秒", v);
+            }
+        }
+        Err(e) => dialog::show_info("ClipSync 设置未生效", &format!("{e}")),
+    }
+}
+
+/// 弹框修改同步监听端口。
+///
+/// 端口与其它设置不同：**改了要重启才生效**——监听套接字在启动时就绑好了，
+/// 运行中换端口意味着断开所有连接重新监听，还要让对端重新学到新端口。
+/// 与其做一套半可靠的热切换，不如如实告诉用户重启一下。
+fn prompt_listen_port(settings: &config::SettingsHandle) {
+    let current = settings.snapshot().listen_port;
+    let Some(input) = dialog::prompt(
+        "ClipSync 同步端口",
+        &format!("当前：{current}\n\n输入新的端口（1024–65535）：\n改动将在下次启动时生效。"),
+    ) else {
+        return;
+    };
+
+    match input.trim().parse::<u16>() {
+        // 1024 以下是特权端口，普通用户绑不上，提前拦住比让它启动时失败好。
+        Ok(p) if p >= 1024 => {
+            settings.update(|s| s.listen_port = p);
+            info!("同步端口已改为 {p}（重启后生效）");
+            dialog::show_info(
+                "ClipSync 同步端口",
+                &format!("已设为 {p}。\n\n请重启 ClipSync 使其生效，并确认对端也能连到这个端口。"),
+            );
+        }
+        Ok(p) => dialog::show_info(
+            "ClipSync 设置未生效",
+            &format!("端口 {p} 属于系统保留范围，请填 1024–65535 之间的值。"),
+        ),
+        Err(_) => dialog::show_info(
+            "ClipSync 设置未生效",
+            &format!("「{input}」不是有效端口，请填 1024–65535 之间的整数。"),
+        ),
+    }
+}
+
+/// 把字节数写成人能读的形式（弹窗里展示当前值用）。
+fn describe_bytes(n: usize) -> String {
+    if n == usize::MAX {
+        return "不限制".to_string();
+    }
+    if n >= 1 << 30 {
+        format!("{:.2} GiB", n as f64 / (1u64 << 30) as f64)
+    } else if n >= 1 << 20 {
+        format!("{:.0} MiB", n as f64 / (1u64 << 20) as f64)
+    } else if n >= 1 << 10 {
+        format!("{:.0} KiB", n as f64 / 1024.0)
+    } else {
+        format!("{n} 字节")
+    }
+}
+
+/// 托盘「显示配对码…」的完整流程，含单例控制。
+///
+/// 重复点击时**不再** bind 一个已被占用的端口（那会给用户抛 `os error 10048`
+/// 且只能重启程序恢复），而是把当前会话的配对码重新弹出来——这本就是用户
+/// 重复点击时想要的。
+fn host_pairing_interactive(
+    dir: &std::path::Path,
+    identity: &clipsync_net::crypto::StaticIdentity,
+    device_name: &str,
+    sync_port: u16,
+    pairing: &PairingDeps,
+) {
+    let guard = match pairing.host_slot.try_acquire() {
+        Ok(g) => g,
+        Err(code) => {
+            // 已有会话在等待——把同一个码再显示一遍即可。
+            info!("配对会话已在进行中，重新显示当前配对码");
+            dialog::show_info_and_copy(
+                "ClipSync 配对",
+                &format!(
+                    "配对码：{code}\n（已复制到剪贴板）\n\n\
+                     本机仍在等待对方加入，请在对方设备上选「输入配对码…」。"
+                ),
+                &code,
+            );
+            return;
+        }
+    };
+
+    let slot = pairing.host_slot.clone();
+    let result = pairing_cli::host(dir, identity, device_name, sync_port, true, |code| {
+        slot.set_code(code.as_str());
+    });
+    drop(guard); // 显式释放槽位，后续弹窗期间允许再次发起
+
+    match result {
+        Ok(record) => {
+            pairing.register(&record);
+            dialog::show_info(
+                "ClipSync 配对成功",
+                &format!("已与「{}」配对，现在可以互相同步了。", record.name),
+            );
+        }
+        Err(e) => {
+            warn!("配对失败: {e:#}");
+            dialog::show_info("ClipSync 配对失败", &format!("{e:#}"));
+        }
+    }
 }
 
 /// 托盘「输入配对码…」的完整流程：要码 → 加入 → 告知结果。
@@ -733,6 +1076,46 @@ fn run_capture(program: &str, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 重复发起主持配对时，不得去 bind 一个已被占用的端口。
+    ///
+    /// 用户第二次点「显示配对码」通常只是想再看一眼码。原先每次点击都新起
+    /// 线程去 bind 47685，第二次必然失败并把 `os error 10048` 抛给用户看，
+    /// 且只能重启程序恢复。槽位被占用时应返回**当前会话的码**供重新显示。
+    #[test]
+    fn host_slot_reports_existing_code_instead_of_starting_over() {
+        let slot = PairingHostSlot::default();
+
+        let guard = slot.try_acquire().expect("首次应能占用");
+        slot.set_code("ABC123");
+
+        match slot.try_acquire() {
+            Err(code) => assert_eq!(code, "ABC123", "应返回当前会话的码以便重新显示"),
+            Ok(_) => panic!("已有会话时不应再次占用槽位——那会撞上端口占用"),
+        }
+
+        // 会话结束后必须能重新发起，否则功能就永久坏掉了。
+        drop(guard);
+        assert!(
+            slot.try_acquire().is_ok(),
+            "会话结束后槽位应释放，允许发起新一轮配对"
+        );
+    }
+
+    /// 槽位在 `host()` 报错返回时也要释放（靠 guard 的 Drop，不能靠成功路径）。
+    #[test]
+    fn host_slot_releases_on_error_path() {
+        let slot = PairingHostSlot::default();
+        {
+            let _guard = slot.try_acquire().expect("应能占用");
+            slot.set_code("XYZ789");
+            // 模拟 host() 中途 bail!——guard 在作用域结束时析构。
+        }
+        assert!(
+            slot.try_acquire().is_ok(),
+            "出错路径也必须释放槽位，否则一次配对失败就再也发起不了"
+        );
+    }
 
     #[test]
     fn non_empty_trims_and_rejects_blank() {

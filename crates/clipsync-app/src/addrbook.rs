@@ -75,6 +75,15 @@ impl AddrBook {
         }
     }
 
+    /// 忘掉某对端的全部地址（解除配对时调用）。
+    ///
+    /// 不清理的话，拨号线程虽然因设备表里没它而不再拨号，地址簿里却还留着
+    /// 一份陈旧记录，`clipsync addrs` 之类的诊断输出会显示一台早已解除配对的
+    /// 设备，徒增困惑。
+    pub fn forget(&self, device: &DeviceId) {
+        self.inner.lock().unwrap().remove(device);
+    }
+
     /// 某对端已知地址数量（诊断用）。
     pub fn count(&self, device: &DeviceId) -> usize {
         self.inner

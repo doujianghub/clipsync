@@ -43,6 +43,12 @@ pub enum HubEvent {
     },
     /// 某对端断开。
     PeerDisconnected { device: DeviceId },
+    /// 用户解除了与某设备的配对：立即断开与它的连接。
+    ///
+    /// 中枢是唯一持有各对端发送通道的地方，移除该通道会让对应连接的收发泵
+    /// 读到 `Disconnected` 并退出——解除配对因此当场生效，而不是等对方
+    /// 下次重连时才被拒。
+    Unpaired { device: DeviceId },
 }
 
 /// 中枢句柄：向中枢投递事件。可克隆，分发给各线程。
@@ -160,13 +166,25 @@ fn hub_loop(engine: SyncEngine, deps: HubDeps, rx: Receiver<HubEvent>) {
             HubEvent::PeerConnected { device, name, tx } => {
                 info!("对端已连接: {} ({})", name, device);
                 st.peers.insert(device, Peer { name, tx });
-                st.deps.status.set_connected(st.peers.len());
+                st.sync_connected_status();
+            }
+            HubEvent::Unpaired { device } => {
+                // 丢掉发送通道即切断连接：对应 pump 会读到 Disconnected 并退出。
+                if let Some(p) = st.peers.remove(&device) {
+                    info!("已解除与 {} ({}) 的配对，连接随之断开", p.name, device);
+                }
+                st.sync_connected_status();
+                if st.incoming.as_ref().map(|t| &t.from) == Some(&device) {
+                    debug!("解除配对，放弃来自该设备的文件接收");
+                    st.incoming = None;
+                    st.engine.forget_current();
+                }
             }
             HubEvent::PeerDisconnected { device } => {
                 if let Some(p) = st.peers.remove(&device) {
                     info!("对端已断开: {} ({})", p.name, device);
                 }
-                st.deps.status.set_connected(st.peers.len());
+                st.sync_connected_status();
                 // 正在从该对端接收的传输就此中断；保留已收字节以便将来续传。
                 if st.incoming.as_ref().map(|t| &t.from) == Some(&device) {
                     debug!("对端断开，接收中的文件传输暂停（已收部分保留待续传）");
@@ -179,6 +197,19 @@ fn hub_loop(engine: SyncEngine, deps: HubDeps, rx: Receiver<HubEvent>) {
 }
 
 impl HubState {
+    /// 把当前连接情况同步给托盘。
+    ///
+    /// 连同**在线设备的 ID 集合**一起给出，而不只是一个计数——设备列表要靠它
+    /// 标出每台是 ● 还是 ○。中枢是唯一知道谁真正连着的地方。
+    fn sync_connected_status(&self) {
+        let ids = self
+            .peers
+            .keys()
+            .map(|d| d.to_string())
+            .collect::<std::collections::HashSet<_>>();
+        self.deps.status.set_connected_ids(ids);
+    }
+
     /// 处理本地剪贴板变化：判定后广播给所有对端。
     fn on_local(
         &mut self,
