@@ -369,12 +369,16 @@ pub fn connect_hosts(host_ip: Option<&str>) -> Result<Vec<TcpStream>> {
         return Ok(vec![s]);
     }
 
+    // 组播命中的地址交给同一个探测器验证——同机可能同时占着 47685 的别的
+    // 服务，而且一台主机会给出多个地址（逐网卡宣告），挨个连才知道哪条通。
     match discover_host() {
-        Ok(addr) => {
-            println!("  正在连接 {addr} …");
-            return Ok(vec![
-                TcpStream::connect(&addr).with_context(|| format!("连接 {addr} 失败"))?
-            ]);
+        Ok(addrs) => {
+            println!("  正在连接 {} 个组播发现的地址…", addrs.len());
+            let found = crate::host_probe::probe_candidates(addrs);
+            if !found.is_empty() {
+                return Ok(found.into_iter().map(|(_, s)| s).collect());
+            }
+            debug!("组播发现的地址都连不上，改为主动探测");
         }
         Err(e) => debug!("局域网组播未发现主持方，改为主动探测: {e:#}"),
     }
@@ -413,8 +417,11 @@ pub fn join_on(
     Ok(record)
 }
 
-/// 在局域网中查找正在等待配对的设备，返回其地址。
-fn discover_host() -> Result<String> {
+/// 在局域网中查找正在等待配对的设备，返回它的**全部**可连地址。
+///
+/// 一台主机会给出多个地址：信标逐网卡发送，局域网口与覆盖网口各来一份。
+/// 全都返回，由调用方挨个试——一条走不通还有下一条。
+fn discover_host() -> Result<Vec<std::net::SocketAddr>> {
     use clipsync_net::discovery::discover_pairing_hosts;
 
     println!("  正在局域网中查找等待配对的设备…");
@@ -424,23 +431,26 @@ fn discover_host() -> Result<String> {
     match hosts.len() {
         0 => anyhow::bail!(
             "未在局域网中找到等待配对的设备。\n  \
-             请确认对方已运行 `clipsync pair --host`；\n  \
-             若两台设备不在同一局域网，请改用：clipsync pair <对方IP> <配对码>"
+             请确认对方正显示着配对码；\n  \
+             若两台设备不在同一局域网，本机会自动改为主动探测"
         ),
         1 => {
             let h = &hosts[0];
-            println!("  找到设备：{}（{}）", h.device_name, h.addr.ip());
-            Ok(h.addr.to_string())
+            println!("  找到设备：{}（{} 个地址）", h.device_name, h.addrs.len());
+            Ok(h.addrs.clone())
         }
         _ => {
-            // 多台同时在等待配对：让用户明确指定，避免连错设备。
+            // 现在这条分支才真的表示"多台**不同**设备"——按设备名归并之前，
+            // 同一台机器的多个网卡就会误入此处，同机 e2e 一跑就露馅。
             let mut msg = String::from("局域网中有多台设备在等待配对，请指定其一：\n");
             for h in &hosts {
-                msg.push_str(&format!(
-                    "      clipsync pair {} <配对码>   # {}\n",
-                    h.addr.ip(),
-                    h.device_name
-                ));
+                if let Some(a) = h.addrs.first() {
+                    msg.push_str(&format!(
+                        "      clipsync pair <配对码>@{}   # {}\n",
+                        a.ip(),
+                        h.device_name
+                    ));
+                }
             }
             anyhow::bail!(msg)
         }

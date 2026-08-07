@@ -153,8 +153,6 @@ pub(super) fn pump(
         // 3) 周期性通告地址（覆盖网上线/IP 变化后对端能及时学到）。
         if last_announce.elapsed() >= ADDR_ANNOUNCE_INTERVAL {
             announce_addresses(&mut conn, ctx)?;
-            // 设备表也可能变了（用户又配了一台），顺带再引荐一次。
-            introduce_peers(&mut conn, ctx, peer, peer_protocol)?;
             last_announce = Instant::now();
         }
 
@@ -162,7 +160,10 @@ pub(super) fn pump(
         //
         // 只引荐一次是不够的：A 与 B 连上时 B 可能还只认识 A，没什么可介绍；
         // 等 B 后来又配了 C，那条已建立的连接若不再引荐，A 就永远不知道 C。
-        // 靠定时兜底则要等一整个周期，用户刚配完却发现没生效。
+        //
+        // 这里曾另有一处"跟着地址通告顺带再引荐一次"的定时兜底。版本驱动之后
+        // 它纯属冗余：设备表没变也每 60 秒重发一遍引荐，日志里刷成一片
+        // 「向 X 引荐 N 台设备」，把真正的变化淹没了。
         let peers_version = ctx.known.version();
         if peer_protocol.is_some() && introduced_version != Some(peers_version) {
             introduce_peers(&mut conn, ctx, peer, peer_protocol)?;
