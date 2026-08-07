@@ -82,6 +82,15 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSUIElement</key>             <true/>
 
     <key>NSHighResolutionCapable</key> <true/>
+
+    <!-- 本地网络权限（macOS 14+ 必需）。
+         局域网自动发现靠 UDP 组播（239.255.71.83），而 macOS 会把组播/广播
+         归入"本地网络"隐私类别：没有这条声明，系统既不会弹授权请求，发送也
+         直接失败——`send_to` 返回 EHOSTUNREACH (errno 65)。
+         症状是日志里刷"局域网信标一个网卡都发不出去"，而同一份代码从终端
+         跑却一切正常（终端自己有这个权限）。 -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>用于在局域网内自动发现你的其它设备，免去手动输入 IP。</string>
 </dict>
 </plist>
 PLIST
@@ -214,6 +223,10 @@ echo "  版本 ${VERSION}   体积 $(du -sh "$APP" | cut -f1)   架构 $(lipo -a
 echo
 echo "安装：把它拖进「应用程序」，双击即可（图标出现在菜单栏，不在 Dock）。"
 echo "开机自启：托盘菜单勾选，或 ${APP}/Contents/MacOS/clipsync autostart on"
+echo
+echo "首次运行会请求「本地网络」权限——务必允许，否则局域网自动发现不可用"
+echo "（覆盖网如 Tailscale 不受影响）。若误点了拒绝，去"
+echo "「系统设置 › 隐私与安全性 › 本地网络」把 ClipSync 打开。"
 
 if [[ -z "$IDENTITY" ]]; then
     cat <<'TIP'
