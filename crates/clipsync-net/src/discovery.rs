@@ -32,7 +32,14 @@ pub const BEACON_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 71, 83);
 /// 信标端口。
 pub const BEACON_PORT: u16 = 47_690;
 /// 信标发送间隔。
-pub const BEACON_INTERVAL: Duration = Duration::from_secs(5);
+/// 常驻信标的组播间隔。
+///
+/// 它只负责"提示地址"——连接一旦建立，双方就改走加密通道互告地址，信标便
+/// 无关紧要了。真正需要它的只有两个时刻：刚启动、以及 IP 变了之后重新被发现。
+/// 这两件事都不需要秒级响应，5 秒偏于频繁：每台设备每分钟往局域网里丢 12 个
+/// 组播包，N 台就是 12N，全天不停。放宽到 15 秒后降到三分之一，而"换了 Wi-Fi
+/// 后最多 15 秒被重新发现"完全够用。
+pub const BEACON_INTERVAL: Duration = Duration::from_secs(15);
 
 /// **配对**专用的发现端口。
 ///

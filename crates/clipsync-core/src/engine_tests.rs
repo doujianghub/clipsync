@@ -295,3 +295,63 @@ fn forget_current_allows_retry_after_failed_transfer() {
         "清除记录后应允许重新接收同一内容"
     );
 }
+
+/// 类型开关必须**收发都拦**。
+///
+/// 早先只拦发送：用户在菜单里关掉图片，对端发来的图片照样写进剪贴板。
+/// 那样开关就名不副实，菜单只好写成"发送图片到其它设备"来避免误导——
+/// 一句啰嗦的文案，根源是语义没做干净。
+#[test]
+fn disabled_kind_is_rejected_on_receive_too() {
+    let mut e = SyncEngine::new(
+        DeviceId::from_public_key(b"me"),
+        Limits {
+            allow_image: false,
+            ..Default::default()
+        },
+    );
+    let img = ClipContent::Image(ImageData {
+        width: 1,
+        height: 1,
+        rgba: vec![0, 0, 0, 0],
+    });
+    let h = img.content_hash();
+
+    assert_eq!(
+        e.on_remote_clip(&img, h),
+        RemoteDecision::Skip(SkipReason::KindDisabled),
+        "关掉图片后不该再接收对端发来的图片"
+    );
+    // 被拒的内容不得污染"当前状态"，否则之后重新打开开关时会被误判为重复。
+    assert!(
+        matches!(e.on_remote_clip(&text("normal"), text("normal").content_hash()),
+                 RemoteDecision::Apply),
+        "其它类型不受影响"
+    );
+}
+
+/// 开关重新打开后，先前被拒的内容应能正常接收。
+#[test]
+fn reenabling_kind_allows_previously_rejected_content() {
+    let mut e = SyncEngine::new(
+        DeviceId::from_public_key(b"me"),
+        Limits {
+            allow_files: false,
+            ..Default::default()
+        },
+    );
+    let files = ClipContent::Files(vec![crate::content::FileMeta::new("a.txt", 10, 7)]);
+    let h = files.content_hash();
+
+    assert_eq!(
+        e.on_remote_clip(&files, h),
+        RemoteDecision::Skip(SkipReason::KindDisabled)
+    );
+
+    e.set_limits(Limits::default());
+    assert_eq!(
+        e.on_remote_clip(&files, h),
+        RemoteDecision::Apply,
+        "重新打开后应能收到——说明拒绝时没有把它记成当前状态"
+    );
+}

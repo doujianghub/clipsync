@@ -150,11 +150,19 @@ impl SyncEngine {
 
     /// 替换大小上限与类型开关（用户在界面上改设置时调用）。
     ///
-    /// 只影响此后的判定，不追溯已广播的内容。注意这些开关只作用于**发送**
-    /// 路径（见 `on_local_change`）；接收侧不做限制，因此关掉"发送图片"后
-    /// 对端发来的图片仍会被接受。
+    /// 只影响此后的判定，不追溯已广播的内容。类型开关**收发两侧都生效**，
+    /// 所以界面上就叫"同步图片"——关掉即彻底不同步该类型。
     pub fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
+    }
+
+    /// 该类型是否被用户关掉了。收发两侧共用同一判断。
+    fn kind_disabled(&self, content: &ClipContent) -> bool {
+        match content.kind() {
+            crate::content::ContentKind::Image => !self.limits.allow_image,
+            crate::content::ContentKind::Files => !self.limits.allow_files,
+            crate::content::ContentKind::Text => false,
+        }
     }
 
     /// 当前生效的上限与开关。
@@ -191,14 +199,8 @@ impl SyncEngine {
         }
 
         // 3) 类型开关。
-        match content.kind() {
-            crate::content::ContentKind::Image if !self.limits.allow_image => {
-                return LocalDecision::Skip(SkipReason::KindDisabled);
-            }
-            crate::content::ContentKind::Files if !self.limits.allow_files => {
-                return LocalDecision::Skip(SkipReason::KindDisabled);
-            }
-            _ => {}
+        if self.kind_disabled(content) {
+            return LocalDecision::Skip(SkipReason::KindDisabled);
         }
 
         // 4) 大小上限。
@@ -228,6 +230,13 @@ impl SyncEngine {
     pub fn on_remote_clip(&mut self, content: &ClipContent, content_hash: u64) -> RemoteDecision {
         if self.paused {
             return RemoteDecision::Skip(SkipReason::Paused);
+        }
+
+        // 类型开关同样拦接收。早先只拦发送，于是菜单不得不写成"发送图片到
+        // 其它设备"——否则用户关掉后仍然收到图片，会觉得开关是坏的。
+        // 收发一致后，"同步图片"这个名字才名副其实。
+        if self.kind_disabled(content) {
+            return RemoteDecision::Skip(SkipReason::KindDisabled);
         }
 
         // 已经是当前内容 —— 无需重复写入（例如两端几乎同时复制了相同内容）。

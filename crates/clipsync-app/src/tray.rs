@@ -23,10 +23,8 @@ use tray_platform::{init_platform_app, pump_platform_events};
 #[path = "tray_menu.rs"]
 mod tray_menu;
 
-use tray_menu::{
-    custom_label_bytes, custom_label_rate, rebuild_peer_menu, MAX_BYTES_PRESETS,
-    UPLOAD_LIMIT_PRESETS,
-};
+pub(crate) use tray_menu::human_bytes;
+use tray_menu::{max_bytes_label, port_label, rate_label, rebuild_peer_menu};
 
 // 不再是 Copy：`Unpair` 携带 device id。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,21 +36,17 @@ pub enum TrayAction {
     /// 加入配对：输入对方给的配对码，主动连过去。
     EnterPairingCode,
     Quit,
-    /// 切换"发送图片到其它设备"。
-    ToggleSendImages,
-    /// 切换"发送文件到其它设备"。
-    ToggleSendFiles,
+    /// 切换是否同步图片（收发都受此开关约束）。
+    ToggleImages,
+    /// 切换是否同步文件。
+    ToggleFiles,
     /// 切换传输前自动压缩。
     ToggleCompress,
-    /// 设置单次内容大小上限（字节）。
-    SetMaxBytes(usize),
-    /// 设置发送限速（字节/秒，0 为不限速）。
-    SetUploadLimit(u64),
-    /// 弹输入框自定义单次大小上限。
+    /// 弹输入框改单次大小上限。
     PromptMaxBytes,
-    /// 弹输入框自定义发送限速。
+    /// 弹输入框改发送限速。
     PromptUploadLimit,
-    /// 弹输入框修改同步监听端口。
+    /// 弹输入框改同步监听端口。
     PromptListenPort,
     /// 解除与某台设备的配对（携带其 device id）。
     Unpair(String),
@@ -73,8 +67,8 @@ pub struct TrayPeer {
 /// 托盘需要展示的当前设置值（用于菜单初始勾选状态）。
 #[derive(Debug, Clone, Copy)]
 pub struct TraySettings {
-    pub send_images: bool,
-    pub send_files: bool,
+    pub sync_images: bool,
+    pub sync_files: bool,
     pub compress: bool,
     pub max_bytes: usize,
     pub upload_limit: u64,
@@ -111,68 +105,48 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
     let menu = Menu::new();
     // 首项显示状态，不可点击，仅作信息展示。
     let status_item = MenuItem::new(status.summary(), false, None);
-    // 配对的两端各给一个入口。此前只有"显示配对码"，加入方**只能**去命令行敲
-    // `clipsync pair <码>`——而这是个托盘常驻的图形程序，多数用户根本不会开
-    // 终端，等于配对只做了一半。
-    let pair_item = MenuItem::new("显示配对码…（本机等待对方加入）", true, None);
-    let join_item = MenuItem::new("输入配对码…（加入对方）", true, None);
 
-    // 开关文案强调"发送"：这两项只拦截发出，收到的内容不受影响
-    // （引擎只在 on_local_change 检查，on_remote 不检查）。写成"同步图片"
-    // 会让人以为关掉后也不再接收。
-    let send_images_item = CheckMenuItem::new("发送图片到其它设备", true, s0.send_images, None);
-    let send_files_item = CheckMenuItem::new("发送文件到其它设备", true, s0.send_files, None);
-    let compress_item = CheckMenuItem::new("传输前自动压缩", true, s0.compress, None);
-
-    // 预设档用一组 CheckMenuItem 手工做成单选：muda 没有原生 radio 项，
-    // 点击后由我们把同组其它项取消勾选。
-    // 预设档 + 末尾的「自定义…」。自定义项做成普通菜单项而非勾选项：
-    // 它是个动作（弹输入框），不是一个可勾选的状态。当前值不在任何预设档里
-    // 时，标签会带上实际数值，让用户一眼看出"现在是自定义的多少"。
-    let max_items: Vec<CheckMenuItem> = MAX_BYTES_PRESETS
-        .iter()
-        .map(|(label, v)| CheckMenuItem::new(*label, true, s0.max_bytes == *v, None))
-        .collect();
-    let max_custom = MenuItem::new(custom_label_bytes(s0.max_bytes), true, None);
-    let max_menu = Submenu::new("单次大小上限", true);
-    {
-        let mut items: Vec<&dyn tray_icon::menu::IsMenuItem> =
-            max_items.iter().map(|i| i as &dyn tray_icon::menu::IsMenuItem).collect();
-        items.push(&max_custom);
-        max_menu
-            .append_items(&items)
-            .map_err(|e| anyhow::anyhow!("构建上限子菜单失败: {e}"))?;
-    }
-
-    let rate_items: Vec<CheckMenuItem> = UPLOAD_LIMIT_PRESETS
-        .iter()
-        .map(|(label, v)| CheckMenuItem::new(*label, true, s0.upload_limit == *v, None))
-        .collect();
-    let rate_custom = MenuItem::new(custom_label_rate(s0.upload_limit), true, None);
-    let rate_menu = Submenu::new("发送限速", true);
-    {
-        let mut items: Vec<&dyn tray_icon::menu::IsMenuItem> =
-            rate_items.iter().map(|i| i as &dyn tray_icon::menu::IsMenuItem).collect();
-        items.push(&rate_custom);
-        rate_menu
-            .append_items(&items)
-            .map_err(|e| anyhow::anyhow!("构建限速子菜单失败: {e}"))?;
-    }
-
-    let port_item = MenuItem::new(format!("同步端口：{}…", s0.listen_port), true, None);
-
-    // 已配对设备：列出每台及其在线状态，点击可解除配对。
+    // —— 一级：日常会碰的 ——
+    let pair_item = MenuItem::new("显示配对码…", true, None);
+    let join_item = MenuItem::new("输入配对码…", true, None);
     let peers_menu = Submenu::new("已配对设备", true);
     let mut peer_items = rebuild_peer_menu(&peers_menu, &[], &(callbacks.current_peers)())?;
 
-    // 日志：出问题时用户唯一能自查的东西，入口要好找。
-    let verbose_item = CheckMenuItem::new("详细日志（排查问题用）", true, s0.verbose_log, None);
+    // 开关收发两侧都生效，所以可以就叫"同步图片"（见 engine 的 kind_disabled）。
+    let images_item = CheckMenuItem::new("同步图片", true, s0.sync_images, None);
+    let files_item = CheckMenuItem::new("同步文件", true, s0.sync_files, None);
+    let pause_item = CheckMenuItem::new("暂停同步", true, status.is_paused(), None);
+    let autostart_item = CheckMenuItem::new("开机自启", true, crate::autostart::is_enabled(), None);
+
+    // —— 二级：少数人偶尔需要 ——
+    //
+    // 分层而非直接砍掉：这些确实有人要用，但摆在一级会让每天都看见它的
+    // 多数人多扫四行。收进来后一级只剩日常项，需要时也找得到——比让人去
+    // 手工编辑 settings.json 强得多。
+    //
+    // 可调项一律把当前值写进标签，点击即弹输入框；不再给预设档——有了
+    // 输入框，五个档位既占地方又永远不够用。
+    let max_item = MenuItem::new(max_bytes_label(s0.max_bytes), true, None);
+    let rate_item = MenuItem::new(rate_label(s0.upload_limit), true, None);
+    let port_item = MenuItem::new(port_label(s0.listen_port), true, None);
+    let compress_item = CheckMenuItem::new("传输前压缩", true, s0.compress, None);
+    let verbose_item = CheckMenuItem::new("详细日志", true, s0.verbose_log, None);
     let log_dir_item = MenuItem::new("打开日志文件夹…", true, None);
 
-    let pause_item = CheckMenuItem::new("暂停同步", true, status.is_paused(), None);
-    let autostart_item =
-        CheckMenuItem::new("开机自启", true, crate::autostart::is_enabled(), None);
-    let quit_item = MenuItem::new("退出 ClipSync", true, None);
+    let advanced_menu = Submenu::new("高级设置", true);
+    advanced_menu
+        .append_items(&[
+            &max_item,
+            &rate_item,
+            &port_item,
+            &compress_item,
+            &PredefinedMenuItem::separator(),
+            &verbose_item,
+            &log_dir_item,
+        ])
+        .map_err(|e| anyhow::anyhow!("构建高级设置子菜单失败: {e}"))?;
+
+    let quit_item = MenuItem::new("退出", true, None);
 
     menu.append_items(&[
         &status_item,
@@ -181,32 +155,28 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
         &join_item,
         &peers_menu,
         &PredefinedMenuItem::separator(),
-        &send_images_item,
-        &send_files_item,
-        &max_menu,
-        &rate_menu,
-        &compress_item,
-        &port_item,
-        &PredefinedMenuItem::separator(),
+        &images_item,
+        &files_item,
         &pause_item,
+        &PredefinedMenuItem::separator(),
         &autostart_item,
-        &verbose_item,
-        &log_dir_item,
+        &advanced_menu,
         &PredefinedMenuItem::separator(),
         &quit_item,
     ])
     .map_err(|e| anyhow::anyhow!("构建托盘菜单失败: {e}"))?;
 
-    let mut current_icon = IconState::of(&status);
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(status.summary())
-        .with_icon(make_icon(current_icon)?)
+        .with_icon(make_icon(IconState::of(&status))?)
         .build()
         .map_err(|e| anyhow::anyhow!("创建托盘图标失败: {e}"))?;
 
     let menu_rx = MenuEvent::receiver();
     let mut last_summary = status.summary();
+
+    let mut current_icon = IconState::of(&status);
 
     loop {
         // 让平台处理其自身的窗口/菜单消息。
@@ -224,15 +194,15 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
                 Some(TrayAction::EnterPairingCode)
             } else if event.id == quit_item.id() {
                 Some(TrayAction::Quit)
-            } else if event.id == send_images_item.id() {
-                Some(TrayAction::ToggleSendImages)
-            } else if event.id == send_files_item.id() {
-                Some(TrayAction::ToggleSendFiles)
+            } else if event.id == images_item.id() {
+                Some(TrayAction::ToggleImages)
+            } else if event.id == files_item.id() {
+                Some(TrayAction::ToggleFiles)
             } else if event.id == compress_item.id() {
                 Some(TrayAction::ToggleCompress)
-            } else if event.id == max_custom.id() {
+            } else if event.id == max_item.id() {
                 Some(TrayAction::PromptMaxBytes)
-            } else if event.id == rate_custom.id() {
+            } else if event.id == rate_item.id() {
                 Some(TrayAction::PromptUploadLimit)
             } else if event.id == port_item.id() {
                 Some(TrayAction::PromptListenPort)
@@ -240,22 +210,11 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
                 Some(TrayAction::ToggleVerboseLog)
             } else if event.id == log_dir_item.id() {
                 Some(TrayAction::OpenLogDir)
-            } else if let Some((_, device)) =
-                peer_items.iter().find(|(i, _)| i.id() == &event.id)
-            {
-                Some(TrayAction::Unpair(device.clone()))
             } else {
-                // 两组预设档：按 id 找到被点的那一项。
-                max_items
+                peer_items
                     .iter()
-                    .position(|i| i.id() == &event.id)
-                    .map(|idx| TrayAction::SetMaxBytes(MAX_BYTES_PRESETS[idx].1))
-                    .or_else(|| {
-                        rate_items
-                            .iter()
-                            .position(|i| i.id() == &event.id)
-                            .map(|idx| TrayAction::SetUploadLimit(UPLOAD_LIMIT_PRESETS[idx].1))
-                    })
+                    .find(|(i, _)| i.id() == &event.id)
+                    .map(|(_, device)| TrayAction::Unpair(device.clone()))
             };
 
             if let Some(a) = action {
@@ -269,21 +228,14 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
                 autostart_item.set_checked(crate::autostart::is_enabled());
 
                 let s = (callbacks.current_settings)();
-                send_images_item.set_checked(s.send_images);
-                send_files_item.set_checked(s.send_files);
+                images_item.set_checked(s.sync_images);
+                files_item.set_checked(s.sync_files);
                 compress_item.set_checked(s.compress);
-                // 预设档做成单选：只勾中与当前值相等的那项。
-                for (item, (_, v)) in max_items.iter().zip(MAX_BYTES_PRESETS) {
-                    item.set_checked(s.max_bytes == *v);
-                }
-                for (item, (_, v)) in rate_items.iter().zip(UPLOAD_LIMIT_PRESETS) {
-                    item.set_checked(s.upload_limit == *v);
-                }
-                // 自定义项的标签带着当前值，改完要跟着变；端口项同理。
-                max_custom.set_text(custom_label_bytes(s.max_bytes));
-                rate_custom.set_text(custom_label_rate(s.upload_limit));
-                port_item.set_text(format!("同步端口：{}…", s.listen_port));
                 verbose_item.set_checked(s.verbose_log);
+                // 标签里带着当前值，改完要跟着变。
+                max_item.set_text(max_bytes_label(s.max_bytes));
+                rate_item.set_text(rate_label(s.upload_limit));
+                port_item.set_text(port_label(s.listen_port));
                 // 解除配对会改变设备列表，重建一次。
                 peer_items =
                     rebuild_peer_menu(&peers_menu, &peer_items, &(callbacks.current_peers)())?;

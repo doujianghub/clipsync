@@ -1,74 +1,52 @@
-//! 菜单项的取值档位、标签渲染与设备子菜单的重建。
+//! 菜单标签的渲染与设备子菜单的重建。
 //!
 //! 与 `tray` 的分工：那边跑事件循环，这边决定"菜单上显示什么"。
+//!
+//! **文案原则**：短、不解释、不吓人。菜单是给人扫一眼的，不是说明书——
+//! 需要解释的地方交给点击后的对话框，那里有足够篇幅把话说清楚。
+//! 可调的项一律把**当前值写进标签**（`单次上限：100 MiB…`），省掉一层
+//! "点进去才知道现在是多少"。
 
 use super::TrayPeer;
 
-/// 单次大小上限的预设档。`usize::MAX` 表示不限制。
+/// 把字节数写成人能读的形式。
 ///
-/// 预设档覆盖常见场景，档位之外由子菜单末尾的「自定义…」承接——它会弹一个
-/// 输入框，接受 `500MB`、`1.5GiB` 这类写法。
-///
-/// （早先这里写的是"托盘菜单没有输入框，需要精确值的用户可直接改
-/// `settings.json`"。自从配对流程引入 `dialog::prompt` 后这个前提就不成立了，
-/// 而让用户去翻 `~/Library/Application Support/` 手改 JSON 显然不是好答案。）
-pub(super) const MAX_BYTES_PRESETS: &[(&str, usize)] = &[
-    ("10 MiB", 10 * 1024 * 1024),
-    ("100 MiB（默认）", 100 * 1024 * 1024),
-    ("500 MiB", 500 * 1024 * 1024),
-    ("2 GiB", 2 * 1024 * 1024 * 1024),
-    ("不限制", usize::MAX),
-];
-
-/// 发送限速的预设档。`0` 表示不限速。
-pub(super) const UPLOAD_LIMIT_PRESETS: &[(&str, u64)] = &[
-    ("不限速（默认）", 0),
-    ("10 MB/s", 10 * 1000 * 1000),
-    ("20 MB/s", 20 * 1000 * 1000),
-    ("50 MB/s", 50 * 1000 * 1000),
-];
-
-
-/// 「自定义…」项的标签。当前值不在预设档里时带上实际数值，让用户一眼看出
-/// 现在生效的是多少——否则子菜单里一个勾都没有，会显得像没设置过。
-pub(super) fn custom_label_bytes(current: usize) -> String {
-    if MAX_BYTES_PRESETS.iter().any(|(_, v)| *v == current) {
-        "自定义…".to_string()
-    } else {
-        format!("自定义…（当前 {}）", human_bytes(current))
-    }
-}
-
-pub(super) fn custom_label_rate(current: u64) -> String {
-    if UPLOAD_LIMIT_PRESETS.iter().any(|(_, v)| *v == current) {
-        "自定义…".to_string()
-    } else {
-        format!("自定义…（当前 {}/s）", human_bytes(current as usize))
-    }
-}
-
-/// 把字节数写成人能读的形式。挑最合适的单位，避免出现 "0.00 GiB" 这种。
-pub(super) fn human_bytes(n: usize) -> String {
-    if n == usize::MAX {
-        return "不限制".to_string();
-    }
-    const UNITS: &[(&str, usize)] = &[
-        ("GiB", 1 << 30),
-        ("MiB", 1 << 20),
-        ("KiB", 1 << 10),
-    ];
+/// 只挑最合适的那个单位，整数倍时不带小数——"100 MiB" 比 "100.0 MiB" 干净。
+pub(crate) fn human_bytes(n: u64) -> String {
+    const UNITS: &[(&str, u64)] = &[("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)];
     for (unit, size) in UNITS {
         if n >= *size {
             let v = n as f64 / *size as f64;
-            // 整数倍就不显示小数位，"100 MiB" 比 "100.0 MiB" 干净。
-            return if (v.fract()).abs() < 0.05 {
-                format!("{:.0} {unit}", v)
+            return if v.fract().abs() < 0.05 {
+                format!("{v:.0} {unit}")
             } else {
                 format!("{v:.1} {unit}")
             };
         }
     }
     format!("{n} B")
+}
+
+/// 单次上限的显示值。`usize::MAX` 表示不限制。
+pub(crate) fn max_bytes_label(v: usize) -> String {
+    if v == usize::MAX {
+        "单次上限：不限…".to_string()
+    } else {
+        format!("单次上限：{}…", human_bytes(v as u64))
+    }
+}
+
+/// 发送限速的显示值。`0` 表示不限速。
+pub(crate) fn rate_label(v: u64) -> String {
+    if v == 0 {
+        "发送限速：不限…".to_string()
+    } else {
+        format!("发送限速：{}/s…", human_bytes(v))
+    }
+}
+
+pub(crate) fn port_label(port: u16) -> String {
+    format!("同步端口：{port}…")
 }
 
 /// 重建「已配对设备」子菜单。
@@ -89,31 +67,57 @@ pub(super) fn rebuild_peer_menu(
         let _ = menu.remove(item);
     }
     // 上一轮的占位项也要清掉，否则会越堆越多。
-    for item in menu.items() {
-        let _ = menu.remove_at(0);
-        drop(item);
+    while menu.items().len() > old.len().min(menu.items().len()) && !menu.items().is_empty() {
+        if menu.remove_at(0).is_none() {
+            break;
+        }
     }
 
     let mut mapping = Vec::with_capacity(peers.len());
     if peers.is_empty() {
-        let empty = MenuItem::new("（尚未配对任何设备）", false, None);
+        let empty = MenuItem::new("（尚未配对）", false, None);
         menu.append(&empty)
             .map_err(|e| anyhow::anyhow!("构建设备子菜单失败: {e}"))?;
         return Ok(mapping);
     }
 
     for p in peers {
-        // ● 在线 / ○ 离线，一眼能看出哪台连着。文案写明点击的后果——
-        // 这是个破坏性操作，不能让人以为只是查看详情。
-        let label = format!(
-            "{} {} — 解除配对",
-            if p.online { '●' } else { '○' },
-            p.name
+        // ● 在线 / ○ 离线，一眼看出哪台连着。不在标签里写"解除配对"——
+        // 那是点击后确认框的事，菜单只负责列出设备。
+        let item = MenuItem::new(
+            format!("{} {}", if p.online { '●' } else { '○' }, p.name),
+            true,
+            None,
         );
-        let item = MenuItem::new(label, true, None);
         menu.append(&item)
             .map_err(|e| anyhow::anyhow!("构建设备子菜单失败: {e}"))?;
         mapping.push((item, p.device.clone()));
     }
     Ok(mapping)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_bytes_picks_the_right_unit() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(100 * 1024 * 1024), "100 MiB");
+        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2 GiB");
+        // 整数倍不带小数位。
+        assert!(!human_bytes(1 << 20).contains('.'));
+        // 非整数倍保留一位，够看又不啰嗦。
+        assert_eq!(human_bytes(1536 * 1024 * 1024), "1.5 GiB");
+    }
+
+    /// 标签要把当前值写进去——省掉"点进去才知道现在是多少"这一步。
+    #[test]
+    fn labels_carry_the_current_value() {
+        assert_eq!(max_bytes_label(100 * 1024 * 1024), "单次上限：100 MiB…");
+        assert_eq!(max_bytes_label(usize::MAX), "单次上限：不限…");
+        assert_eq!(rate_label(0), "发送限速：不限…");
+        assert_eq!(rate_label(10 * 1024 * 1024), "发送限速：10 MiB/s…");
+        assert_eq!(port_label(47684), "同步端口：47684…");
+    }
 }
