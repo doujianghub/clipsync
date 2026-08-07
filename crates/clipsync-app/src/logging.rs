@@ -213,8 +213,10 @@ pub fn open_in_file_manager(dir: &Path) -> Result<()> {
     #[cfg(not(any(target_os = "macos", windows)))]
     let program = "xdg-open";
 
-    std::process::Command::new(program)
-        .arg(dir)
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    crate::win_util::hidden(&mut cmd);
+    cmd.arg(dir)
         .spawn()
         .with_context(|| format!("无法打开目录 {}", dir.display()))?;
     Ok(())
