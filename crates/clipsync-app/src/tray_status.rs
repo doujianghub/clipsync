@@ -164,86 +164,26 @@ impl TrayStatus {
     }
 }
 
-/// 进度里文件名允许占的显示宽度（半角为 1，全角/中日韩为 2）。
+/// 界面上文件名保留的头尾字符数：`前5…后5`。
 ///
-/// 菜单项过长在 macOS 上把整张菜单撑得很宽，在 Windows 上则直接被托盘提示
-/// 截断（`NOTIFYICONDATA` 的提示文本有硬上限），后半截连百分比都看不到。
-/// 28 列约等于 28 个英文字符或 14 个汉字，足够辨认是哪个文件。
-const NAME_MAX_WIDTH: usize = 28;
-
-/// 字符的显示宽度。东亚全角字符占两列。
-///
-/// 不引入 unicode-width 之类的依赖：这里只需要"别把菜单撑爆"，按区段粗判
-/// 足够，判错一两个字符最多让宽度差一列。
-fn char_width(c: char) -> usize {
-    let u = c as u32;
-    let wide = (0x1100..=0x115F).contains(&u)      // 韩文字母
-        || (0x2E80..=0xA4CF).contains(&u)          // CJK 部首、假名、汉字
-        || (0xAC00..=0xD7A3).contains(&u)          // 韩文音节
-        || (0xF900..=0xFAFF).contains(&u)          // CJK 兼容汉字
-        || (0xFE30..=0xFE6F).contains(&u)          // 竖排标点
-        || (0xFF00..=0xFF60).contains(&u)          // 全角字符
-        || (0xFFE0..=0xFFE6).contains(&u)
-        || (0x1F300..=0x1FAFF).contains(&u); // emoji
-    1 + wide as usize
-}
-
-fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
-}
-
-/// 超宽时**从中间**省略：`一个很长的视频文件…part3.mp4`。
-///
-/// 不从尾部截：尾部截断会把扩展名切掉，只剩"很长很长的名字…"，连是视频
-/// 还是压缩包都看不出来。而文件名里最能区分彼此的信息，恰恰常在结尾
-/// （序号、日期、清晰度）。
-fn ellipsize_middle(s: &str, max_width: usize) -> String {
-    if display_width(s) <= max_width {
-        return s.to_string();
-    }
-    // 省略号自身占一列；余下的宽度前六后四分，保住扩展名又不至于头太短。
-    let budget = max_width.saturating_sub(1);
-    let tail_budget = budget * 4 / 10;
-    let head_budget = budget - tail_budget;
-
-    let mut head = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = char_width(c);
-        if w + cw > head_budget {
-            break;
-        }
-        head.push(c);
-        w += cw;
-    }
-
-    let mut tail: Vec<char> = Vec::new();
-    let mut w = 0;
-    for c in s.chars().rev() {
-        let cw = char_width(c);
-        if w + cw > tail_budget {
-            break;
-        }
-        tail.push(c);
-        w += cw;
-    }
-    tail.reverse();
-
-    format!("{head}…{}", tail.into_iter().collect::<String>())
-}
+/// 名字长到看不完时，真正有辨识度的就是开头和结尾——结尾还带着扩展名与
+/// 序号。中间那一大段（日期、参数、哈希）反而是最不需要看清的部分。
+/// 11 个字符（5+1+5）足够认出是哪个文件，也让托盘那行不至于抖。
+const NAME_HEAD: usize = 5;
+const NAME_TAIL: usize = 5;
 
 /// Windows 托盘提示的硬上限：`NOTIFYICONDATA.szTip` 是 64 个 UTF-16 单元
 /// （63 个字符 + 结尾的 0），超出部分被系统直接切掉，不换行也不省略。
 ///
 /// 实机截图里正好断在第 64 个字符上，后半截连百分比都看不到。注意这个限制
-/// 数的是**字符数**（汉字也只算一个 UTF-16 单元），与菜单那边的**显示列数**
-/// 是两套约束——这也是提示与菜单项必须分开生成的原因。
+/// 数的是**字符数**（汉字也只算一个 UTF-16 单元），与菜单那行能占多宽是两回
+/// 事——这也是提示与菜单项必须分开生成的原因。
 const TOOLTIP_MAX_CHARS: usize = 63;
 
 /// 把字符串硬塞进 `max` 个字符，超了就尾部省略。
 ///
-/// 这是最后一道保险。正常路径上文案已经短于上限，走到这里说明哪里算漏了
-/// ——宁可自己带个省略号，也别让系统在半截字上切一刀。
+/// 最后一道保险。正常路径上文案已经短于上限，走到这里说明哪里算漏了——
+/// 宁可自己带个省略号，也别让系统在半截字上切一刀。
 fn fit_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -251,25 +191,19 @@ fn fit_chars(s: &str, max: usize) -> String {
     s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
 }
 
-/// 按**字符数**从中间省略。
+/// 从中间省略，保留固定的头尾。
 ///
-/// 与 [`ellipsize_middle`] 同一个思路（保住扩展名），但量的是字符数而非显示
-/// 列数：托盘提示的上限是 UTF-16 单元数，汉字只算一个。两个约束都要满足，
-/// 所以两把尺子都得有。
-fn ellipsize_chars(s: &str, max_chars: usize) -> String {
+/// 不按"总长度预算"分配头尾，而是写死 `前5…后5`：预算式分配会让名字长度
+/// 随剩余空间浮动，托盘那行的宽度跟着变，在换行临界点上就会一会儿一行、
+/// 一会儿两行地抖——实机上就是这个毛病。定长才稳。
+fn ellipsize_middle(s: &str) -> String {
     let n = s.chars().count();
-    if n <= max_chars {
+    if n <= NAME_HEAD + 1 + NAME_TAIL {
         return s.to_string();
     }
-    if max_chars <= 1 {
-        return "…".into();
-    }
-    let budget = max_chars - 1;
-    let tail = budget * 4 / 10;
-    let head = budget - tail;
-    let h: String = s.chars().take(head).collect();
-    let t: String = s.chars().skip(n - tail).collect();
-    format!("{h}…{t}")
+    let head: String = s.chars().take(NAME_HEAD).collect();
+    let tail: String = s.chars().skip(n - NAME_TAIL).collect();
+    format!("{head}…{tail}")
 }
 
 /// `已传 / 总量`。单位相同就只写一次：`3.9 / 9.3 GiB` 比
@@ -291,7 +225,7 @@ fn describe(st: &ProgressState, shorten: bool) -> String {
     {
         let dir = if st.p.sending { "发送" } else { "接收" };
         let name = if shorten {
-            ellipsize_middle(&st.p.name, NAME_MAX_WIDTH)
+            ellipsize_middle(&st.p.name)
         } else {
             st.p.name.clone()
         };
@@ -399,25 +333,29 @@ impl TrayStatus {
 impl TrayStatus {
     /// 悬停提示。与菜单里那行**不是**同一份文案。
     ///
-    /// 菜单项能占一整行，放得下绝对字节数；托盘提示只有 63 个字符，光是
-    /// `ClipSync — 接收 ` 加上 `（151.8 MiB / 17.3 GiB，37.2 MiB/s）` 就占掉
-    /// 五十来个，留给文件名的连 13 个都不到。所以提示这边砍掉两样：
+    /// 传输中固定排成**两行**，行内容各司其职：
     ///
-    ///   - **`ClipSync — ` 前缀**：鼠标正悬在 ClipSync 的图标上，不必再自报家门；
-    ///   - **绝对字节数**：一瞥之下要的是"到哪了、多快"，具体数字留给菜单和日志。
+    /// ```text
+    /// 接收 2026年…分.mp4 42%
+    /// 3.9 / 9.3 GiB · 47.3 MiB/s
+    /// ```
+    ///
+    /// **为什么自己换行**：让系统按宽度自动折行的话，速率位数一变
+    /// （`9.8 MiB/s` ↔ `123.4 MiB/s`）总长就在折行临界点上下浮动，提示一会儿
+    /// 一行、一会儿两行地跳。自己定死行数，宽度再变也只是行内长短的事。
+    ///
+    /// **为什么去掉 `ClipSync — ` 前缀**：63 个字符的额度太紧，两行加起来最坏
+    /// 要 55 个，前缀那 11 个字符会顶出去。而鼠标正悬在 ClipSync 的图标上，
+    /// 本来也不必自报家门。空闲时字数宽裕，前缀就留着。
     pub fn tooltip(&self) -> String {
-        let text = match self.progress_brief() {
+        let text = match self.progress_tooltip() {
             Some(p) => p,
             None => self.summary(),
         };
         fit_chars(&text, TOOLTIP_MAX_CHARS)
     }
 
-    /// 提示用的精简进度：`接收 video.mp4 42% · 8.3 MiB/s`。
-    ///
-    /// 文件名的可用长度由剩余预算倒推，而不是写死——速率位数会变，写死就会
-    /// 在某些数值下又超出去。
-    fn progress_brief(&self) -> Option<String> {
+    fn progress_tooltip(&self) -> Option<String> {
         if !self.is_transferring() {
             return None;
         }
@@ -430,20 +368,16 @@ impl TrayStatus {
         } else {
             0
         };
+        let name = ellipsize_middle(&st.p.name);
+
+        let mut second = bytes_pair(st.p.done, st.p.total);
         let moved = st.p.done.saturating_sub(st.since_bytes);
         let secs = st.since.elapsed().as_secs_f64();
-        let tail = if moved > 0 && secs >= 0.5 {
+        if moved > 0 && secs >= 0.5 {
             let rate = (moved as f64 / secs) as u64;
-            format!(" {pct}% · {}/s", crate::tray::human_bytes(rate))
-        } else {
-            format!(" {pct}%")
-        };
-
-        // 除文件名外都是定长部分，剩下多少给名字就用多少。
-        let fixed = dir.chars().count() + 1 + tail.chars().count();
-        let budget = TOOLTIP_MAX_CHARS.saturating_sub(fixed);
-        let name = ellipsize_chars(&st.p.name, budget);
-        Some(format!("{dir} {name}{tail}"))
+            second.push_str(&format!(" · {}/s", crate::tray::human_bytes(rate)));
+        }
+        Some(format!("{dir} {name} {pct}%\n{second}"))
     }
 }
 
@@ -551,41 +485,35 @@ mod tests {
     /// 短名字原样保留，不该无端加省略号。
     #[test]
     fn short_names_pass_through() {
-        assert_eq!(ellipsize_middle("a.txt", 28), "a.txt");
-        assert_eq!(ellipsize_middle("报告.pdf", 28), "报告.pdf");
-        // 正好卡在上限也不截。
-        let exact = "a".repeat(28);
-        assert_eq!(ellipsize_middle(&exact, 28), exact);
+        assert_eq!(ellipsize_middle("a.txt"), "a.txt");
+        assert_eq!(ellipsize_middle("报告.pdf"), "报告.pdf");
+        // 正好 5+1+5 也不截。
+        assert_eq!(ellipsize_middle("abcdeXfghij"), "abcdeXfghij");
     }
 
-    /// 超宽时从中间省略，且**扩展名必须留着**。
+    /// 超长时固定取头 5 尾 5，**扩展名必须留着**。
+    #[test]
+    fn long_names_keep_five_at_each_end() {
+        let out = ellipsize_middle("2026年度第三季度产品发布会现场录像完整版第三部分.mp4");
+        assert_eq!(out, "2026年…分.mp4");
+        assert_eq!(out.chars().count(), 11);
+
+        let iso = ellipsize_middle("Ubuntu-24.04.1-desktop-amd64-live-server-installer.iso");
+        assert_eq!(iso, "Ubunt…r.iso");
+    }
+
+    /// 截断长度**不随剩余空间浮动**。
     ///
-    /// 从尾部截会切掉扩展名，只剩"很长很长的名字…"——连是视频还是压缩包都
-    /// 看不出来；而文件名里最能区分彼此的信息（序号、日期、清晰度）恰恰
-    /// 常在结尾。
+    /// 回归自实机观感："有时候换行有时候不换行"。若按剩余预算分配头尾，
+    /// 速率位数一变（9.8 ↔ 123.4 MiB/s）名字长度就跟着变，总宽在折行临界点
+    /// 上下抖，提示一会儿一行一会儿两行。
     #[test]
-    fn long_names_keep_head_and_extension() {
-        let s = "2026年度第三季度产品发布会现场录像完整版第三部分.mp4";
-        let out = ellipsize_middle(s, 28);
-
-        assert!(out.contains('…'), "应当省略：{out}");
-        assert!(out.ends_with(".mp4"), "扩展名必须留着：{out}");
-        assert!(out.starts_with("2026"), "开头也要留着：{out}");
-        assert!(display_width(&out) <= 28, "宽度超了：{out}");
-    }
-
-    /// 宽度按显示列算，不是按字符数——否则中文名会把菜单撑到两倍宽。
-    #[test]
-    fn width_counts_columns_not_chars() {
-        assert_eq!(display_width("abc"), 3);
-        assert_eq!(display_width("中文"), 4, "汉字占两列");
-        assert_eq!(display_width("a中"), 3);
-
-        // 14 个汉字 = 28 列，刚好到上限；15 个就得截。
-        let ok = "文".repeat(14);
-        assert_eq!(ellipsize_middle(&ok, 28), ok);
-        let too_long = "文".repeat(15);
-        assert!(display_width(&ellipsize_middle(&too_long, 28)) <= 28);
+    fn name_length_is_fixed_regardless_of_context() {
+        let long = "IMG_20260807_143052_HDR_Portrait_Enhanced_Final_v3.heic";
+        let a = ellipsize_middle(long);
+        let b = ellipsize_middle(long);
+        assert_eq!(a, b);
+        assert_eq!(a.chars().count(), NAME_HEAD + 1 + NAME_TAIL);
     }
 
     /// 托盘提示**任何情况下**都不能超过 63 个字符。
@@ -624,6 +552,16 @@ mod tests {
             let n = tip.chars().count();
             assert!(n <= 63, "提示 {n} 字符，超了：{tip}");
             assert!(tip.contains('%'), "百分比不能被挤掉：{tip}");
+
+            // 固定两行：自己换行才不会随宽度抖。
+            let lines: Vec<&str> = tip.split('\n').collect();
+            assert_eq!(lines.len(), 2, "传输中的提示应恒为两行：{tip:?}");
+            assert!(lines[0].contains('%'), "第一行给方向、名字、进度：{tip:?}");
+            assert!(lines[1].contains('/'), "第二行给已传/总量：{tip:?}");
+            // 任一行都不该长到被系统再折一次。
+            for l in &lines {
+                assert!(l.chars().count() <= 40, "行太长会被再折一次：{l}");
+            }
         }
     }
 
@@ -636,7 +574,7 @@ mod tests {
         assert!(s.tooltip().chars().count() <= 63);
     }
 
-    /// 菜单项那份可以更详细——它没有 63 字符的限制，绝对字节数是有用的。
+    /// 菜单与提示都要给出绝对字节数——只看百分比不知道还剩多少。
     #[test]
     fn menu_summary_keeps_the_absolute_bytes() {
         let s = TrayStatus::new(1);
@@ -655,7 +593,9 @@ mod tests {
         });
         let sum = s.summary();
         assert!(sum.contains("GiB") || sum.contains("MiB"), "菜单里该有字节数：{sum}");
-        assert!(!s.tooltip().contains(" / "), "提示里不该有字节数：{}", s.tooltip());
+        // 提示里也要有已传/总量——只看百分比不知道还剩多少。
+        let tip = s.tooltip();
+        assert!(tip.contains(" / "), "提示第二行该给出已传/总量：{tip}");
     }
 
     /// 人工核对截断效果。
@@ -688,7 +628,10 @@ mod tests {
             println!("原名 {name}");
             println!("  菜单 {}", s.summary());
             let tip = s.tooltip();
-            println!("  提示 {tip}  [{} 字符]", tip.chars().count());
+            for (i, l) in tip.split('\n').enumerate() {
+                println!("  提示{} {l}", i + 1);
+            }
+            println!("       [共 {} 字符]", tip.chars().count());
         }
     }
 }
