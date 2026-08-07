@@ -3,10 +3,11 @@
 # 把 ClipSync 打包成 macOS 的 .app。
 #
 # 用法：
-#   scripts/package-macos.sh              仅本机架构（快）
-#   scripts/package-macos.sh --universal  通用二进制（Intel + Apple Silicon）
+#   scripts/package-macos.sh                    仅本机架构（快）
+#   scripts/package-macos.sh --universal        通用二进制（Intel + Apple Silicon）
+#   scripts/package-macos.sh --universal --dmg  再打一个 dmg 便于分发
 #
-# 产物：target/ClipSync.app
+# 产物：target/ClipSync.app 与 ClipSync-<版本>.zip；加 --dmg 时还有 .dmg
 #
 # 关于签名：本机没有开发者证书时用 ad-hoc 签名（codesign -s -）。这足以让
 # 程序在**本机**正常运行；分发给别人需要 Developer ID 证书并做公证，否则
@@ -23,7 +24,14 @@ VERSION="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
 APP="target/${APP_NAME}.app"
 
 UNIVERSAL=0
-[[ "${1:-}" == "--universal" ]] && UNIVERSAL=1
+MAKE_DMG=0
+for arg in "$@"; do
+    case "$arg" in
+        --universal) UNIVERSAL=1 ;;
+        --dmg)       MAKE_DMG=1 ;;
+        *) echo "未知参数：$arg" >&2; exit 2 ;;
+    esac
+done
 
 # ————————————————————————— 编译 —————————————————————————
 
@@ -169,9 +177,57 @@ codesign --verify --strict "$APP"
     || { echo "LSUIElement 未生效，Dock 会出现图标" >&2; exit 1; }
 test -s "$APP/Contents/Resources/AppIcon.icns"
 
+# ————————————————————————— 分发包 —————————————————————————
+#
+# .app 是个**目录**，用普通 zip 传容易丢东西；而 Apple Silicon 上签名一旦
+# 损坏，内核直接拒绝执行——报的是"应用程序无法打开"，比 Gatekeeper 那句
+# "无法验证开发者"更让人摸不着头脑。
+#
+# 所以给出两种可靠形式：dmg（macOS 标准分发格式，只读镜像，内容动不了），
+# 以及 ditto 打的 zip（Apple 官方推荐，完整保留签名与扩展属性）。
+
+DMG="target/${APP_NAME}-${VERSION}.dmg"
+ZIP="target/${APP_NAME}-${VERSION}.zip"
+
+echo "==> 打分发包"
+rm -f "$ZIP"
+# 用 ditto 而不是 zip：它会完整保留签名所依赖的一切。
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+echo "    $ZIP  ($(du -h "$ZIP" | cut -f1))"
+
+if [[ $MAKE_DMG == 1 ]]; then
+    rm -f "$DMG"
+    STAGE="$(mktemp -d)/${APP_NAME}"
+    mkdir -p "$STAGE"
+    cp -R "$APP" "$STAGE/"
+    # 放一个「应用程序」快捷方式，用户拖进去即可安装——macOS 上的惯例。
+    ln -s /Applications "$STAGE/应用程序"
+    hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$STAGE" \
+        -ov -format UDZO "$DMG"
+    rm -rf "$(dirname "$STAGE")"
+    echo "    $DMG  ($(du -h "$DMG" | cut -f1))"
+fi
+
 echo
 echo "完成：$APP"
 echo "  版本 ${VERSION}   体积 $(du -sh "$APP" | cut -f1)   架构 $(lipo -archs "$APP/Contents/MacOS/clipsync")"
 echo
 echo "安装：把它拖进「应用程序」，双击即可（图标出现在菜单栏，不在 Dock）。"
 echo "开机自启：托盘菜单勾选，或 ${APP}/Contents/MacOS/clipsync autostart on"
+
+if [[ -z "$IDENTITY" ]]; then
+    cat <<'TIP'
+
+给别人用时请一并转告（ad-hoc 签名的固有限制，与程序本身无关）：
+
+  首次打开会被系统拦下。**右键点图标 → 打开**（不要双击），弹窗里选「打开」。
+  macOS 15 及以上：改去「系统设置 › 隐私与安全性」，页面下方点「仍要打开」。
+  只需一次，之后正常双击。
+
+  若提示「已损坏」或「无法打开」，多半是传输弄坏了签名，让对方执行：
+      xattr -cr /Applications/ClipSync.app
+
+  要彻底免掉这些提示，需要 Apple Developer Program（$99/年）的
+  Developer ID 证书并做公证。本脚本检测到证书会自动改用它，无需改动。
+TIP
+fi

@@ -41,13 +41,23 @@ cargo run -p clipsync-app   # 运行后台同步
 **打包成 macOS 应用**：
 
 ```bash
-scripts/package-macos.sh              # 产出 target/ClipSync.app（约 1.6 MB）
-scripts/package-macos.sh --universal  # Intel + Apple Silicon 通用二进制
+scripts/package-macos.sh                    # 本机架构（约 1.6 MB）
+scripts/package-macos.sh --universal        # Intel + Apple Silicon 通用二进制
+scripts/package-macos.sh --universal --dmg  # 再打一个 dmg 便于分发
 ```
 
+除 `.app` 外还会产出 `ClipSync-<版本>.zip`（用 `ditto` 打，完整保留签名所依赖的
+扩展属性——普通 `zip` 可能弄坏它）。
+
 拖进「应用程序」双击即可——图标出现在菜单栏，不占 Dock。图标在打包时现画，
-仓库里不存二进制资源。没有开发者证书时用 ad-hoc 签名，本机运行没问题；
-分发给别人需要 Developer ID 与公证，否则对方要在「隐私与安全性」里手动放行。
+仓库里不存二进制资源。
+
+**给别人用时**：没有开发者证书时只能 ad-hoc 签名，对方首次打开会被系统拦下，
+需**右键点图标 → 打开**（双击不给放行按钮）；macOS 15 及以上改去「系统设置 ›
+隐私与安全性」点「仍要打开」。若提示「已损坏」或「无法打开」，多半是传输弄坏了
+签名，让对方执行 `xattr -cr /Applications/ClipSync.app`。要彻底免掉这些提示，
+需 Apple Developer Program（$99/年）的 Developer ID 证书并做公证——脚本检测到
+证书会自动改用它，无需改动。
 
 ## 使用
 
