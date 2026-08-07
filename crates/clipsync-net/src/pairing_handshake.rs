@@ -60,6 +60,22 @@ pub struct LocalPairingInfo {
     pub addrs: Vec<std::net::SocketAddr>,
 }
 
+/// 标记：这次失败是**配对码不对**，而不是连接层面的问题。
+///
+/// 主持方靠它决定要不要计入"猜测次数"。不区分的话，任何人反复连一下再断开
+/// 就能耗光失败上限、把会话打死——而自动发现恰恰会去连一批地址，等于自己
+/// 把自己的配对会话探挂。
+///
+/// 用 `anyhow` 的类型化上下文而不是匹配错误文案：文案会改，类型不会。
+#[derive(Debug)]
+pub struct WrongCode;
+
+impl std::fmt::Display for WrongCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("配对码不匹配")
+    }
+}
+
 /// 在已建立的字节流上执行配对握手，成功返回对端的 `PairingRecord`。
 ///
 /// `stream` 需实现 `Read + Write`（如 `TcpStream`）。双方须使用相同配对码。
@@ -85,7 +101,8 @@ pub fn run_pairing<S: std::io::Read + std::io::Write>(
     // 3) 完成 PAKE，得到共享密钥 K。口令不一致时这里可能出错或得到不同 K。
     let key = state
         .finish(&their_pake_msg)
-        .map_err(|e| anyhow!("PAKE 协商失败（配对码可能不匹配）: {e:?}"))?;
+        .map_err(|e| anyhow!("PAKE 协商失败: {e:?}"))
+        .context(WrongCode)?;
 
     // 4) 交换带认证标签的身份负载。
     let our_identity = Identity {
@@ -110,9 +127,7 @@ pub fn run_pairing<S: std::io::Read + std::io::Write>(
     // 5) 校验对端标签：证明对端掌握相同 K（即相同配对码），认证公钥来源。
     let expected = identity_tag(&key, &their_auth.identity)?;
     if !constant_time_eq(&expected, &their_auth.tag) {
-        return Err(anyhow!(
-            "配对认证失败：标签不匹配（配对码错误或存在中间人）"
-        ));
+        return Err(anyhow!("标签不匹配（配对码错误或存在中间人）")).context(WrongCode);
     }
 
     // 6) 设备 ID **自己算**，不采信对端自报的那个。

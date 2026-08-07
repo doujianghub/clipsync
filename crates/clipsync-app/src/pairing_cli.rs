@@ -16,29 +16,22 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clipsync_net::crypto::StaticIdentity;
 use clipsync_net::pairing::PairingCode;
-use clipsync_net::pairing_handshake::{run_pairing, LocalPairingInfo};
+use clipsync_net::pairing_handshake::{run_pairing, LocalPairingInfo, WrongCode};
+
+use tracing::debug;
 
 use crate::config;
 
 /// 配对使用的 TCP 端口（与同步端口区分）。
 pub const PAIRING_PORT: u16 = 47_685;
 
-/// 把配对码与主持方地址拼成一个可整体复制的串：`ABCDEF@100.88.88.22`。
-///
-/// **为什么需要它**：局域网内靠 UDP 组播就能自动找到对方，但**覆盖网不转发
-/// 组播**——Tailscale、ZeroTier 这类 L3 overlay 都是如此（mDNS/SSDP 在上面
-/// 同样不工作）。于是跨网络配对时自动发现必然落空，用户得先看主持方屏幕上
-/// 的一串 IP、再手动敲进去，两次输入、两处出错机会。
-///
-/// 把地址并进配对码后，跨网络也只需复制粘贴**一次**。
-pub fn format_pairing_string(code: &PairingCode, addr: &std::net::SocketAddr) -> String {
-    format!("{code}@{}", fmt_host(addr))
-}
-
 /// 解析用户输入：纯配对码，或 `配对码@地址`。
 ///
-/// 返回 `(配对码, 地址)`；地址为 `None` 时调用方走局域网自动发现。
+/// 返回 `(配对码, 地址)`；地址为 `None` 时调用方自动查找对方。
 /// 无法识别为合法配对码时返回 `None`。
+///
+/// 带地址的写法是**手动出口**，不再主动示人：自动发现覆盖到绝大多数情况，
+/// 让每个用户都先读一遍 IP 是本末倒置。命令行仍然接受它。
 pub fn parse_pairing_input(input: &str) -> Option<(PairingCode, Option<String>)> {
     let s = input.trim();
     match s.rsplit_once('@') {
@@ -78,29 +71,33 @@ fn best_addr_for_sharing(port: u16) -> Option<std::net::SocketAddr> {
         .or_else(|| pick(AddrClass::Public))
 }
 
-/// 拼出交给对方的那一串：有可分享地址时是 `ABCDEF@100.88.88.22`，否则就是
-/// 裸码 `ABCDEF`（本机一个可用网卡都没有，只能靠局域网发现）。
-fn share_string(code: &PairingCode, sync_port: u16) -> String {
-    match best_addr_for_sharing(sync_port) {
-        Some(addr) => format_pairing_string(code, &addr),
-        None => code.to_string(),
-    }
+/// 本机最适合被对方连到的地址，用于弹窗末尾那句兜底提示。
+///
+/// 自动发现覆盖不到时（比如网段大到不值得枚举、组网工具又不在表里），用户
+/// 需要手输一次地址——那就得让他看得见该输什么。
+fn own_addr_hint(sync_port: u16) -> Option<String> {
+    best_addr_for_sharing(sync_port).map(|a| fmt_host(&a))
 }
 
 /// 主持配对的有效期。到期自动结束：释放端口、停止组播宣告。
 ///
 /// **为什么必须有这个**：配对码是一次性凭证，"永远有效"既是安全问题，更是
-/// 一个必现的功能故障——见 [`host`] 的说明。3 分钟足够两台设备走完流程，
-/// 又不至于让用户看完码去忙别的时还一直开着。
-pub const HOST_SESSION_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// 一次主持期间允许的失败尝试次数。
+/// 一个必现的功能故障——见 [`host`] 的说明。
 ///
-/// 配对码是 30^6 ≈ 7.3 亿组合，靠 SPAKE2 保证每猜一次都要走一轮完整握手。
-/// 但原实现失败后无限重试，等于给在线猜测开了不限次数的窗口——`pairing.rs`
-/// 的注释声称有"错误锁定"，实际并不存在。超过此数即结束会话，用户重新点一次
-/// 菜单会拿到**新的**配对码。
-const MAX_FAILED_ATTEMPTS: u32 = 5;
+/// 60 秒：码只有 4 位数字（1 万种组合），有效期越短，在线猜测的窗口越小。
+/// 走完"看一眼码 → 到另一台点菜单 → 敲四个数字"够用；过期再点一次会拿到
+/// **新的**码，代价很小。
+pub const HOST_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 一次主持期间允许的**猜测**次数。
+///
+/// 4 位数字只有 1 万种组合，靠 SPAKE2 保证每猜一次都要走一轮完整握手（离线
+/// 穷举不可能）。配合 3 次上限，单个会话被猜中的概率是 3/10000。用户自己
+/// 敲错还剩两次机会，够了。
+///
+/// **只有真的发来 PAKE 且验证失败才算一次**（见 `WrongCode`）。连上就断不
+/// 计数——否则自动发现去探一批地址，等于自己把自己的会话探挂。
+const MAX_FAILED_ATTEMPTS: u32 = 3;
 
 /// accept 的轮询间隔。listener 设为非阻塞后按此节奏检查超时与取消。
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -136,8 +133,8 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 ///
 /// 调用方（托盘）另有单例控制，见 `main.rs` 的 `PairingHostSlot`——重复点击
 /// 不会再撞上"端口已被占用"，而是复用当前会话、重新显示同一个配对码。
-/// `on_code` 在开始等待前调用一次，把**带地址的完整串**交给调用方（托盘的
-/// 单例槽位）——用户重复点菜单时要把同一串再显示、再复制一遍。
+/// `on_code` 在开始等待前调用一次，把配对码交给调用方（托盘的单例槽位）
+/// ——用户在有效期内重复点菜单时要把同一个码再显示一遍。
 pub fn host(
     dir: &Path,
     identity: &StaticIdentity,
@@ -165,17 +162,10 @@ pub fn host(
             .ok();
     let announcing = announcer.is_some();
 
-    // 进剪贴板的是**带地址的完整串**，不是光秃秃的 6 位码。
-    //
-    // 这里曾只复制 6 位码，带地址那串只印在弹窗正文里等用户自己选中——于是
-    // 跨覆盖网配对必然卡壳：对方粘过来只有码，没有地址，只能回退到局域网
-    // 组播发现，而 Tailscale 这类 L3 overlay 根本不转发组播，最后还是得手敲
-    // IP。整套"把地址并进配对码"的设计因为这一行而完全没生效。
-    let share = share_string(&code, sync_port);
-    on_code(&share);
+    on_code(code.as_str());
 
     println!();
-    println!("  配对码： {}", share);
+    println!("  配对码： {}", code);
     println!();
     if announcing {
         println!("  在另一台设备上运行（同一局域网内，无需输入 IP）：");
@@ -200,10 +190,9 @@ pub fn host(
     // 早先注释说"先监听再弹才不会错过连接"——只对了一半：连接确实不会丢，
     // 但握手不是内核能替我们完成的。
     if show_dialog {
-        let body = dialog_body(&share, announcing);
-        let share = share.clone();
+        let body = dialog_body(&code, sync_port);
         std::thread::spawn(move || {
-            crate::dialog::show_info_and_copy("ClipSync 配对", &body, &share);
+            crate::dialog::show_info("ClipSync 配对", &body);
         });
     }
 
@@ -233,11 +222,16 @@ pub fn host(
                 return Ok(record);
             }
             Err(e) => {
+                // 连接层面的失败（探测器连一下就断、网络抖动）不算猜测。
+                if e.downcast_ref::<WrongCode>().is_none() {
+                    debug!("一个连接未完成握手（不计入猜测次数）: {e:#}");
+                    continue;
+                }
                 failures += 1;
-                println!("  ✗ 本次配对未成功：{e:#}");
+                println!("  ✗ 配对码不对：{e:#}");
                 if failures >= MAX_FAILED_ATTEMPTS {
                     anyhow::bail!(
-                        "配对失败 {failures} 次，已结束本次配对以防猜测；\
+                        "配对码连错 {failures} 次，已结束本次配对以防猜测；\
                          请重新发起（会生成新的配对码）"
                     );
                 }
@@ -302,17 +296,21 @@ fn fmt_host(sa: &std::net::SocketAddr) -> String {
     }
 }
 
-/// 弹窗正文。内容与终端输出一致，但更紧凑——弹窗放不下太多行。
+/// 弹窗正文。
 ///
-/// 只给**一串**。此前分两串（裸码 + 带地址的），用户得先判断"我们算不算
-/// 同一个局域网"再选一串——这恰恰是程序该替他判断的事，而且判断错了就配不上。
-/// 带地址那串在局域网里同样能用（还省掉一次组播发现），没有分两串的理由。
-fn dialog_body(share: &str, _announcing: bool) -> String {
-    format!(
-        "配对码：{share}\n（已复制到剪贴板）\n\n\
-         在对方设备上选「输入配对码…」，粘贴即可。\n\n\
-         正在等待对方连接…"
-    )
+/// 只说三件事：码是多少、去哪儿输、多久过期。地址放在最后一行且加了"若"，
+/// 因为绝大多数情况下自动发现能搞定，不该让每个用户都先读一遍 IP。
+fn dialog_body(code: &PairingCode, sync_port: u16) -> String {
+    let mut s = format!(
+        "配对码  {code}\n\n\
+         在对方设备上选「输入配对码…」，输入这四位。\n\
+         {} 秒内有效。",
+        HOST_SESSION_TIMEOUT.as_secs()
+    );
+    if let Some(addr) = own_addr_hint(sync_port) {
+        s.push_str(&format!("\n\n若对方提示需要地址，本机是 {addr}"));
+    }
+    s
 }
 
 /// 作为发起方完成配对。
@@ -326,22 +324,55 @@ pub fn join(
     code_str: &str,
     sync_port: u16,
 ) -> Result<clipsync_net::pairing::PairingRecord> {
-    let mut stream = connect_host(host_ip)?;
-    join_on(&mut stream, dir, identity, device_name, code_str, sync_port)
+    let mut last = None;
+    for mut stream in connect_hosts(host_ip)? {
+        match join_on(&mut stream, dir, identity, device_name, code_str, sync_port) {
+            Ok(r) => return Ok(r),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("没有可用的连接")))
 }
 
-/// 连到主持方：给了地址就直连，否则先在局域网里找。
+/// 连到主持方，返回一批**已建立**的连接，调用方依次尝试握手。
 ///
-/// 与握手**分成两步**是为了让调用方能区分"连不上"和"码不对"：前者值得换条
-/// 路再试（码里带的是覆盖网地址，而对方其实就在同一局域网，或反过来），
-/// 后者再试多少次都一样，只会白等一轮 6 秒的组播发现。
-pub fn connect_host(host_ip: Option<&str>) -> Result<TcpStream> {
-    let addr = match host_ip {
-        Some(ip) => format!("{ip}:{PAIRING_PORT}"),
-        None => discover_host()?,
-    };
-    println!("  正在连接 {addr} …");
-    TcpStream::connect(&addr).with_context(|| format!("连接 {addr} 失败"))
+/// 给了地址就直连；没给则走两级自动发现，都不必让用户输 IP：
+///   1. **局域网组播**——同网段最快，零探测；
+///   2. **主动探测**（[`crate::host_probe`]）——覆盖网不转发组播，只能反过来
+///      由本机去连一批候选地址，谁应答谁就是主持方。
+///
+/// 返回多个是因为占着 47685 的不一定就是 ClipSync；通常只有一个。
+///
+/// 与握手**分成两步**，是为了让调用方能区分"连不上"和"码不对"：前者值得
+/// 换条路再试，后者再试多少次都一样。
+pub fn connect_hosts(host_ip: Option<&str>) -> Result<Vec<TcpStream>> {
+    if let Some(ip) = host_ip {
+        let addr = format!("{ip}:{PAIRING_PORT}");
+        println!("  正在连接 {addr} …");
+        let s = TcpStream::connect(&addr).with_context(|| format!("连接 {addr} 失败"))?;
+        return Ok(vec![s]);
+    }
+
+    match discover_host() {
+        Ok(addr) => {
+            println!("  正在连接 {addr} …");
+            return Ok(vec![
+                TcpStream::connect(&addr).with_context(|| format!("连接 {addr} 失败"))?
+            ]);
+        }
+        Err(e) => debug!("局域网组播未发现主持方，改为主动探测: {e:#}"),
+    }
+
+    println!("  正在探测可达设备…");
+    let found = crate::host_probe::find_hosts(PAIRING_PORT);
+    if found.is_empty() {
+        anyhow::bail!(
+            "没能自动找到等待配对的设备。\n  \
+             请确认对方正显示着配对码（60 秒内有效），\n  \
+             或改用带地址的写法：clipsync pair <配对码>@<对方IP>"
+        );
+    }
+    Ok(found.into_iter().map(|(_, s)| s).collect())
 }
 
 /// 在已建立的连接上完成配对握手并落盘。
@@ -371,7 +402,7 @@ fn discover_host() -> Result<String> {
     use clipsync_net::discovery::discover_pairing_hosts;
 
     println!("  正在局域网中查找等待配对的设备…");
-    let hosts = discover_pairing_hosts(std::time::Duration::from_secs(6))
+    let hosts = discover_pairing_hosts(std::time::Duration::from_secs(2))
         .context("局域网配对发现失败")?;
 
     match hosts.len() {
