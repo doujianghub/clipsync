@@ -38,6 +38,17 @@ cargo test             # 运行单元测试（核心逻辑）
 cargo run -p clipsync-app   # 运行后台同步
 ```
 
+**打包成 macOS 应用**：
+
+```bash
+scripts/package-macos.sh              # 产出 target/ClipSync.app（约 1.6 MB）
+scripts/package-macos.sh --universal  # Intel + Apple Silicon 通用二进制
+```
+
+拖进「应用程序」双击即可——图标出现在菜单栏，不占 Dock。图标在打包时现画，
+仓库里不存二进制资源。没有开发者证书时用 ad-hoc 签名，本机运行没问题；
+分发给别人需要 Developer ID 与公证，否则对方要在「隐私与安全性」里手动放行。
+
 ## 使用
 
 ```bash
@@ -210,7 +221,7 @@ ClipSync — 已连接 1 / 2 台
   详见 [`docs/CROSS_PLATFORM.md`](docs/CROSS_PLATFORM.md) 末尾。
 - **真实密码管理器验证**：两平台至今都用脚本模拟敏感标记。社区约定与"某个
   软件实际是否遵守"是两回事，模拟测不出后者。
-- **打包**：Windows 免控制台窗口的 GUI 子系统构建、macOS `.app` 签名。
+- **打包**：Windows 免控制台窗口的 GUI 子系统构建（macOS `.app` 已完成，见「构建」）。
 
 > macOS 平台代码（`NSPasteboard` 文件列表读写、`ConcealedType` 敏感探测、
 > `changeCount` 变更令牌、`NSApplication` 事件循环、开机自启、私钥 0600）
