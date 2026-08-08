@@ -29,7 +29,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # 系统托盘图标与菜单（跨 Windows/macOS）。
-tray-icon = "0.19"
+tray-icon = "0.24"
 
 # 文件传输的自适应压缩。flate2 已随 arboard→image→png 缓存，
 # 作为直接依赖不引入新下载。
