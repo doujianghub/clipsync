@@ -16,6 +16,7 @@ fn received_files_detection_requires_all_paths_inside() {
         content: ClipContent::Files(vec![FileMeta::new("a", 1, 1)]),
         sensitive: false,
         file_paths: paths.into_iter().map(std::path::PathBuf::from).collect(),
+        denied: Vec::new(),
     };
 
     assert!(is_our_received_files(

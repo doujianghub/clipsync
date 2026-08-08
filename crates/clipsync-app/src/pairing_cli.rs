@@ -11,6 +11,7 @@
 
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -146,6 +147,22 @@ const MAX_FAILED_ATTEMPTS: u32 = 5;
 /// accept 的轮询间隔。listener 设为非阻塞后按此节奏检查超时与取消。
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// 会话被主动取消——用户点了「换个配对码」。
+///
+/// 单独一个类型而不是靠错误文案区分：调用方要据此决定"立刻开新一轮"还是
+/// "弹一个配对失败"，把这个判断挂在字符串匹配上迟早会因为改文案而失灵
+/// （`WrongCode` 也是同样的道理）。
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("已取消当前配对会话")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
 /// 作为接受方主持配对：生成并显示配对码，等待对方连入。
 ///
 /// 同时向局域网宣告"我在等待配对"，使对方**无需手输 IP**——直接
@@ -170,22 +187,25 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// > 更糟的是 announcer 在 bind **之前**启动，每失败一次就多泄漏一个线程，
 /// > 持续向局域网广播"我在等待配对"。
 ///
-/// 现在会话在三种情况下结束，任一发生都会释放端口并停止组播宣告：
+/// 现在会话在四种情况下结束，任一发生都会释放端口并停止组播宣告：
 ///   1. 配对成功；
 ///   2. 超过 [`HOST_SESSION_TIMEOUT`]；
-///   3. 失败尝试达到 [`MAX_FAILED_ATTEMPTS`]。
+///   3. 失败尝试达到 [`MAX_FAILED_ATTEMPTS`]；
+///   4. `cancel` 被置起——用户点了「换个配对码」，返回 [`Cancelled`]。
 ///
-/// 调用方（托盘）另有单例控制，见 `main.rs` 的 `PairingHostSlot`——重复点击
+/// 调用方（托盘）另有单例控制，见 `pairing_ui` 的 `PairingHostSlot`——重复点击
 /// 不会再撞上"端口已被占用"，而是复用当前会话、重新显示同一个配对码。
-/// `on_code` 在开始等待前调用一次，把配对码交给调用方（托盘的单例槽位）
-/// ——用户在有效期内重复点菜单时要把同一个码再显示一遍。
+///
+/// `on_code` 在开始等待前调用一次，交出配对码与**到期时刻**：托盘据此在菜单里
+/// 显示实时倒计时，弹窗据此写出「有效至 21:47:30」。UI 一律由调用方负责——
+/// 本模块只管协议，不弹窗。
 pub fn host(
     dir: &Path,
     identity: &StaticIdentity,
     device_name: &str,
     sync_port: u16,
-    show_dialog: bool,
-    on_code: impl FnOnce(&str),
+    cancel: &AtomicBool,
+    on_code: impl FnOnce(&str, Instant),
 ) -> Result<clipsync_net::pairing::PairingRecord> {
     let code = PairingCode::generate();
 
@@ -206,7 +226,10 @@ pub fn host(
             .ok();
     let announcing = announcer.is_some();
 
-    on_code(code.as_str());
+    let deadline = Instant::now() + HOST_SESSION_TIMEOUT;
+    // 交给调用方之后它可能立刻弹窗——那个窗口会一直挡到用户点掉，所以必须
+    // 起在别的线程上（调用方的事），而监听此刻已就绪，不会错过任何连接。
+    on_code(code.as_str(), deadline);
 
     println!();
     println!("  配对码： {}", code);
@@ -219,32 +242,13 @@ pub fn host(
     print_manual_hint(&code, sync_port);
     println!("  正在等待对方连接（{} 秒内有效）…", HOST_SESSION_TIMEOUT.as_secs());
 
-    // 从托盘启动时没有终端，上面的 println! 用户一个字也看不到——不弹窗
-    // 等于"点了菜单没反应"。故在**开始监听之后**再弹：弹窗会阻塞本线程直到
-    // 用户点掉，此时监听已就绪，对方可以随时连入，不会错过连接。
-    //
-    // 注意这里在后台线程调用，不涉及主线程 UI 约束（见 dialog 模块说明）。
-    // 弹窗必须与下面的 accept 循环**并行**。
-    //
-    // 它会一直阻塞到用户点掉，而配对握手需要我们主动 accept 并收发——先弹窗
-    // 再 accept 的后果是：对方 TCP 连上了（内核替我们完成三次握手，连接躺在
-    // backlog 里），发来 PAKE 消息却没人读，于是他那边一直等到超时。用户看到
-    // 的现象就是"必须先点掉配对码窗口，别人才连得上"。
-    //
-    // 早先注释说"先监听再弹才不会错过连接"——只对了一半：连接确实不会丢，
-    // 但握手不是内核能替我们完成的。
-    if show_dialog {
-        let body = code_dialog_body(code.as_str(), sync_port);
-        std::thread::spawn(move || {
-            crate::dialog::show_info("ClipSync 配对", &body);
-        });
-    }
-
-    let deadline = Instant::now() + HOST_SESSION_TIMEOUT;
     let mut failures = 0u32;
 
     loop {
-        let Some((mut stream, addr)) = accept_until(&listener, deadline)? else {
+        let Some((mut stream, addr)) = accept_until(&listener, deadline, cancel)? else {
+            if cancel.load(Ordering::Acquire) {
+                return Err(anyhow::Error::new(Cancelled));
+            }
             anyhow::bail!(
                 "配对已超时（{} 秒内无人连入），请重新发起配对",
                 HOST_SESSION_TIMEOUT.as_secs()
@@ -291,12 +295,14 @@ pub fn host(
 /// 单次配对握手的读写超时。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 轮询等待一个入站连接，直到 `deadline`。
+/// 轮询等待一个入站连接，直到 `deadline` 或被取消。
 ///
-/// `Ok(None)` 表示到期仍无人连入。listener 必须已设为非阻塞。
+/// `Ok(None)` 表示到期或被取消——两者由调用方查 `cancel` 区分。listener 必须
+/// 已设为非阻塞：`accept()` 一旦阻塞，超时与取消都叫不醒它。
 fn accept_until(
     listener: &TcpListener,
     deadline: Instant,
+    cancel: &AtomicBool,
 ) -> Result<Option<(TcpStream, std::net::SocketAddr)>> {
     loop {
         match listener.accept() {
@@ -309,7 +315,7 @@ fn accept_until(
                 return Ok(Some((stream, addr)));
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
+                if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
                     return Ok(None);
                 }
                 std::thread::sleep(ACCEPT_POLL_INTERVAL);
@@ -345,12 +351,20 @@ fn fmt_host(sa: &std::net::SocketAddr) -> String {
 /// `pub` 是为了让「会话进行中重复点菜单」那条路复用同一份文案——此前那里
 /// 另写了一段更短的，结果是"关掉窗口再打开，地址就没了"，用户以为程序把
 /// 信息弄丢了。同一件事只该有一份文案。
-pub fn code_dialog_body(code: &str, sync_port: u16) -> String {
+///
+/// **有效期写成绝对时刻**（「有效至 21:47:30」）而不是「还有 2 分 47 秒」：
+/// 这个窗口是系统原生模态窗，显示出来就改不了文字了，相对时间从显示的那一刻
+/// 起就在撒谎。实时倒计时在托盘菜单里，那儿本来就每 200ms 转一圈。
+/// 取不到系统时钟时退回说总时长——那仍然是真话，只是粗一些。
+pub fn code_dialog_body(code: &str, sync_port: u16, expires_in: Duration) -> String {
+    let validity = match crate::wallclock::hms_after(expires_in) {
+        Some(at) => format!("有效至 {at}"),
+        None => format!("{} 分钟内有效", HOST_SESSION_TIMEOUT.as_secs() / 60),
+    };
     let mut s = format!(
         "配对码  {code}\n\n\
          在对方设备上选「输入配对码…」，输入这四位。\n\
-         {} 分钟内有效，配对成功即失效。",
-        HOST_SESSION_TIMEOUT.as_secs() / 60
+         {validity}，配对成功即失效。"
     );
     if let Some(block) = addr_block(sync_port) {
         s.push_str(&format!(

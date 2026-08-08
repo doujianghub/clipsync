@@ -26,7 +26,7 @@ tray-icon = "0.19"
 
 # 文件传输的自适应压缩。flate2 已随 arboard→image→png 缓存，
 # 作为直接依赖不引入新下载。
-flate2 = "1"
+flate2 = { workspace = true }
 
 # 托盘需要在主线程上跑平台消息循环。windows-sys 已缓存，仅增 feature。
 # Win32_UI_Controls 提供 TaskDialogIndirect——系统原生的现代对话框。
@@ -40,10 +40,17 @@ windows-sys = { version = "0.60", features = [
     "Win32_UI_Controls",
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
+    # GetLocalTime：配对码弹窗要写出到期时刻（见 wallclock 模块）。
+    "Win32_System_SystemInformation",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
+
+# localtime_r：同上，本地时刻。已在依赖树里（arboard/directories 都用它），
+# 声明为直接依赖不引入新下载。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # macOS 上 tray-icon 依赖 NSApplication 的事件循环才能响应菜单点击。
 # 版本对齐 tray-icon 0.19 实际使用的 objc2 0.6 / app-kit 0.3（见 Cargo.lock）。

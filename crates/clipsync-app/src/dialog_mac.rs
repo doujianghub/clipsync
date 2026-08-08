@@ -16,6 +16,20 @@ pub fn show(title: &str, body: &str) -> Result<()> {
     run_osascript(SCRIPT, title, body).map(|_| ())
 }
 
+/// 信息框 + 一个动作按钮。默认按钮是「好」——动作是岔路，不是主路。
+///
+/// 用户按右上角关闭或 Esc 时 osascript 以 -128 退出 → `None` → 按"没动作"处理。
+const ACTION_SCRIPT: &str = r#"on run argv
+  display dialog (item 2 of argv) with title (item 1 of argv) buttons {(item 3 of argv), "好"} default button 2 with icon note
+  return button returned of result
+end run"#;
+
+pub fn ask_action(title: &str, body: &str, action: &str) -> Result<bool> {
+    Ok(run_osascript_args(ACTION_SCRIPT, &[title, body, action])?
+        .map(|s| s.trim() == action)
+        .unwrap_or(false))
+}
+
 /// 带输入框的对话框。
 ///
 /// `text returned` 经 stdout 返回给我们。用户点「取消」时 osascript 以

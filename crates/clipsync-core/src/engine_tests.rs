@@ -114,18 +114,40 @@ fn sensitive_memory_is_bounded() {
     );
 }
 
+/// 内联内容超过硬上限就不发——那是一条兜底线，不是可调的旋钮。
 #[test]
-fn oversized_content_is_skipped() {
-    let mut e = SyncEngine::new(
-        DeviceId::from_public_key(b"me"),
-        Limits {
-            max_bytes: 4,
-            ..Default::default()
-        },
-    );
+fn oversized_inline_content_is_skipped() {
+    let mut e = SyncEngine::new(DeviceId::from_public_key(b"me"), Limits::default());
+    let huge = ClipContent::Text("x".repeat(INLINE_MAX_BYTES + 1));
     assert_eq!(
-        e.on_local_change(&text("toolong"), false),
+        e.on_local_change(&huge, false),
         LocalDecision::Skip(SkipReason::TooLarge)
+    );
+    // 刚好到线以内照发。
+    let ok = text("正常长度");
+    assert!(matches!(
+        e.on_local_change(&ok, false),
+        LocalDecision::Broadcast { .. }
+    ));
+}
+
+/// **文件多大都照发**——这是"接收方说了算"的前提。
+///
+/// 回归自设计变更：上限原先装在发送侧，于是接收方的设置对它自己毫无保护
+/// （A 设「不限」就能把 5 GB 推给设了 100 MiB 的 B），而复制一个大文件在本机
+/// 又什么代价都没有——只发元数据，一个字节的内容都不读。真正该判断"值不值得
+/// 拉"的是接收方，见 `Settings::auto_fetch_bytes`。
+#[test]
+fn files_are_never_too_large_to_announce() {
+    let mut e = SyncEngine::new(DeviceId::from_public_key(b"me"), Limits::default());
+    let huge = ClipContent::Files(vec![crate::FileMeta::new(
+        "巨无霸.iso",
+        500 * 1024 * 1024 * 1024, // 500 GB
+        1,
+    )]);
+    assert!(
+        matches!(e.on_local_change(&huge, false), LocalDecision::Broadcast { .. }),
+        "文件只发元数据，多大都该通告出去"
     );
 }
 
@@ -353,5 +375,31 @@ fn reenabling_kind_allows_previously_rejected_content() {
         e.on_remote_clip(&files, h),
         RemoteDecision::Apply,
         "重新打开后应能收到——说明拒绝时没有把它记成当前状态"
+    );
+}
+
+/// 撤销"当前内容"之后，同一份内容必须能被重新接受。
+///
+/// 接收侧的"挂起大文件"就靠这条：判定 Apply 时引擎已把哈希记成当前状态，
+/// 而挂起这条路根本没写剪贴板。不撤销的话，对方再复制一次同一个文件会被
+/// 当成重复内容跳过，托盘上那一行再也不出现——用户只会觉得"又复制了一遍
+/// 怎么没反应"。
+#[test]
+fn forgetting_current_lets_the_same_content_arrive_again() {
+    let mut e = engine();
+    let files = ClipContent::Files(vec![crate::FileMeta::new("big.iso", 5 << 30, 7)]);
+    let h = files.content_hash();
+
+    assert_eq!(e.on_remote_clip(&files, h), RemoteDecision::Apply);
+    assert!(
+        matches!(e.on_remote_clip(&files, h), RemoteDecision::Skip(_)),
+        "没撤销之前，重复内容本就该跳过"
+    );
+
+    e.forget_current();
+    assert_eq!(
+        e.on_remote_clip(&files, h),
+        RemoteDecision::Apply,
+        "撤销后同一份内容应能再次被接受"
     );
 }

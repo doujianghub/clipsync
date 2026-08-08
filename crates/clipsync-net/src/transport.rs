@@ -9,8 +9,11 @@
 //!   2. Noise_IK 握手：发起方须已知响应方静态公钥（配对后成立）。
 //!   3. 进入 transport 模式，双向收发加密的 `SyncMessage`（postcard 编码）。
 //!
-//! 大消息（图片/文件）由 `send` 内部按 Noise 单帧上限自动切分为多帧，
-//! `recv` 侧重组，对上层透明。
+//! 大消息（图片/文件）由 `send` 内部**按需压缩**后再按 Noise 单帧上限切分为
+//! 多帧，`recv` 侧重组还原，对上层透明——`SyncMessage` 与内容哈希都不受影响。
+//!
+//! 压缩放在这一层是因为图片以裸 RGBA 传输（`ClipContent::Image`），一张 4K
+//! 截图就是 33 MB 而压完只剩 6%。放在这里，上层的类型与哈希语义都不用动。
 
 use std::net::TcpStream;
 
@@ -38,7 +41,7 @@ impl NoiseConnection {
         local_private: &[u8],
         remote_public: &[u8],
     ) -> Result<Self> {
-        tune_socket(&stream);
+        crate::sockopt::tune(&stream);
         let handshake = snow::Builder::new(NOISE_PARAMS.parse()?)
             .local_private_key(local_private)
             .remote_public_key(remote_public)
@@ -57,7 +60,7 @@ impl NoiseConnection {
     /// 响应方在握手中获得发起方静态公钥，返回时通过 [`Self::remote_static`]
     /// 暴露，供上层比对配对记录（认证对端身份）。
     pub fn accept(stream: TcpStream, local_private: &[u8]) -> Result<Self> {
-        tune_socket(&stream);
+        crate::sockopt::tune(&stream);
         let handshake = snow::Builder::new(NOISE_PARAMS.parse()?)
             .local_private_key(local_private)
             .build_responder()
@@ -75,20 +78,17 @@ impl NoiseConnection {
         self.noise.get_remote_static().map(|k| k.to_vec())
     }
 
-    /// 发送一条消息：编码 → 按帧上限切分 → 逐帧加密写出。
+    /// 发送一条消息：编码 → 按需压缩 → 按帧上限切分 → 逐帧加密写出。
     ///
-    /// 帧结构：先发一个头帧（4 字节大端的明文总长度），再发若干密文数据帧。
-    /// 接收方据总长度重组。
+    /// 帧结构：先发一个头帧（见 [`Header`]），再发若干密文数据帧。
     pub fn send(&mut self, msg: &SyncMessage) -> Result<()> {
         let plaintext = msg.encode().context("编码消息失败")?;
+        let (body, compressed) = pack(msg, &plaintext);
 
-        // 头帧：明文总长度（便于接收方预分配与判断重组完成）。
-        let mut header = Vec::with_capacity(4);
-        header.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
-        self.send_encrypted(&header)?;
+        self.send_encrypted(&Header::new(body.len(), plaintext.len(), compressed).encode())?;
 
         // 数据帧：按 Noise 明文上限切分。
-        for chunk in plaintext.chunks(MAX_FRAME_PAYLOAD) {
+        for chunk in body.chunks(MAX_FRAME_PAYLOAD) {
             self.send_encrypted(chunk)?;
         }
         Ok(())
@@ -96,16 +96,11 @@ impl NoiseConnection {
 
     /// 接收一条消息，重组所有数据帧。对端关闭返回 `Ok(None)`。
     pub fn recv(&mut self) -> Result<Option<SyncMessage>> {
-        // 读头帧得到明文总长度。
         let header = match self.recv_encrypted()? {
             Some(h) => h,
             None => return Ok(None),
         };
-        if header.len() != 4 {
-            return Err(anyhow!("消息头帧长度非法: {}", header.len()));
-        }
-        let total = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let msg = self.recv_body(total)?;
+        let msg = self.recv_message(Header::decode(&header)?)?;
         Ok(Some(msg))
     }
 
@@ -155,24 +150,19 @@ impl NoiseConnection {
                 if header.len() < 16 {
                     return Err(anyhow!("消息头帧过短（疑似损坏）"));
                 }
-                // 头帧是加密的（16 字节 tag + 4 字节明文长度）。先解密它。
+                // 头帧是加密的（16 字节 tag + 头部本身）。先解密它。
                 let mut hdr_plain = vec![0u8; header.len()];
                 let n = self
                     .noise
                     .read_message(&header, &mut hdr_plain)
                     .context("解密消息头帧失败")?;
                 hdr_plain.truncate(n);
-                if hdr_plain.len() != 4 {
-                    return Err(anyhow!("消息头帧明文长度非法: {}", hdr_plain.len()));
-                }
-                let total =
-                    u32::from_be_bytes([hdr_plain[0], hdr_plain[1], hdr_plain[2], hdr_plain[3]])
-                        as usize;
+                let hdr = Header::decode(&hdr_plain)?;
 
                 // 已进入消息中段：取消超时，阻塞读完所有数据帧。
                 let prev = self.stream.read_timeout().ok().flatten();
                 self.stream.set_read_timeout(None).ok();
-                let result = self.recv_body(total);
+                let result = self.recv_message(hdr);
                 // 恢复超时设置。
                 self.stream.set_read_timeout(prev).ok();
                 let msg = result?;
@@ -184,25 +174,117 @@ impl NoiseConnection {
         }
     }
 
-    /// 读取并重组消息体（不含头帧），头帧已给出明文总长度 `total`。
-    fn recv_body(&mut self, total: usize) -> Result<SyncMessage> {
+    /// 读齐消息体、按需解压、解码。
+    fn recv_message(&mut self, hdr: Header) -> Result<SyncMessage> {
+        let body = self.recv_body(hdr.wire_len)?;
+        let plaintext = if hdr.compressed {
+            std::borrow::Cow::Owned(crate::compress::decompress(&body, hdr.plain_len)?)
+        } else {
+            std::borrow::Cow::Borrowed(&body[..])
+        };
+        SyncMessage::decode(&plaintext).context("解码消息失败")
+    }
+
+    /// 读取并重组消息体（不含头帧），共 `total` 字节。
+    fn recv_body(&mut self, total: usize) -> Result<Vec<u8>> {
         // 按声明长度**预留上限**而非照单全收：`total` 来自对端头帧，虽已由
         // Noise 认证（只有已配对设备发得出），但一个 u32 就能声明 4 GB。
         // 对端实现出错或内容异常时，照着分配会当场把内存打爆，而实际数据
         // 可能一个字节都没到。这里只先要一小块，随实际收到的数据自然增长，
         // 下面的 `> total` 检查负责拦住真正超长的消息。
         const PREALLOC_CAP: usize = 1024 * 1024;
-        let mut plaintext = Vec::with_capacity(total.min(PREALLOC_CAP));
-        while plaintext.len() < total {
+        let mut body = Vec::with_capacity(total.min(PREALLOC_CAP));
+        while body.len() < total {
             let chunk = self
                 .recv_encrypted()?
                 .ok_or_else(|| anyhow!("重组消息时连接中断"))?;
-            plaintext.extend_from_slice(&chunk);
-            if plaintext.len() > total {
+            body.extend_from_slice(&chunk);
+            if body.len() > total {
                 return Err(anyhow!("重组消息超出声明长度"));
             }
         }
-        SyncMessage::decode(&plaintext).context("解码消息失败")
+        Ok(body)
+    }
+}
+
+/// 消息头帧：告诉接收方要读多少字节、解压后有多长、要不要解压。
+///
+/// 定长 9 字节，全部大端：线上长度 u32 ‖ 原始长度 u32 ‖ 压缩标记 u8。
+///
+/// **为什么原始长度也要发**：解压必须有个硬上限，否则一段几 KB 的恶意数据能
+/// 解出几 GB。见 [`crate::compress::decompress`]。
+struct Header {
+    /// 数据帧总字节数（压缩后的量，即实际要从线上读多少）。
+    wire_len: usize,
+    /// 解压还原后的字节数；未压缩时与 `wire_len` 相同。
+    plain_len: usize,
+    compressed: bool,
+}
+
+impl Header {
+    const LEN: usize = 9;
+
+    fn new(wire_len: usize, plain_len: usize, compressed: bool) -> Self {
+        Self { wire_len, plain_len, compressed }
+    }
+
+    fn encode(&self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&(self.wire_len as u32).to_be_bytes());
+        b[4..8].copy_from_slice(&(self.plain_len as u32).to_be_bytes());
+        b[8] = self.compressed as u8;
+        b
+    }
+
+    fn decode(b: &[u8]) -> Result<Self> {
+        if b.len() != Self::LEN {
+            return Err(anyhow!("消息头帧长度非法: {}（应为 {}）", b.len(), Self::LEN));
+        }
+        Ok(Self {
+            wire_len: u32::from_be_bytes(b[0..4].try_into().unwrap()) as usize,
+            plain_len: u32::from_be_bytes(b[4..8].try_into().unwrap()) as usize,
+            compressed: b[8] != 0,
+        })
+    }
+}
+
+/// 小于此值不压：省下的字节抵不过一次压缩调用的开销。
+const COMPRESS_MIN: usize = 16 * 1024;
+
+/// 决定这条消息要不要在帧层压，并给出待发字节。
+///
+/// **为什么压缩放在帧层**：图片是以裸 RGBA 传的（`ClipContent::Image`），
+/// 一张 4K 截图就是 33 MB，而它压完只剩 6%。在这里压，`ClipContent` 的类型
+/// 与内容哈希语义都不用动——哈希始终基于原始字节，回环检测不受影响。
+fn pack<'a>(msg: &SyncMessage, plaintext: &'a [u8]) -> (std::borrow::Cow<'a, [u8]>, bool) {
+    let borrowed = || (std::borrow::Cow::Borrowed(plaintext), false);
+
+    if plaintext.len() < COMPRESS_MIN {
+        return borrowed();
+    }
+    // 文件分块在应用层已按文件类型自适应压过（见 app 的 `compress` 模块），
+    // 这里再压一遍：能压的已经压完，压不动的（jpg/zip）白白多试一次。
+    if matches!(msg, SyncMessage::FileChunk { .. }) {
+        return borrowed();
+    }
+    // 先采样探一下。整份试压对压不动的内容是纯浪费——实测能把吞吐砍掉一半。
+    if !crate::compress::worth_compressing(plaintext) {
+        return borrowed();
+    }
+    match crate::compress::compress(plaintext) {
+        // 压完反而更大就退回原始字节。随机/已压缩内容会这样。
+        Ok(c) if c.len() < plaintext.len() => {
+            // 上层的「已同步 N 字节」报的是**内容**大小，看不出线上实际发了多少。
+            // 少了这一行，"压缩到底生效没有"就只能靠猜。
+            tracing::debug!(
+                "帧层压缩 {} → {} 字节（{:.0}%）",
+                plaintext.len(),
+                c.len(),
+                c.len() as f64 / plaintext.len() as f64 * 100.0
+            );
+            (std::borrow::Cow::Owned(c), true)
+        }
+        _ => borrowed(),
     }
 }
 
@@ -225,20 +307,6 @@ fn is_timeout(err: &std::io::Error) -> bool {
 enum Role {
     Initiator,
     Responder,
-}
-
-/// 调整套接字参数以适配本协议的收发模式。
-///
-/// **关闭 Nagle 算法**：本协议是"一帧接一帧"的请求/流式模式，Nagle 会为了合并
-/// 小包而等待对端 ACK；与接收端的延迟确认叠加时，可能造成数十毫秒的停顿——
-/// 对文件传输吞吐和剪贴板同步延迟都是明显损害。我们自己已经把长度前缀与负载
-/// 合并成单次写出，不需要内核再代为合并。
-///
-/// 设置失败不致命（个别平台/虚拟网卡可能不支持），仅记录后继续。
-fn tune_socket(stream: &TcpStream) {
-    if let Err(e) = stream.set_nodelay(true) {
-        tracing::debug!("设置 TCP_NODELAY 失败（不影响功能，可能略增延迟）: {e}");
-    }
 }
 
 /// 执行 Noise_IK 握手（两条消息：-> e, es, s, ss ; <- e, ee, se），完成后转入
@@ -294,105 +362,9 @@ fn run_handshake(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::crypto::StaticIdentity;
-    use clipsync_core::{ClipContent, DeviceId, SyncMessage};
-    use std::net::{TcpListener, TcpStream};
+#[path = "transport_tests.rs"]
+mod tests;
 
-    /// 端到端：真实 socket 上完成 Noise_IK 握手并双向收发加密消息，
-    /// 覆盖握手、头帧加密、多帧重组、身份认证（remote_static）。
-    #[test]
-    fn noise_roundtrip_over_tcp() {
-        let server_id = StaticIdentity::generate().unwrap();
-        let client_id = StaticIdentity::generate().unwrap();
-        let server_pub = server_id.public_key.clone();
-        let client_pub = client_id.public_key.clone();
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        // 服务端：响应方。
-        let server = std::thread::spawn(move || {
-            let (s, _) = listener.accept().unwrap();
-            let mut conn = NoiseConnection::accept(s, &server_id.private_key).unwrap();
-            // 认证：应看到客户端静态公钥。
-            assert_eq!(conn.remote_static().unwrap(), client_pub);
-            // 收一条文本，回一条较大的图片（触发多帧）。
-            let got = conn.recv().unwrap().unwrap();
-            match got {
-                SyncMessage::Clip { content, .. } => {
-                    assert_eq!(content, ClipContent::Text("hello".into()));
-                }
-                _ => panic!("期望 Clip"),
-            }
-            let big = ClipContent::Image(clipsync_core::ImageData {
-                width: 100,
-                height: 200,
-                rgba: vec![7u8; 100 * 200 * 4], // 80000 字节，跨多帧
-            });
-            conn.send(&SyncMessage::Clip {
-                origin: DeviceId::from_public_key(b"srv"),
-                seq: 1,
-                content_hash: big.content_hash(),
-                content: big,
-            })
-            .unwrap();
-        });
-
-        // 客户端：发起方，已知服务端公钥（IK）。
-        let stream = TcpStream::connect(addr).unwrap();
-        let mut conn = NoiseConnection::connect(stream, &client_id.private_key, &server_pub).unwrap();
-        assert_eq!(conn.remote_static().unwrap(), server_pub);
-
-        conn.send(&SyncMessage::Clip {
-            origin: DeviceId::from_public_key(b"cli"),
-            seq: 0,
-            content_hash: 0,
-            content: ClipContent::Text("hello".into()),
-        })
-        .unwrap();
-
-        // 收多帧大图片并校验完整重组。
-        let reply = conn.recv().unwrap().unwrap();
-        match reply {
-            SyncMessage::Clip { content, .. } => match content {
-                ClipContent::Image(img) => {
-                    assert_eq!(img.width, 100);
-                    assert_eq!(img.height, 200);
-                    assert_eq!(img.rgba.len(), 100 * 200 * 4);
-                    assert!(img.rgba.iter().all(|&b| b == 7));
-                }
-                _ => panic!("期望 Image"),
-            },
-            _ => panic!("期望 Clip"),
-        }
-
-        server.join().unwrap();
-    }
-
-    /// 用错误的对端公钥发起 IK 握手应失败（认证保护）。
-    #[test]
-    fn handshake_fails_with_wrong_remote_key() {
-        let server_id = StaticIdentity::generate().unwrap();
-        let client_id = StaticIdentity::generate().unwrap();
-        let wrong_pub = StaticIdentity::generate().unwrap().public_key;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = std::thread::spawn(move || {
-            if let Ok((s, _)) = listener.accept() {
-                // 响应方握手会因发起方用错公钥而失败；忽略结果。
-                let _ = NoiseConnection::accept(s, &server_id.private_key);
-            }
-        });
-
-        let stream = TcpStream::connect(addr).unwrap();
-        // 用错误的服务端公钥 → 握手应失败。
-        let result = NoiseConnection::connect(stream, &client_id.private_key, &wrong_pub);
-        assert!(result.is_err(), "用错误对端公钥握手不应成功");
-
-        let _ = server.join();
-    }
-}
+#[cfg(test)]
+#[path = "transport_bench.rs"]
+mod bench;

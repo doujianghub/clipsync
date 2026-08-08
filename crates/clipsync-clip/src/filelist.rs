@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clipsync_core::FileMeta;
 
 /// 读取剪贴板中的文件路径。`Ok(None)` 表示剪贴板里没有文件。
@@ -30,13 +30,110 @@ pub fn supported() -> bool {
     platform::SUPPORTED
 }
 
+/// 这个错误是不是"系统不让读"。
+///
+/// 要顺着 `anyhow` 的因果链找 `io::Error`——上层加过 context，直接比对字符串
+/// 会在措辞一改时失灵。
+pub fn is_permission_denied(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+/// 系统拒绝读取某个路径时的解释。
+///
+/// **判据是路径形态而不是 errno**：macOS 的 TCC 一律返回
+/// `Operation not permitted`，从错误码看不出是哪一类保护，而路径能看出来。
+pub struct Denied {
+    /// 一句话说清这是什么位置。
+    pub reason: &'static str,
+    /// 该去系统设置的哪一页把它打开。
+    pub where_to_fix: &'static str,
+}
+
+/// 解释一个路径为什么可能被系统拒绝。
+///
+/// 只在确实拿到 `PermissionDenied` 之后调用——它不判断能不能读，只负责
+/// 把"读不了"翻译成用户能照着做的一句话。
+pub fn explain_denied(path: &Path) -> Denied {
+    let p = path.to_string_lossy();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let under = |sub: &str| !home.is_empty() && p.starts_with(&format!("{home}/{sub}"));
+
+    if under("Library/Containers") || under("Library/Group Containers") {
+        return Denied {
+            reason: "这是另一个 App 的私有数据目录（微信、QQ 这类把收到的文件存在自己容器里）",
+            // 实机截图确认过：这类授权出现在「文件与文件夹」里 ClipSync 名下，
+            // 与「桌面」「下载」并列，条目名就是那个 App（如「微信」）。
+            // 不是「App 管理」——那一项管的是"修改其它 App"，另一回事。
+            where_to_fix: "系统设置 › 隐私与安全性 › 文件与文件夹 › ClipSync",
+        };
+    }
+    for (dir, label) in [
+        ("Desktop", "「桌面」文件夹"),
+        ("Documents", "「文稿」文件夹"),
+        ("Downloads", "「下载」文件夹"),
+    ] {
+        if under(dir) {
+            return Denied {
+                reason: label,
+                where_to_fix: "系统设置 › 隐私与安全性 › 文件与文件夹",
+            };
+        }
+    }
+    if p.starts_with("/Volumes/") {
+        return Denied {
+            reason: "这是外置磁盘或网络卷",
+            where_to_fix: "系统设置 › 隐私与安全性 › 可移除卷宗／网络卷宗",
+        };
+    }
+    Denied {
+        reason: "系统拒绝了访问，但路径不属于已知的几类受保护位置",
+        where_to_fix: "系统设置 › 隐私与安全性 › 完全磁盘访问权限（最后的办法）",
+    }
+}
+
+/// 剪贴板当前提供的全部数据类型标识，供排查用。
+///
+/// "复制了文件却没同步"有两种完全不同的成因：**根本没有文件类型**（有些
+/// App 放的是"承诺文件"或纯文本），与**有路径但读不了**（权限）。光看
+/// 同步结果分不出这两者，而这两者的解法南辕北辙——所以要能把原始类型列出来。
+pub fn pasteboard_types() -> Vec<String> {
+    platform::pasteboard_types()
+}
+
 /// 由路径生成 [`FileMeta`]：文件名 + 大小 + 传输标识。
 ///
 /// 标识由 (文件名, 大小, 修改时间) 派生，**不读取文件内容**——复制 100MB 文件
 /// 时不会产生任何磁盘读取延迟。文件被修改后标识自然改变，旧缓存随之失效。
 pub fn meta_for_path(path: &Path) -> Result<FileMeta> {
+    // 用 `context` 而不是 `anyhow!("...{e}")`：后者把 `io::Error` 格式化成字符串
+    // 就丢了类型，调用方再也分不出"权限被拒"和"文件不存在"——而这两者对用户
+    // 的意义完全不同，一个要去点系统设置，一个只是文件没了。
     let md = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("读取文件信息失败 {}: {e}", path.display()))?;
+        .with_context(|| format!("读取文件信息失败 {}", path.display()))?;
+
+    // **stat 过了不等于读得了。**
+    //
+    // macOS 的 TCC 保护的是文件**内容**：`stat` 常常照样成功，`open` 才被拒。
+    // （拿 `/etc/sudoers` 一试便知：metadata 返回 1709 字节，open 返回
+    // PermissionDenied。）
+    //
+    // 少了这一步，从微信这类 App 复制文件会走进一条最难查的岔路：本机以为
+    // 一切正常，把元数据广播出去、日志里写着"已同步"，对端收到后来索取内容，
+    // 我们这才发现打不开，回一句 FileUnavailable——而对端只是默默丢弃，**它的
+    // 剪贴板原封不动**。用户在那边一粘贴，出来的是上一次复制的东西。两边都
+    // 没有任何提示，现象是"同步串台了"，谁也想不到根因是个权限开关。
+    //
+    // 代价是每个文件多一次 open/close（几微秒），换来的是在**复制的那一刻**
+    // 就能把话说清楚。只对普通文件做：对 FIFO 之类 open 会阻塞。
+    if md.is_file() {
+        drop(
+            std::fs::File::open(path)
+                .with_context(|| format!("打不开文件 {}", path.display()))?,
+        );
+    }
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -110,6 +207,17 @@ mod platform {
         fn drop(&mut self) {
             // SAFETY: 与 OpenClipboard 成对调用。
             unsafe { CloseClipboard() };
+        }
+    }
+
+    /// Windows 的剪贴板格式是数字 ID，没有 macOS 那样的字符串标识。
+    /// 只报告与本模块相关的那一个是否在场——排查文件同步足够了。
+    pub fn pasteboard_types() -> Vec<String> {
+        // SAFETY: 纯查询调用。
+        if unsafe { IsClipboardFormatAvailable(CF_HDROP) } != 0 {
+            vec!["CF_HDROP".to_string()]
+        } else {
+            Vec::new()
         }
     }
 
@@ -236,6 +344,13 @@ mod platform {
     /// Finder 复制文件时放入剪贴板的类型。仅用于"是否有文件"的廉价预判。
     const FILE_URL: &str = "public.file-url";
 
+    pub fn pasteboard_types() -> Vec<String> {
+        NSPasteboard::generalPasteboard()
+            .types()
+            .map(|t| t.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default()
+    }
+
     pub fn read_file_paths() -> Result<Option<Vec<PathBuf>>> {
         let pb = NSPasteboard::generalPasteboard();
 
@@ -340,6 +455,10 @@ mod platform {
 
     // 其它平台暂不支持文件列表，文本与图片同步不受影响。
     pub const SUPPORTED: bool = false;
+
+    pub fn pasteboard_types() -> Vec<String> {
+        Vec::new()
+    }
 
     pub fn read_file_paths() -> Result<Option<Vec<PathBuf>>> {
         Ok(None)

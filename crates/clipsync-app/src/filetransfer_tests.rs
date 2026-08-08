@@ -54,7 +54,7 @@ fn stream_emits_chunks_then_done() {
     let data = vec![9u8; CHUNK_SIZE + 100];
     let p = write_temp("stream.bin", &data);
     // 关闭压缩，便于直接断言原始长度。
-    let mut s = OutgoingStream::start(1, 55, p, 0, false).unwrap();
+    let mut s = OutgoingStream::start(1, 55, p, 0, false, true).unwrap();
 
     let m1 = s.next_message(CHUNK_SIZE).unwrap().unwrap();
     match m1 {
@@ -89,7 +89,7 @@ fn incremental_hash_matches_full_reread() {
     let p = write_temp("hash_equiv.bin", &data);
 
     // 从头发送：走增量路径。
-    let mut s = OutgoingStream::start(1, 1, p.clone(), 0, false).unwrap();
+    let mut s = OutgoingStream::start(1, 1, p.clone(), 0, false, true).unwrap();
     let mut incremental = None;
     while let Some(msg) = s.next_message(CHUNK_SIZE).unwrap() {
         if let SyncMessage::FileDone { content_hash, .. } = msg {
@@ -112,7 +112,7 @@ fn resumed_transfer_still_hashes_whole_file() {
     let data: Vec<u8> = (0..5000).map(|i| (i % 97) as u8).collect();
     let p = write_temp("hash_resume.bin", &data);
 
-    let mut s = OutgoingStream::start(1, 1, p.clone(), 2000, false).unwrap();
+    let mut s = OutgoingStream::start(1, 1, p.clone(), 2000, false, true).unwrap();
     assert!(
         s.running_hash.is_none(),
         "续传不该启用增量哈希——前 2000 字节根本没读过"
@@ -138,7 +138,7 @@ fn hash_covers_plaintext_not_compressed_bytes() {
     let data = vec![b'Z'; 200_000]; // 高度可压
     let p = write_temp("hash_compressed.bin", &data);
 
-    let mut s = OutgoingStream::start(1, 1, p.clone(), 0, true).unwrap();
+    let mut s = OutgoingStream::start(1, 1, p.clone(), 0, true, true).unwrap();
     let mut got = None;
     while let Some(msg) = s.next_message(CHUNK_SIZE).unwrap() {
         if let SyncMessage::FileDone { content_hash, .. } = msg {
@@ -170,7 +170,7 @@ fn hash_benchmark() {
 
     let run = |offset: u64| {
         let t = std::time::Instant::now();
-        let mut s = OutgoingStream::start(1, 1, p.clone(), offset, false).unwrap();
+        let mut s = OutgoingStream::start(1, 1, p.clone(), offset, false, true).unwrap();
         while let Some(m) = s.next_message(CHUNK_SIZE).unwrap() {
             if matches!(m, SyncMessage::FileDone { .. }) {
                 break;
@@ -199,7 +199,7 @@ fn hash_benchmark() {
 fn stream_resumes_from_offset() {
     let data = b"0123456789".to_vec();
     let p = write_temp("resume.bin", &data);
-    let mut s = OutgoingStream::start(1, 1, p, 6, false).unwrap();
+    let mut s = OutgoingStream::start(1, 1, p, 6, false, true).unwrap();
 
     match s.next_message(CHUNK_SIZE).unwrap().unwrap() {
         SyncMessage::FileChunk { offset, data, .. } => {
@@ -215,7 +215,7 @@ fn stream_resumes_from_offset() {
 fn budget_limits_chunk_size() {
     let data = vec![7u8; 10_000];
     let p = write_temp("budget.bin", &data);
-    let mut s = OutgoingStream::start(1, 1, p, 0, false).unwrap();
+    let mut s = OutgoingStream::start(1, 1, p, 0, false, true).unwrap();
 
     match s.next_message(1000).unwrap().unwrap() {
         SyncMessage::FileChunk { offset, data, .. } => {
@@ -236,7 +236,7 @@ fn budget_limits_chunk_size() {
 fn compressible_content_is_compressed() {
     let data = vec![b'A'; 100_000]; // 高度重复，必然可压
     let p = write_temp("compressible.bin", &data);
-    let mut s = OutgoingStream::start(1, 1, p, 0, true).unwrap();
+    let mut s = OutgoingStream::start(1, 1, p, 0, true, true).unwrap();
 
     match s.next_message(CHUNK_SIZE).unwrap().unwrap() {
         SyncMessage::FileChunk {
@@ -261,7 +261,7 @@ fn compressible_content_is_compressed() {
 fn compression_can_be_disabled() {
     let data = vec![b'B'; 50_000];
     let p = write_temp("nocompress.bin", &data);
-    let mut s = OutgoingStream::start(1, 1, p, 0, false).unwrap();
+    let mut s = OutgoingStream::start(1, 1, p, 0, false, true).unwrap();
 
     match s.next_message(CHUNK_SIZE).unwrap().unwrap() {
         SyncMessage::FileChunk {
@@ -280,12 +280,54 @@ fn compression_can_be_disabled() {
 fn stale_generation_request_is_aborted() {
     let o = OutgoingFiles::new();
     o.register(1, vec![(1, write_temp("stale.bin", b"z"))]);
-    o.advance(2); // 剪贴板已更新
+    // 又复制了一个**文件**：上一份才真的不再提供。
+    o.register(2, vec![(2, write_temp("newer.bin", b"z"))]);
 
     match begin_stream(&o, 1, 1, 0, false) {
         Err(SyncMessage::FileAbort { generation }) => assert_eq!(generation, 1),
-        _ => panic!("过期代际的请求应被中止"),
+        _ => panic!("被新的文件复制取代之后，旧代际的请求应被中止"),
     }
+}
+
+/// 复制了文字之后，那份大文件**仍然拿得到**——这是"延后取回"的前提。
+///
+/// 超过对方自动取回上限的文件会挂在它那儿等人点，而这期间本机很可能已经
+/// 复制过文字、截过图。若照 `is_current` 判定，对方那个「取回」按钮基本上
+/// 一按一个空。
+#[test]
+fn a_file_stays_servable_after_copying_text() {
+    let o = OutgoingFiles::new();
+    o.register(1, vec![(1, write_temp("big.bin", b"payload"))]);
+    o.advance(2); // 复制了一段文字
+    o.advance(3); // 又复制了一段
+
+    assert!(!o.is_current(1), "它确实已不是当前剪贴板内容");
+    assert!(o.is_servable(1), "但仍该拿得到——对方可能正等着手动取回");
+    assert!(
+        begin_stream(&o, 1, 1, 0, false).is_ok(),
+        "手动取回必须能开流"
+    );
+}
+
+/// 开流时若请求的已不是当前内容，那只能是手动取回——它不受"剪贴板变了就
+/// 中止"的约束。
+///
+/// 自动那条路在收到 `Clip` 的当场就发 `FileNeed`，那时它必然还是当前内容；
+/// 所以开流那一刻的 `is_current` 恰好能把两者分开，无需改协议加字段。
+#[test]
+fn manual_fetch_streams_do_not_abort_on_supersede() {
+    let o = OutgoingFiles::new();
+    o.register(1, vec![(1, write_temp("manual.bin", b"payload"))]);
+
+    let auto = begin_stream(&o, 1, 1, 0, false).expect("当前内容应能开流");
+    assert!(auto.abort_on_supersede(), "自动传输：剪贴板一变就该收手");
+
+    o.advance(2); // 本机复制了别的东西
+    let manual = begin_stream(&o, 1, 1, 0, false).expect("延后取回仍应能开流");
+    assert!(
+        !manual.abort_on_supersede(),
+        "人明确点了取回，要的就是这一份，本机剪贴板换成什么与他无关"
+    );
 }
 
 #[test]

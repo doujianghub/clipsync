@@ -92,7 +92,10 @@ pub(super) fn pump(
         if let Some(s) = stream.as_mut() {
             // 剪贴板已更新为别的内容：立即中止，不再浪费带宽。
             // 对端会保留已收字节，将来可断点续传。
-            if !ctx.outgoing.is_current(s.generation()) {
+            //
+            // **手动取回不适用**：对方明确点了「取回」，要的就是那一份，本机
+            // 剪贴板后来换成什么与他无关（见 `OutgoingStream::abort_on_supersede`）。
+            if s.abort_on_supersede() && !ctx.outgoing.is_current(s.generation()) {
                 debug!("剪贴板已更新，中止代际 {} 的文件发送", s.generation());
                 conn.send(&SyncMessage::FileAbort {
                     generation: s.generation(),

@@ -26,10 +26,14 @@ pub(crate) fn run_tray(
     hub_thread: std::thread::JoinHandle<()>,
 ) -> Result<()> {
     let pairing_for_peers = pairing.clone();
+    let pairing_for_version = pairing.clone();
+    let pairing_for_code = pairing.clone();
     let status_for_cb = status.clone();
+    let hub_for_cb = pairing.hub.clone();
     let running_for_cb = running.clone();
     let settings_for_cb = settings.clone();
     let settings_for_read = settings.clone();
+    let settings_for_version = settings.clone();
 
     let callbacks = tray::TrayCallbacks {
         on_action: Box::new(move |action| match action {
@@ -68,6 +72,21 @@ pub(crate) fn run_tray(
                 });
                 true
             }
+            tray::TrayAction::NewPairingCode => {
+                // 只置一个标志，正在等待的那一轮自己会收摊并开新一轮
+                // （见 `host_pairing_interactive` 的循环）。落空时它会说明原因，
+                // 而弹窗一律不能占着托盘事件循环。
+                let pairing = pairing.clone();
+                std::thread::spawn(move || pairing_ui::new_code_from_tray(&pairing));
+                true
+            }
+            tray::TrayAction::FetchPending => {
+                // 只管转发。"对方在不在线"、"还提不提供这份内容"都由中枢判定
+                // 并解释——它才是唯一知道连接实况的地方，两处各判一次迟早会
+                // 说出两套不一样的话。
+                hub_for_cb.send(crate::hub::HubEvent::FetchPending);
+                true
+            }
             tray::TrayAction::Quit => {
                 info!("正在退出…");
                 running_for_cb.store(false, Ordering::SeqCst);
@@ -93,9 +112,9 @@ pub(crate) fn run_tray(
             }
             // 弹框会阻塞到用户点掉，放在托盘事件循环里会让整个菜单卡住，
             // 故一律丢到后台线程。
-            tray::TrayAction::PromptMaxBytes => {
+            tray::TrayAction::PromptAutoFetch => {
                 let s = settings_for_cb.clone();
-                std::thread::spawn(move || prompt_max_bytes(&s));
+                std::thread::spawn(move || prompt_auto_fetch(&s));
                 true
             }
             tray::TrayAction::PromptUploadLimit => {
@@ -147,13 +166,23 @@ pub(crate) fn run_tray(
                 sync_images: s.allow_image,
                 sync_files: s.allow_files,
                 compress: s.compress_transfers,
-                max_bytes: s.max_bytes,
+                auto_fetch_bytes: s.auto_fetch_bytes,
                 upload_limit: s.upload_limit_bytes_per_sec,
                 listen_port: s.listen_port,
                 verbose_log: s.verbose_log,
             }
         }),
+        settings_version: Box::new(move || settings_for_version.version()),
         current_peers: Box::new(move || pairing_for_peers.peers_for_tray()),
+        peers_version: Box::new(move || pairing_for_version.known.version()),
+        live_pairing_code: Box::new(move || {
+            pairing_for_code
+                .host_slot
+                .live()
+                // 向上取整：还剩 0.3 秒时写「剩 0:00」看着像已经没了，而这时
+                // 码其实还能用。宁可多显示一秒。
+                .map(|l| (l.code, l.remaining.as_millis().div_ceil(1000) as u64))
+        }),
         // 中枢线程一旦结束（正常退出或 panic），同步就全停了。托盘据此
         // 切到故障状态，而不是继续显示一切正常。
         hub_alive: Box::new(move || !hub_thread.is_finished()),
@@ -216,12 +245,12 @@ fn pick_setting<T: Copy>(
     }
 }
 
-/// 单次上限的常用档。`usize::MAX` 表示不限。
+/// 自动取回上限的常用档。`usize::MAX` 表示多大都自动拉。
 ///
 /// 档位排得密一些是有意的：「自定义…」要弹文本输入框，而输入框是目前唯一
 /// 还依赖 PowerShell 子进程的路径，在某些 Windows 上并不可靠。档位覆盖得越
 /// 全，需要走那条路的人越少。
-const MAX_BYTES_PRESETS: &[(&str, usize)] = &[
+const AUTO_FETCH_PRESETS: &[(&str, usize)] = &[
     ("10 MiB", 10 << 20),
     ("50 MiB", 50 << 20),
     ("100 MiB（默认）", 100 << 20),
@@ -243,8 +272,8 @@ const RATE_PRESETS: &[(&str, u64)] = &[
     ("100 MB/s", 100_000_000),
 ];
 
-fn prompt_max_bytes(settings: &config::SettingsHandle) {
-    let cur = settings.snapshot().max_bytes;
+fn prompt_auto_fetch(settings: &config::SettingsHandle) {
+    let cur = settings.snapshot().auto_fetch_bytes;
     let shown = if cur == usize::MAX {
         "不限".to_string()
     } else {
@@ -252,16 +281,17 @@ fn prompt_max_bytes(settings: &config::SettingsHandle) {
     };
     pick_setting(
         settings,
-        "单次上限",
+        "自动取回上限",
         &shown,
-        MAX_BYTES_PRESETS,
-        "输入大小，例如 500MB、1.5GiB；填 0 表示不限",
+        AUTO_FETCH_PRESETS,
+        "收到的文件多大以内自动拉取，超过的挂起等你点「取回」。\n\
+         输入大小，例如 500MB、1.5GiB；填 0 表示多大都自动拉",
         |s| {
             // 0 在这里表示"不限"，而不是"一个字节都不许传"。
             let v = size_parse::parse_byte_size(s)?;
             Ok(if v == 0 { usize::MAX } else { v as usize })
         },
-        |s, v| s.max_bytes = v,
+        |s, v| s.auto_fetch_bytes = v,
     );
 }
 
@@ -321,7 +351,7 @@ mod tests {
     #[test]
     fn presets_match_their_labels() {
         let by_label = |label: &str| -> usize {
-            MAX_BYTES_PRESETS
+            AUTO_FETCH_PRESETS
                 .iter()
                 .find(|(l, _)| *l == label)
                 .unwrap_or_else(|| panic!("找不到档位 {label}"))
@@ -351,7 +381,7 @@ mod tests {
     /// 档位应当递增，否则列表读起来很怪。
     #[test]
     fn presets_are_ordered() {
-        let sizes: Vec<usize> = MAX_BYTES_PRESETS.iter().map(|(_, v)| *v).collect();
+        let sizes: Vec<usize> = AUTO_FETCH_PRESETS.iter().map(|(_, v)| *v).collect();
         assert!(sizes.windows(2).all(|w| w[0] < w[1]), "上限档应递增: {sizes:?}");
 
         // 限速的「不限」排第一（0 表示不限，语义上是最大），其余递增。

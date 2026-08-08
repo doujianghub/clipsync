@@ -15,7 +15,7 @@ fn corrupt_settings_falls_back_instead_of_failing() {
     std::fs::write(dir.join("settings.json"), "{ 这不是合法 JSON ,,, ").unwrap();
 
     let s = load_or_init_settings(&dir).expect("配置损坏不该让启动失败");
-    assert_eq!(s.max_bytes, Settings::default().max_bytes, "应回退到默认值");
+    assert_eq!(s.auto_fetch_bytes, Settings::default().auto_fetch_bytes, "应回退到默认值");
 
     // 坏文件要保留下来，用户手写的内容可能还想找回。
     assert!(
@@ -115,12 +115,12 @@ fn settings_roundtrip_custom_values() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let mut s = Settings::default();
-    s.max_bytes = crate::size_parse::parse_byte_size("777MB").unwrap() as usize;
+    s.auto_fetch_bytes = crate::size_parse::parse_byte_size("777MB").unwrap() as usize;
     s.upload_limit_bytes_per_sec = crate::size_parse::parse_rate("33MB/s").unwrap();
     save_settings(&dir, &s).unwrap();
 
     let back = load_or_init_settings(&dir).unwrap();
-    assert_eq!(back.max_bytes, 777_000_000);
+    assert_eq!(back.auto_fetch_bytes, 777_000_000);
     assert_eq!(back.upload_limit_bytes_per_sec, 33_000_000);
 }
 
@@ -177,3 +177,52 @@ fn old_records_without_source_still_load() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+/// 每次 `update` 都必须让版本号变。
+///
+/// 托盘的菜单标签（`单次上限：100 MiB…`）就挂在这个数上——变了才重渲染。
+/// 回归自实机反馈「选了 100 MiB，二级菜单还写着不限，下次再选才显示上一次
+/// 选的值」：改设置的弹窗跑在后台线程，`on_action` 在用户还没看见窗口时就
+/// 返回了，点完立刻刷等于把**改之前**的值又渲染一遍。改成按这个版本号轮询
+/// 之后，它漏掉一次自增就等于菜单又晚一拍。
+#[test]
+fn every_update_bumps_the_version() {
+    let dir = std::env::temp_dir().join("clipsync_settings_version");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let h = SettingsHandle::new(dir.clone(), Settings::default());
+    let v0 = h.version();
+
+    h.update(|s| s.auto_fetch_bytes = 100 << 20);
+    let v1 = h.version();
+    assert_ne!(v1, v0, "改了值，版本号必须跟着变");
+    assert_eq!(h.snapshot().auto_fetch_bytes, 100 << 20);
+
+    // 连改两次也要各记一笔——否则第二次改动在托盘上就是不可见的。
+    h.update(|s| s.upload_limit_bytes_per_sec = 5_000_000);
+    assert_ne!(h.version(), v1, "第二次改动也得让版本号变");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 老的 `max_bytes` 字段名必须仍能读进来。
+///
+/// 三台机器上都已经有写好的 settings.json，改名不该把用户设过的值悄悄重置
+/// 成默认——那种"设置自己变回去了"最难察觉，也最招人烦。
+#[test]
+fn the_old_max_bytes_key_still_loads() {
+    let dir = std::env::temp_dir().join("clipsync_maxbytes_alias");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("settings.json"),
+        r#"{"max_bytes":524288000,"allow_image":true,"allow_files":true,"listen_port":47684}"#,
+    )
+    .unwrap();
+
+    let s = load_or_init_settings(&dir).expect("旧字段名应能读取");
+    assert_eq!(s.auto_fetch_bytes, 524_288_000, "用户设过的 500 MiB 不该被重置");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

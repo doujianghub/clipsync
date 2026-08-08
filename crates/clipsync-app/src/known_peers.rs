@@ -4,6 +4,7 @@
 //! 配对流程、托盘设备列表都要读写它。放在 `net_manager` 里会让那个文件
 //! 同时承担"连接管理"与"设备目录"两件事。
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clipsync_core::DeviceId;
@@ -50,15 +51,31 @@ pub struct KnownPeers {
     version: Arc<std::sync::atomic::AtomicU64>,
     /// 变更通知：拨号线程等在这上面，配对/引荐一登记就立刻醒。
     changed: Arc<(Mutex<()>, std::sync::Condvar)>,
+    /// 设备台数的无锁镜像，随本表一起变。
+    ///
+    /// 托盘要显示「已连接 m / n 台」，那个 n 就是这张表的长度。原先托盘自己
+    /// 存了一份、由配对流程手工同步——而写这张表的地方不止配对流程：引荐来的
+    /// 设备、对端广播的移出，都在 `net_pump` 里直接改表。于是实机上出现过
+    /// 「已连接 2 / 1 台」：分子来自连接，分母停在一次也没更新过的旧值。
+    ///
+    /// 把台数挂在表自己身上，两者就不可能再分家；代价只是每次增删多一次
+    /// 原子写。
+    count: Arc<AtomicUsize>,
 }
 
 impl KnownPeers {
     pub fn new(peers: Vec<KnownPeer>) -> Self {
         Self {
+            count: Arc::new(AtomicUsize::new(peers.len())),
             inner: Arc::new(Mutex::new(peers)),
             version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             changed: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
         }
+    }
+
+    /// 台数的只读句柄，供托盘直接读——它拿到的永远是这张表的真实长度。
+    pub fn counter(&self) -> Arc<AtomicUsize> {
+        self.count.clone()
     }
 
     /// 变更计数。值变了就说明设备表被动过。
@@ -99,7 +116,7 @@ impl KnownPeers {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.count.load(Ordering::Acquire)
     }
 
     pub fn contains(&self, device: &DeviceId) -> bool {
@@ -124,6 +141,8 @@ impl KnownPeers {
                 Some(existing) => *existing = peer,
                 None => g.push(peer),
             }
+            // 在锁内发布：持锁者看到的表长与台数永远一致。
+            self.count.store(g.len(), Ordering::Release);
         }
         self.bump();
     }
@@ -137,6 +156,7 @@ impl KnownPeers {
             let mut g = self.inner.lock().unwrap();
             let before = g.len();
             g.retain(|p| &p.device != device);
+            self.count.store(g.len(), Ordering::Release);
             g.len() != before
         };
         if changed {

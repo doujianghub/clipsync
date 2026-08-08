@@ -5,14 +5,15 @@
 //! 这套逻辑对所有组网方案通用——Tailscale、ZeroTier、WireGuard 或公网端口转发
 //! 只是候选地址的不同来源，无需分别适配。
 //!
-//! **连接方向去重**：仅 device_id 字典序较小的一方主动拨号，另一方只监听，
+//! **连接方向去重**：两边都会拨号，但同一对设备之间只保留**由 id 较小一方
+//! 拨出**的那条（见 `is_canonical`）。早先的做法是"较大一方干脆不拨"，
 //! 保证任意两台设备之间恒定只有一条连接。进程内 [`ConnRegistry`] 再兜底一层。
 //!
 //! **地址互告**：连接建立后立即、并每隔一段时间向对端通告本机全部可达地址，
 //! 使对端在当前路径失效时仍握有其它候选。
 
 use std::collections::HashSet;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,13 +50,32 @@ pub(super) const ADDR_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
 /// 退避只在"一轮下来一个都没连上"时推进；**任意一次连接成功即复位**，
 /// 所以回到家打开盖子，最迟一个 `DIAL_RETRY_MAX` 就能重新连上。
 const DIAL_RETRY_INTERVAL: Duration = Duration::from_secs(3);
-/// 退避的上限。取 60 秒：断网一整天也只是每分钟试一次，而重新联网后
-/// 最坏等一分钟就恢复——对一个后台同步工具是合适的折中。
-const DIAL_RETRY_MAX: Duration = Duration::from_secs(60);
+/// 退避的上限。
+///
+/// **从 60 秒下调到 15 秒**，因为一轮拨号的代价变了：原先是逐个候选地址串着
+/// `connect_timeout(3s)`，一台设备五个地址最坏空转 15 秒，那样的一轮确实不该
+/// 频繁做；改成并发之后，一轮的墙上时间就是一个超时窗口、几个短命 socket。
+///
+/// 上限直接决定了**对端重新上线后要等多久**——这是实机上最扎眼的那个体感：
+/// 打开笔记本，两台设备明明都在线，却要干等十几二十秒。方向去重规定只由
+/// id 较小的一方拨号，所以较大的那一方完全被动，等的就是对方这个退避周期。
+const DIAL_RETRY_MAX: Duration = Duration::from_secs(15);
 /// 每隔多少轮拨号重采样一次本机网段（约 30 秒）。
 const REFRESH_NETWORKS_EVERY: u32 = 10;
-/// 空闲时的 TCP 读超时：较长以降低 CPU 占用。
-pub(super) const IDLE_READ_TIMEOUT: Duration = Duration::from_millis(200);
+/// 空闲时的 TCP 读超时。
+///
+/// **这个值直接就是同步延迟的下限**，因为收发泵是单线程的：它在这里阻塞时，
+/// 中枢刚放进发送队列的消息只能干等到超时才发得出去。收到对端消息后也一样,
+/// 泵会立刻回到这个阻塞里,完全没给中枢的回复留窗口。
+///
+/// 曾经取 200ms，实机日志里三次同步一个 **3 字节**的文件，耗时分别是 210ms、
+/// 210ms、215ms——传输时间趋近于零，量到的几乎全是这个超时。一次文件同步要
+/// 走 `Clip → FileNeed → FileChunk → FileDone` 好几跳，每跳都吃一次。
+///
+/// 改成 20ms 后最坏延迟降一个数量级，代价是空闲连接每秒多醒 45 次。一次空转
+/// 循环只是几个原子读加一次 `read` 系统调用（约 1μs），折合 0.01% 的单核占用，
+/// 换十倍的响应速度是划算的。
+pub(super) const IDLE_READ_TIMEOUT: Duration = Duration::from_millis(20);
 /// 文件传输中的 TCP 读超时：极短以保证吞吐，同时仍能及时响应对端消息。
 pub(super) const ACTIVE_READ_TIMEOUT: Duration = Duration::from_millis(1);
 /// 每轮最多连续发送的文件分块数。
@@ -86,6 +106,11 @@ impl ConnRegistry {
 
     fn contains(&self, device: &DeviceId) -> bool {
         self.inner.lock().unwrap().contains(device)
+    }
+
+    /// 当前已连接的对端数。拨号线程据此判断"网络是不是在好转"。
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
     }
 }
 
@@ -123,6 +148,24 @@ pub fn spawn_listener(ctx: NetCtx) -> Result<std::thread::JoinHandle<()>> {
     let listener = TcpListener::bind(("0.0.0.0", ctx.sync_port))
         .with_context(|| format!("监听端口 {} 失败", ctx.sync_port))?;
     info!("正在监听入站连接: 0.0.0.0:{}", ctx.sync_port);
+
+    // 本机地址也记一行。
+    //
+    // 之前只记了**对端**的地址簿，于是"连不上 192.168.2.225"这种日志无从判断：
+    // 是对方在挡，还是这根本就是地址簿里的一条陈货？两边日志各有一半线索却
+    // 拼不到一起。把本机地址打出来，对照一下就有答案了。
+    let mine = clipsync_net::local::local_candidates(ctx.sync_port);
+    if mine.is_empty() {
+        warn!("本机一个可用地址都没枚举到，只能等对端主动连入");
+    } else {
+        info!(
+            "本机地址: {}",
+            mine.iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let handle = std::thread::Builder::new()
         .name("net-listener".into())
@@ -172,15 +215,27 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
                 // 立刻再来一轮，而不是等满退避。
                 let version_before = ctx.known.version();
 
+                // 入站连上的也算数。
+                //
+                // 原先只看"本轮我拨通了谁"，于是有个盲点：对端主动连了进来
+                // （说明网络明明是好的），我们自己的退避却照涨不误，另一台
+                // 设备就得多等好几轮。连接总数变多 = 网络在好转，没有理由
+                // 继续退避。
+                let connected_before = ctx.registry.len();
                 let mut any_connected = false;
                 // 有设备还一个地址都没有——多半是引荐刚到、地址正在路上。
                 // 这不算"连不上"，不该让退避跟着翻倍。
                 let mut awaiting_addrs = false;
                 for peer in ctx.known.snapshot() {
-                    // 方向去重：仅由 id 较小的一方主动拨号。
-                    if ctx.local_device.as_str() >= peer.device.as_str() {
-                        continue;
-                    }
+                    // **两边都拨。**
+                    //
+                    // 早先这里有一句"id 较大的一方直接跳过"，代价是它完全被动：
+                    // 能多快连上，取决于对方的退避周期走到哪儿了。实机上一台
+                    // id 最大的 Mac mini 启动后，两台明明在线的设备分别等了
+                    // 9 秒和 28 秒——它自己一个拨号都没发出去过。
+                    //
+                    // 现在它自己拨；对撞由 `is_canonical` + 让位窗口确定性地
+                    // 化解，见 `run_connection`。
                     if ctx.registry.contains(&peer.device) {
                         continue;
                     }
@@ -194,7 +249,13 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
                 }
 
                 let table_changed = ctx.known.version() != version_before;
-                backoff = next_backoff(backoff, any_connected, awaiting_addrs, table_changed);
+                let gained = ctx.registry.len() > connected_before;
+                backoff = next_backoff(
+                    backoff,
+                    any_connected || gained,
+                    awaiting_addrs,
+                    table_changed,
+                );
                 // 睡到退避到期，或设备表一变就提前醒——配对、引荐登记完
                 // 立即开拨，不用干等一个退避周期。
                 ctx.known.wait_for_change(version_before, backoff);
@@ -206,9 +267,10 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
 /// 推进重试间隔。
 ///
 /// 只有**真的试过且没连上**才加倍；下面三种情况一律复位到起始间隔：
-///   - `any_connected`：这轮连上了，说明网络是通的；
+///   - `any_connected`：这轮连上了（自己拨通的，或对端拨了进来），说明网络
+///     是通的；
 ///   - `awaiting_addrs`：有设备还没拿到地址（引荐刚到、地址在路上）。这不是
-///     "连不上"，把它算作失败会让刚认识的设备白等最长 60 秒；
+///     "连不上"，把它算作失败会让刚认识的设备白等满一个 [`DIAL_RETRY_MAX`]；
 ///   - `table_changed`：设备表变过。新设备是新的机会，不该继承此前"连不上"
 ///     攒下来的长间隔。
 ///
@@ -250,60 +312,34 @@ fn log_addrbook_state(ctx: &NetCtx) {
 ///
 /// 连接本身交给独立线程跑，本函数即刻返回，好让拨号线程接着去连下一台设备。
 /// 返回是否**握手成功过**——拨号线程据此决定要不要退避。
-fn dial_peer(peer: &KnownPeer, ctx: &NetCtx) -> bool {
-    let candidates = ctx.addrbook.connect_order(&peer.device);
-    if candidates.is_empty() {
-        debug!("对端 {} 暂无候选地址（等待发现或配对信息）", peer.name);
-        return false;
-    }
-
-    for cand in candidates {
-        // 逐个尝试期间可能已由入站连接建立，及时收手。
-        if ctx.registry.contains(&peer.device) {
-            return true;
-        }
-        match dial_addr(peer, cand.addr, ctx) {
-            Ok(true) => {
-                // 连接已结束（正常断开），本轮到此为止，等下一轮重试。
-                return true;
-            }
-            Ok(false) => { /* 该地址不可用，试下一个 */ }
-            Err(e) => debug!("连接 {} 失败: {e:#}", cand.addr),
-        }
-    }
-    false
-}
-
-/// 尝试单个地址。返回 `Ok(true)` 表示握手成功、连接已交给独立线程。
+/// 这条连接是不是**规范方向**——由 id 较小的一方拨出。
 ///
-/// **连接必须跑在独立线程里**：`run_connection` 会一直阻塞到断开。早先它直接
-/// 在拨号线程里跑，后果是拨通第一台设备后整个拨号线程就卡在那条连接上，
-/// **其余设备永远拨不到**。两台设备时看不出来（本来就只有一个对端），三台
-/// 才暴露：A 连上 B 之后再也没去连 C。入站监听一直是每连接一线程，出站这边
-/// 漏了。
-fn dial_addr(peer: &KnownPeer, addr: SocketAddr, ctx: &NetCtx) -> Result<bool> {
-    let stream = match TcpStream::connect_timeout(&addr, DIAL_TIMEOUT) {
-        Ok(s) => s,
-        Err(e) => {
-            debug!("TCP 连接 {addr} 失败: {e}");
-            return Ok(false);
-        }
-    };
-    let conn = NoiseConnection::connect(stream, &ctx.identity.private_key, &peer.static_public_key)
-        .context("出站 Noise 握手失败")?;
-
-    info!("已通过 {} 连接 {}", addr, peer.name);
-    let ctx = ctx.clone();
-    std::thread::Builder::new()
-        .name(format!("net-conn-{}", peer.device))
-        .spawn(move || {
-            if let Err(e) = run_connection(conn, &ctx, Some(addr)) {
-                debug!("出站连接结束: {e:#}");
-            }
-        })
-        .context("启动连接线程失败")?;
-    Ok(true)
+/// 关键性质：**同一条 socket，两端算出的结论必然相同**。各自都知道两个
+/// device id，也知道自己是拨出方还是接入方，两个信息合起来就唯一确定了
+/// "这条是谁拨的"。有了这条共识，双方就能在不通信的情况下选中同一条连接。
+fn is_canonical(local: &DeviceId, peer: &DeviceId, outbound: bool) -> bool {
+    if outbound {
+        local.as_str() < peer.as_str()
+    } else {
+        local.as_str() > peer.as_str()
+    }
 }
+
+/// 非规范方向的连接在登记前让出的时间。
+///
+/// **为什么需要它**：两边同时拨号时会出现两条 socket。若各自"谁先握完手留谁"，
+/// 两端很可能留下不同的那条——A 留自己的出站、B 也留自己的出站，而对方早把
+/// 它关了，**两条全死**，五成概率。
+///
+/// 让非规范的那条晚一步登记，规范那条就总能先占住位置，于是两端**必然**淘汰
+/// 同一条。代价只落在兜底路径上：只有本机是 id 较大的一方、且对方没在拨时，
+/// 才会实打实等这段时间。
+///
+/// 取 500 毫秒是留足余量：判断会错只可能发生在"规范连接恰好卡在这个截止点
+/// 附近完成"，而同一条 socket 两端完成握手的时间差约为一个 RTT（通常 <100ms）。
+/// 窗口远大于 RTT，这个区间就窄到可以忽略；万一真撞上，后果也只是两条都关掉、
+/// 下一轮重来，不会卡死。
+const NONCANONICAL_YIELD: Duration = Duration::from_millis(500);
 
 /// 连接建立后的公共处理：认证 → 去重登记 → 通知中枢 → 收发泵 → 断开清理。
 ///
@@ -317,6 +353,11 @@ fn run_connection(conn: NoiseConnection, ctx: &NetCtx, via: Option<SocketAddr>) 
         .known
         .find_by_static_key(&remote_static)
         .ok_or_else(|| anyhow!("对端未配对（静态公钥不在记录中），拒绝连接"))?;
+
+    // 非规范方向先让一步，好让规范那条抢先登记（见 `NONCANONICAL_YIELD`）。
+    if !is_canonical(&ctx.local_device, &peer.device, via.is_some()) {
+        std::thread::sleep(NONCANONICAL_YIELD);
+    }
 
     // 去重：同一对端已有连接则放弃本条。
     if !ctx.registry.try_insert(&peer.device) {
@@ -378,73 +419,11 @@ pub fn seed_addrbook_from_pairings(addrbook: &AddrBook, pairings: &[PairingRecor
     }
 }
 
+#[path = "net_dial.rs"]
+mod dial;
+
+use dial::dial_peer;
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 连不上时逐轮加倍并停在上限——不能无限增长，否则恢复联网后要等太久。
-    #[test]
-    fn backoff_grows_then_caps() {
-        let mut d = DIAL_RETRY_INTERVAL;
-        let mut seen = vec![d];
-        for _ in 0..10 {
-            d = next_backoff(d, false, false, false);
-            seen.push(d);
-        }
-        assert!(
-            seen.windows(2).all(|w| w[1] >= w[0]),
-            "间隔应单调不减，实际 {seen:?}"
-        );
-        assert_eq!(d, DIAL_RETRY_MAX, "应停在上限而不是无限增长");
-    }
-
-    /// 连上过就必须复位。忘了这一步的表现是"断网一次之后就再也不积极重连"。
-    #[test]
-    fn backoff_resets_after_success() {
-        let mut d = DIAL_RETRY_INTERVAL;
-        for _ in 0..8 {
-            d = next_backoff(d, false, false, false);
-        }
-        assert!(d > DIAL_RETRY_INTERVAL, "前置条件：已退避到较大间隔");
-
-        assert_eq!(
-            next_backoff(d, true, false, false),
-            DIAL_RETRY_INTERVAL,
-            "连上后应立刻回到起始间隔"
-        );
-    }
-
-    /// 刚认识、地址还没到的设备不该拖长退避。
-    ///
-    /// 回归自实机：`经 KPC 认识了 MacBook Pro` 到真正连上隔了 **60.019 秒**，
-    /// 正好是 `DIAL_RETRY_MAX`。根因是引荐登记时先动设备表、后写地址簿，
-    /// 而设备表一变就唤醒拨号线程——它醒来看到一台没有任何地址的设备，
-    /// 拨不出去，就把这一轮记成"连不上"，退避翻倍直到上限。
-    ///
-    /// 顺序已经改对（地址先落地址簿），这条断言是第二道防线：就算将来又有谁
-    /// 把顺序写反，最坏也只是慢一个起始间隔，而不是慢一分钟。
-    #[test]
-    fn backoff_does_not_grow_while_waiting_for_addresses() {
-        let mut d = DIAL_RETRY_INTERVAL;
-        for _ in 0..8 {
-            d = next_backoff(d, false, false, false);
-        }
-        assert!(d > DIAL_RETRY_INTERVAL, "前置条件：已退避到较大间隔");
-
-        assert_eq!(
-            next_backoff(d, false, true, false),
-            DIAL_RETRY_INTERVAL,
-            "地址还没到不是连不上，不该继续拉长间隔"
-        );
-    }
-
-    /// 设备表变过就复位：新设备是新的机会，不该继承此前攒下的长间隔。
-    #[test]
-    fn backoff_resets_when_the_device_table_changes() {
-        let mut d = DIAL_RETRY_INTERVAL;
-        for _ in 0..8 {
-            d = next_backoff(d, false, false, false);
-        }
-        assert_eq!(next_backoff(d, false, false, true), DIAL_RETRY_INTERVAL);
-    }
-}
+#[path = "net_manager_tests.rs"]
+mod tests;

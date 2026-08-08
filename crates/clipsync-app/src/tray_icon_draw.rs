@@ -63,12 +63,35 @@ const ICON_SIZE: u32 = 32;
 /// 130 两头都合适——一眼分得出，形状却始终饱满。
 const PULSE_ALPHA: u8 = 130;
 
+/// 「有文件待取回」角标的颜色与半径。
+///
+/// 用蓝色而不是主色的深浅变化：角标说的是"有件事等你处理"，与"连接是否正常"
+/// 完全无关，混用同一色系会让人以为连接出了什么状况。蓝色在深浅两种菜单栏上
+/// 都醒目，也不带告警意味——这不是错误，只是有东西等着。
+const BADGE_COLOR: (u8, u8, u8) = (0x2E, 0x8B, 0xE6);
+
+/// 角标半径与离边距离，逐档比出来的（半径 3/4/5 × 边距 1/2）：
+/// 5 太大，把板身右上整个角吞掉，读起来不像"贴了个标"而像图形坏了；
+/// 3 在真实菜单栏尺寸下几乎看不见。4 配 2 像素边距刚好——完整落在画布内，
+/// 一眼能看到，板身的形状也还认得出。
+const BADGE_RADIUS: i32 = 4;
+const BADGE_MARGIN: i32 = 2;
+
+/// 判定圆内用的平方阈值，比 `r²` 略大半个半径。
+///
+/// 纯 `dx²+dy² ≤ r²` 在这么小的半径上会漏掉 (3,3) 那种斜角像素，画出来是个
+/// 带四个尖的十字而不是圆。放宽到 18 正好把斜角补进来。
+const BADGE_R2: i32 = BADGE_RADIUS * BADGE_RADIUS + BADGE_RADIUS / 2;
+
 /// 按状态生成托盘图标：一个简化的剪贴板轮廓。
 ///
 /// `dimmed` 为真时整体变淡，用于文件传输期间的脉冲。颜色**不变**——脉冲表达
 /// "在忙"，连接状态仍由颜色表达，两者正交，不该互相干扰。
-pub fn make_icon(state: IconState, dimmed: bool) -> anyhow::Result<Icon> {
-    let rgba = draw_clipboard(state, dimmed);
+///
+/// `badge` 为真时右上角点一个蓝点，表示有文件待取回。它**不跟着脉冲变淡**：
+/// 那是一件等着人处理的事，不该在传输期间时隐时现。
+pub fn make_icon(state: IconState, dimmed: bool, badge: bool) -> anyhow::Result<Icon> {
+    let rgba = draw_clipboard(state, dimmed, badge);
     Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE)
         .map_err(|e| anyhow::anyhow!("生成托盘图标失败: {e}"))
 }
@@ -76,11 +99,13 @@ pub fn make_icon(state: IconState, dimmed: bool) -> anyhow::Result<Icon> {
 /// 绘制剪贴板形状的 RGBA 像素。
 ///
 /// 形状：一个圆角板身，顶部一个夹子。用纯计算绘制，无需图片资源。
-fn draw_clipboard(state: IconState, dimmed: bool) -> Vec<u8> {
+fn draw_clipboard(state: IconState, dimmed: bool, badge: bool) -> Vec<u8> {
     let (r, g, b) = state.color();
     let alpha = if dimmed { PULSE_ALPHA } else { 255 };
     let n = ICON_SIZE as i32;
     let mut px = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
+    // 角标圆心贴着右上角，留出边距让整个圆都落在画布内。
+    let (bx, by) = (n - BADGE_RADIUS - BADGE_MARGIN, BADGE_RADIUS + BADGE_MARGIN);
 
     // 板身范围（留出边距）与夹子范围。
     let body = Rect {
@@ -101,6 +126,16 @@ fn draw_clipboard(state: IconState, dimmed: bool) -> Vec<u8> {
             let idx = ((y * n + x) * 4) as usize;
             let in_body = body.contains_rounded(x, y, 3);
             let in_clip = clip.contains_rounded(x, y, 2);
+            // 角标压在最上层：它盖住图形的一角反而更像"贴上去的标记"。
+            let dx = x - bx;
+            let dy = y - by;
+            if badge && dx * dx + dy * dy <= BADGE_R2 {
+                px[idx] = BADGE_COLOR.0;
+                px[idx + 1] = BADGE_COLOR.1;
+                px[idx + 2] = BADGE_COLOR.2;
+                px[idx + 3] = 255;
+                continue;
+            }
 
             if in_clip {
                 // 夹子用更深的同色，形成层次。
@@ -176,7 +211,7 @@ mod tests {
 
     #[test]
     fn icon_pixels_have_expected_size_and_content() {
-        let px = draw_clipboard(IconState::Connected, false);
+        let px = draw_clipboard(IconState::Connected, false, false);
         assert_eq!(px.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
         // 应有不透明像素（画出了图形），也应有透明像素（四周留白）。
         assert!(px.chunks(4).any(|p| p[3] == 255), "应绘制出可见图形");
@@ -186,9 +221,9 @@ mod tests {
 
     #[test]
     fn different_states_produce_different_icons() {
-        let a = draw_clipboard(IconState::Connected, false);
-        let b = draw_clipboard(IconState::Disconnected, false);
-        let c = draw_clipboard(IconState::Paused, false);
+        let a = draw_clipboard(IconState::Connected, false, false);
+        let b = draw_clipboard(IconState::Disconnected, false, false);
+        let c = draw_clipboard(IconState::Paused, false, false);
         assert_ne!(a, b);
         assert_ne!(b, c);
         assert_ne!(a, c);
@@ -197,10 +232,41 @@ mod tests {
 
     #[test]
     fn broken_icon_is_visually_distinct() {
-        let broken = draw_clipboard(IconState::Broken, false);
+        let broken = draw_clipboard(IconState::Broken, false, false);
         for other in [IconState::Connected, IconState::Disconnected, IconState::Paused] {
-            assert_ne!(broken, draw_clipboard(other, false), "故障图标应与 {other:?} 有区别");
+            assert_ne!(broken, draw_clipboard(other, false, false), "故障图标应与 {other:?} 有区别");
         }
+    }
+
+    /// 角标是"有事等你"，不是"出问题了"。
+    ///
+    /// 三条性质：确实画出来了；不跟着脉冲变淡（那是一件待办，不该时隐时现）；
+    /// 不改变主体的颜色（连接状态仍由主色表达）。
+    #[test]
+    fn badge_marks_pending_without_touching_the_state_color() {
+        let plain = draw_clipboard(IconState::Connected, false, false);
+        let badged = draw_clipboard(IconState::Connected, false, true);
+        assert_ne!(plain, badged, "角标得看得见");
+
+        let badge_px: Vec<&[u8]> = badged
+            .chunks(4)
+            .zip(plain.chunks(4))
+            .filter(|(b, p)| b != p)
+            .map(|(b, _)| b)
+            .collect();
+        assert!(!badge_px.is_empty());
+        for p in &badge_px {
+            assert_eq!(&p[..3], &[BADGE_COLOR.0, BADGE_COLOR.1, BADGE_COLOR.2], "角标只该是那一种蓝");
+            assert_eq!(p[3], 255, "角标不透明");
+        }
+
+        // 传输脉冲期间角标照样是实的——待办不该跟着闪。
+        let dim_badged = draw_clipboard(IconState::Connected, true, true);
+        let solid = dim_badged
+            .chunks(4)
+            .filter(|p| p[..3] == [BADGE_COLOR.0, BADGE_COLOR.1, BADGE_COLOR.2])
+            .count();
+        assert_eq!(solid, badge_px.len(), "变淡时角标像素数不该变");
     }
 
     /// 脉冲只改透明度，不改颜色。
@@ -209,8 +275,8 @@ mod tests {
     /// 用户就分不清"在传文件"和"连接出问题了"。
     #[test]
     fn pulse_dims_without_changing_color() {
-        let bright = draw_clipboard(IconState::Connected, false);
-        let dim = draw_clipboard(IconState::Connected, true);
+        let bright = draw_clipboard(IconState::Connected, false, false);
+        let dim = draw_clipboard(IconState::Connected, true, false);
         assert_ne!(bright, dim, "淡下去必须看得出来");
 
         for (b, d) in bright.chunks(4).zip(dim.chunks(4)) {
@@ -237,9 +303,14 @@ mod tests {
             IconState::Paused,
             IconState::Broken,
         ] {
-            for dim in [false, true] {
-                let name = format!("{dir}/icon_{st:?}_{}.rgba", if dim { "dim" } else { "on" });
-                std::fs::write(&name, draw_clipboard(st, dim)).unwrap();
+            for (dim, badge) in [(false, false), (true, false), (false, true)] {
+                let tag = match (dim, badge) {
+                    (true, _) => "dim",
+                    (_, true) => "badge",
+                    _ => "on",
+                };
+                let name = format!("{dir}/icon_{st:?}_{tag}.rgba");
+                std::fs::write(&name, draw_clipboard(st, dim, badge)).unwrap();
                 println!("{name}");
             }
         }

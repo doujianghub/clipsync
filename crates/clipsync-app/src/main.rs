@@ -7,6 +7,8 @@
 //!   - `clipsync pair <ip> <code>`：连接对方完成配对。
 //!   - `clipsync list`：列出已配对设备。
 //!   - `clipsync addrs`：显示本机可达地址及其分类（排查连通性用）。
+//!   - `clipsync clipdiag`：显示剪贴板原始内容与文件可读性（排查
+//!     "复制了文件却没同步"用；macOS 上须从 App 包内运行）。
 //!
 //! **跨网络通用性**：不针对任何组网产品做适配。对端地址来自三个通用来源——
 //! 配对时交换、局域网组播信标、已连接对端经加密通道通告——再按"同网段直连 →
@@ -44,6 +46,7 @@ mod ratelimit;
 mod size_parse;
 mod tray;
 mod tray_bridge;
+mod wallclock;
 #[cfg(windows)]
 mod win_util;
 mod wiring;
@@ -74,16 +77,16 @@ fn main() -> Result<()> {
         Some("pair") => match args.get(1).map(|s| s.as_str()) {
             Some("--host") | Some("-h") => {
                 let settings = config::load_or_init_settings(&dir)?;
-                // 命令行下终端可见，不弹窗打断。
-                // 命令行下终端可见，不弹窗打断；也无需单例槽位（进程本身
-                // 就是一次性的）。
+                // 命令行下终端可见，不弹窗打断；也无需单例槽位或取消通道
+                // （进程本身就是一次性的，Ctrl+C 即可结束）。
+                let never = std::sync::atomic::AtomicBool::new(false);
                 pairing_cli::host(
                     &dir,
                     &identity,
                     &device_name,
                     settings.listen_port,
-                    false,
-                    |_| {},
+                    &never,
+                    |_, _| {},
                 )
                 .map(|_| ())
             }
@@ -140,6 +143,10 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some("clipdiag") => {
+            cli::print_clipboard_diagnosis();
+            Ok(())
+        }
         Some("addrs") => {
             let settings = config::load_or_init_settings(&dir)?;
             cli::print_local_addrs(settings.listen_port);
@@ -171,7 +178,7 @@ fn main() -> Result<()> {
         }
         Some(other) => {
             eprintln!("未知命令: {other}");
-            eprintln!("用法: clipsync [pair|list|addrs|autostart]");
+            eprintln!("用法: clipsync [pair|list|addrs|clipdiag|autostart]");
             Ok(())
         }
         None => run_sync(dir, identity, device_name, log_control),
@@ -191,8 +198,8 @@ fn run_sync(
     info!("日志文件: {}", log_control.dir().join("clipsync.log").display());
     info!("本机设备: {} ({})", device_name, device_id);
     info!(
-        "设置: 上限={} MiB, 图片={}, 文件={}, 同步端口={}",
-        settings.max_bytes / (1024 * 1024),
+        "设置: 自动取回上限={} MiB, 图片={}, 文件={}, 同步端口={}",
+        settings.auto_fetch_bytes / (1024 * 1024),
         settings.allow_image,
         settings.allow_files,
         settings.listen_port,
@@ -220,11 +227,18 @@ fn run_sync(
         settings.file_cache_bytes / (1024 * 1024)
     );
 
+    // 已配对设备表。运行期可增补——从托盘完成配对、或经他人引荐认识一台新
+    // 设备时立即生效，无需重启。
+    //
+    // 必须先于托盘状态建好：托盘显示的「已连接 m / n 台」里的 n 就读这张表的
+    // 台数，而不另存一份（存两份必然对不上，见 `TrayStatus::paired`）。
+    let known = known_peers::KnownPeers::new(pairings.iter().cloned().map(Into::into).collect());
+
     // 中枢：唯一持有引擎，串行处理本地/远端事件。
     let engine = SyncEngine::new(device_id.clone(), settings.to_limits());
     let clipboard = Arc::new(Mutex::new(ArboardClipboard::new()?));
     // 托盘状态：中枢更新连接数，托盘读取展示；暂停标志双方共享。
-    let status = tray::TrayStatus::new(pairings.len());
+    let status = tray::TrayStatus::tracking(known.counter());
     // 设置句柄：托盘改动后中枢立即读到新值，无需重启。
     let settings_handle = config::SettingsHandle::new(dir.clone(), settings.clone());
     let (hub, hub_thread) = hub::start_hub(
@@ -238,9 +252,6 @@ fn run_sync(
             settings: settings_handle.clone(),
         },
     );
-
-    // 已配对设备表。运行期可增补——从托盘完成配对后立即生效，无需重启。
-    let known = known_peers::KnownPeers::new(pairings.iter().cloned().map(Into::into).collect());
 
     // 网络上下文。
     let identity_for_tray = identity.clone();

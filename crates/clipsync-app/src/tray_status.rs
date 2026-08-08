@@ -2,9 +2,17 @@
 //!
 //! 中枢更新、托盘读取，两边通过这个共享句柄通信。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[path = "tray_text.rs"]
+mod text;
+
+pub(crate) use text::ellipsize_middle;
+use text::{bytes_pair, describe, fit_chars, TOOLTIP_MAX_CHARS};
+#[cfg(test)]
+use text::{NAME_HEAD, NAME_TAIL};
 
 /// 最后一次传输活动之后，图标还继续脉冲多久。
 ///
@@ -20,6 +28,20 @@ pub struct TransferProgress {
     /// 当前文件名。多文件时是正在传的那一个——逐个传，报总数反而看不出在动。
     pub name: String,
     pub done: u64,
+    pub total: u64,
+}
+
+/// 一批挂起待取的文件的摘要，供托盘展示。
+///
+/// 只带"画界面要用的东西"：真正的文件清单在中枢手里，托盘不需要，也不该
+/// 拿着一份会过期的副本。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingFetchInfo {
+    /// 来源设备 ID。托盘据此判断"对方在不在线"——不在线时点了取回只会石沉
+    /// 大海，不如当场说清楚。
+    pub from: String,
+    pub first_name: String,
+    pub count: usize,
     pub total: u64,
 }
 
@@ -55,21 +77,31 @@ fn transfer_is_recent(now_ms: u64, last_ms: u64) -> bool {
     last_ms != 0 && now_ms.saturating_sub(last_ms) < TRANSFER_LINGER.as_millis() as u64
 }
 
-/// 同步状态，供托盘展示。
+/// 同步状态的一份快照，供托盘展示。
+///
+/// 只读快照，没有"两个字段要记得一起改"的问题：`connected` 由在线集合的长度
+/// 导出，`paired` 现读设备表。要具体是哪几台在线，用
+/// [`connected_devices`](TrayStatus::connected_devices)。
 #[derive(Debug, Clone, Default)]
 pub struct StatusData {
     /// 当前已连接的对端数。
     pub connected: usize,
     /// 已配对设备总数。
     pub paired: usize,
-    /// 当前在线的设备 ID 集合，用于在设备列表里标出 ●/○。
-    pub connected_ids: std::collections::HashSet<String>,
 }
 
 /// 线程安全的状态句柄：中枢更新，托盘读取。
 #[derive(Clone)]
 pub struct TrayStatus {
-    data: Arc<Mutex<StatusData>>,
+    /// 当前在线的设备 ID 集合。台数由它的长度导出，不另存。
+    connected: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// 已配对台数。**不是自己存的一份**，而是 `KnownPeers` 那张表的台数句柄。
+    ///
+    /// 原先托盘自己存着这个数，由配对流程手工同步。可写那张表的地方有四处
+    /// （亲手配对、引荐认识、本机移出、对端广播移出），只有前两处记得回头通知
+    /// 托盘——实机上因此出现「已连接 2 / 1 台」：引荐来的设备连上了，分母却
+    /// 停在旧值。一个数有两个副本就迟早对不上，所以干脆只留一份。
+    paired: Arc<AtomicUsize>,
     paused: Arc<AtomicBool>,
     /// 同步中枢是否已停止工作（异常退出）。
     hub_dead: Arc<AtomicBool>,
@@ -77,6 +109,10 @@ pub struct TrayStatus {
     started: Arc<Instant>,
     /// 进行中的传输及其速度锚点。
     progress: Arc<Mutex<Option<ProgressState>>>,
+    /// 超过自动取回上限、等着用户点一下的那一批文件。
+    ///
+    /// 菜单项、图标角标、悬停提示三处都读它——一份来源，三处不会说不一样的话。
+    pending: Arc<Mutex<Option<PendingFetchInfo>>>,
     /// 最后一次文件分块收发距 `started` 的毫秒数；0 表示从未传输过。
     ///
     /// **用"最后活动时刻"而不是"进行中计数"**：计数要在收发两侧各处出口
@@ -87,18 +123,31 @@ pub struct TrayStatus {
 }
 
 impl TrayStatus {
-    pub fn new(paired: usize) -> Self {
+    /// 台数由外部（`KnownPeers`）持有的正路。
+    pub fn tracking(paired: Arc<AtomicUsize>) -> Self {
         Self {
-            data: Arc::new(Mutex::new(StatusData {
-                connected: 0,
-                paired,
-                connected_ids: std::collections::HashSet::new(),
-            })),
+            connected: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            paired,
             paused: Arc::new(AtomicBool::new(false)),
             hub_dead: Arc::new(AtomicBool::new(false)),
             started: Arc::new(Instant::now()),
             last_transfer: Arc::new(AtomicU64::new(0)),
             progress: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// 台数固定的独立实例，用于测试与无托盘模式。
+    pub fn new(paired: usize) -> Self {
+        Self {
+            connected: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            paired: Arc::new(AtomicUsize::new(paired)),
+            paused: Arc::new(AtomicBool::new(false)),
+            hub_dead: Arc::new(AtomicBool::new(false)),
+            started: Arc::new(Instant::now()),
+            last_transfer: Arc::new(AtomicU64::new(0)),
+            progress: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -144,6 +193,16 @@ impl TrayStatus {
         *self.progress.lock().unwrap() = None;
     }
 
+    /// 中枢更新待取项；`None` 表示没有。
+    pub fn set_pending(&self, p: Option<PendingFetchInfo>) {
+        *self.pending.lock().unwrap() = p;
+    }
+
+    /// 当前待取项。
+    pub fn pending(&self) -> Option<PendingFetchInfo> {
+        self.pending.lock().unwrap().clone()
+    }
+
     /// 进度文案，例如 `接收 video.mp4 42% · 8.3 MB/s`；没有传输时为 `None`。
     ///
     /// 与写进日志的是同一份文案（见 [`describe`]），托盘上看到什么、日志里
@@ -164,94 +223,6 @@ impl TrayStatus {
     }
 }
 
-/// 界面上文件名保留的头尾字符数：`前5…后5`。
-///
-/// 名字长到看不完时，真正有辨识度的就是开头和结尾——结尾还带着扩展名与
-/// 序号。中间那一大段（日期、参数、哈希）反而是最不需要看清的部分。
-/// 11 个字符（5+1+5）足够认出是哪个文件，也让托盘那行不至于抖。
-const NAME_HEAD: usize = 5;
-const NAME_TAIL: usize = 5;
-
-/// Windows 托盘提示的硬上限：`NOTIFYICONDATA.szTip` 是 64 个 UTF-16 单元
-/// （63 个字符 + 结尾的 0），超出部分被系统直接切掉，不换行也不省略。
-///
-/// 实机截图里正好断在第 64 个字符上，后半截连百分比都看不到。注意这个限制
-/// 数的是**字符数**（汉字也只算一个 UTF-16 单元），与菜单那行能占多宽是两回
-/// 事——这也是提示与菜单项必须分开生成的原因。
-const TOOLTIP_MAX_CHARS: usize = 63;
-
-/// 把字符串硬塞进 `max` 个字符，超了就尾部省略。
-///
-/// 最后一道保险。正常路径上文案已经短于上限，走到这里说明哪里算漏了——
-/// 宁可自己带个省略号，也别让系统在半截字上切一刀。
-fn fit_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
-}
-
-/// 从中间省略，保留固定的头尾。
-///
-/// 不按"总长度预算"分配头尾，而是写死 `前5…后5`：预算式分配会让名字长度
-/// 随剩余空间浮动，托盘那行的宽度跟着变，在换行临界点上就会一会儿一行、
-/// 一会儿两行地抖——实机上就是这个毛病。定长才稳。
-fn ellipsize_middle(s: &str) -> String {
-    let n = s.chars().count();
-    if n <= NAME_HEAD + 1 + NAME_TAIL {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(NAME_HEAD).collect();
-    let tail: String = s.chars().skip(n - NAME_TAIL).collect();
-    format!("{head}…{tail}")
-}
-
-/// `已传 / 总量`。单位相同就只写一次：`3.9 / 9.3 GiB` 比
-/// `3.9 GiB / 9.3 GiB` 短五列，也更好读——重复的单位不带任何信息。
-fn bytes_pair(done: u64, total: u64) -> String {
-    let d = crate::tray::human_bytes(done);
-    let t = crate::tray::human_bytes(total);
-    match (d.rsplit_once(' '), t.rsplit_once(' ')) {
-        (Some((dv, du)), Some((_, tu))) if du == tu => format!("{dv} / {t}"),
-        _ => format!("{d} / {t}"),
-    }
-}
-
-/// 把进度渲染成一行人话。托盘与日志共用同一套格式。
-///
-/// `shorten` 只影响文件名：托盘要一眼扫过、且 Windows 的托盘提示有硬上限，
-/// 太长会被系统直接切掉；日志要完整，那是事后排查唯一的凭据。
-fn describe(st: &ProgressState, shorten: bool) -> String {
-    {
-        let dir = if st.p.sending { "发送" } else { "接收" };
-        let name = if shorten {
-            ellipsize_middle(&st.p.name)
-        } else {
-            st.p.name.clone()
-        };
-        let pct = if st.p.total > 0 {
-            st.p.done.saturating_mul(100) / st.p.total
-        } else {
-            0
-        };
-
-        // 速度要等锚点之后确实有字节流过才显示。刚开头就报一个由极短时间
-        // 算出的数字，往往是个离谱的大值，反而不如不显示。
-        let moved = st.p.done.saturating_sub(st.since_bytes);
-        let secs = st.since.elapsed().as_secs_f64();
-        if moved > 0 && secs >= 0.5 {
-            let rate = (moved as f64 / secs) as u64;
-            format!(
-                "{dir} {name} {pct}%（{}，{}/s）",
-                bytes_pair(st.p.done, st.p.total),
-                crate::tray::human_bytes(rate)
-            )
-        } else {
-            format!("{dir} {name} {pct}%")
-        }
-    }
-}
-
 impl TrayStatus {
 
     /// 眼下是否正在传文件（据此让托盘图标脉冲、摘要报进度）。
@@ -262,28 +233,21 @@ impl TrayStatus {
         )
     }
 
-    /// 更新在线设备集合（同时刷新计数，避免两者脱节）。
+    /// 更新在线设备集合。
     pub fn set_connected_ids(&self, ids: std::collections::HashSet<String>) {
-        let mut g = self.data.lock().unwrap();
-        g.connected = ids.len();
-        g.connected_ids = ids;
+        *self.connected.lock().unwrap() = ids;
     }
 
     /// 当前在线的设备 ID。
     pub fn connected_devices(&self) -> std::collections::HashSet<String> {
-        self.data.lock().unwrap().connected_ids.clone()
-    }
-
-    /// 更新已配对设备总数。
-    ///
-    /// 配对可以在运行期从托盘发起，配完这个数就变了——不更新的话菜单首行
-    /// 会一直停在"尚未配对设备"，而同步其实已经在工作了。
-    pub fn set_paired(&self, n: usize) {
-        self.data.lock().unwrap().paired = n;
+        self.connected.lock().unwrap().clone()
     }
 
     pub fn snapshot(&self) -> StatusData {
-        self.data.lock().unwrap().clone()
+        StatusData {
+            connected: self.connected.lock().unwrap().len(),
+            paired: self.paired.load(Ordering::Acquire),
+        }
     }
 
     pub fn is_paused(&self) -> bool {
@@ -347,10 +311,22 @@ impl TrayStatus {
     /// **为什么去掉 `ClipSync — ` 前缀**：63 个字符的额度太紧，两行加起来最坏
     /// 要 55 个，前缀那 11 个字符会顶出去。而鼠标正悬在 ClipSync 的图标上，
     /// 本来也不必自报家门。空闲时字数宽裕，前缀就留着。
+    /// **待取项在空闲时才提**：传输中那两行已经把 63 个字符占满了，而且
+    /// 眼下正在动的那件事更值得看。等它传完，提示自然会退回空闲态并带上这一行。
     pub fn tooltip(&self) -> String {
         let text = match self.progress_tooltip() {
             Some(p) => p,
-            None => self.summary(),
+            None => {
+                let mut s = self.summary();
+                if let Some(p) = self.pending() {
+                    s.push_str(&format!(
+                        "\n{} 项待取回（{}）",
+                        p.count,
+                        crate::tray::human_bytes(p.total)
+                    ));
+                }
+                s
+            }
         };
         fit_chars(&text, TOOLTIP_MAX_CHARS)
     }
@@ -389,249 +365,5 @@ impl Default for TrayStatus {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn prog(name: &str, done: u64, total: u64) -> TransferProgress {
-        TransferProgress {
-            sending: false,
-            name: name.into(),
-            done,
-            total,
-        }
-    }
-
-    /// 传输中，摘要要报进度而不是"已连接 N 台"——这时用户最想知道的是到哪了。
-    #[test]
-    fn summary_reports_progress_while_transferring() {
-        let s = TrayStatus::new(2);
-        s.set_connected_ids(["a".to_string()].into_iter().collect());
-        assert!(s.summary().contains("已连接"));
-
-        s.note_transfer(prog("video.mp4", 42, 100));
-        let sum = s.summary();
-        assert!(sum.contains("接收"), "要说方向，实际 {sum}");
-        assert!(sum.contains("video.mp4"), "要说文件名，实际 {sum}");
-        assert!(sum.contains("42%"), "要说百分比，实际 {sum}");
-    }
-
-    /// 过期判定的边界。
-    #[test]
-    fn transfer_recency_boundaries() {
-        let w = TRANSFER_LINGER.as_millis() as u64;
-        assert!(!transfer_is_recent(0, 0), "从未传输过");
-        assert!(!transfer_is_recent(9_999, 0), "从未传输过，多久都不算");
-        assert!(transfer_is_recent(100, 100), "刚刚就是现在");
-        assert!(transfer_is_recent(100 + w - 1, 100), "窗口内");
-        assert!(!transfer_is_recent(100 + w, 100), "刚好到窗口边界即过期");
-        // 时钟不会倒流，但真倒了也不能 panic 或误判成"很久以前"。
-        assert!(transfer_is_recent(50, 100), "负差被 saturating 夹到 0");
-    }
-
-    /// 进度必须**自己过期**，不能依赖各处出口记得清。
-    ///
-    /// 传输的结束路径有一大把——传完、被新内容取代、对端 FileAbort、解压
-    /// 失败、写盘失败、连接断开——挨个补一句清理迟早会漏，漏了就是托盘上
-    /// 永远挂着一条"接收 42%"。
-    ///
-    /// 这条测试要真等一个 `TRANSFER_LINGER`（1.5 秒）。值：它验的是"摘要
-    /// 确实挂在 `is_transferring` 上"这个联动，而联动正是漏清理时唯一还能
-    /// 兜住的东西；边界算术已由上一条免费覆盖。
-    #[test]
-    fn progress_expires_without_anyone_clearing_it() {
-        let s = TrayStatus::new(1);
-        s.note_transfer(prog("big.zip", 1, 100));
-        assert!(s.summary().contains("big.zip"));
-
-        std::thread::sleep(TRANSFER_LINGER + Duration::from_millis(50));
-        let sum = s.summary();
-        assert!(!sum.contains("big.zip"), "过期后不该还挂着进度：{sum}");
-        assert!(sum.contains("未连接") || sum.contains("已连接") || sum.contains("尚未配对"));
-    }
-
-    /// 换文件要重新锚定速度，否则新文件的速率被上一个的平均值污染。
-    #[test]
-    fn switching_files_reanchors_the_rate() {
-        let s = TrayStatus::new(1);
-        s.note_transfer(prog("a.bin", 0, 1000));
-        s.note_transfer(prog("a.bin", 900, 1000));
-
-        s.note_transfer(prog("b.bin", 0, 1000));
-        let g = s.progress.lock().unwrap();
-        let st = g.as_ref().unwrap();
-        assert_eq!(st.since_bytes, 0, "新文件的速度锚点应从它自己的起点算");
-        assert_eq!(st.p.name, "b.bin");
-    }
-
-    /// 刚开头不报速度：由极短时间算出的数字往往离谱，不如不显示。
-    #[test]
-    fn rate_is_withheld_until_it_is_meaningful() {
-        let s = TrayStatus::new(1);
-        s.note_transfer(prog("x.bin", 500, 1000));
-        let sum = s.summary();
-        assert!(sum.contains("50%"));
-        assert!(!sum.contains("/s"), "刚开头不该报速度：{sum}");
-    }
-
-    /// 单位相同就只写一次——重复的单位不带信息，白占五列。
-    #[test]
-    fn byte_pairs_drop_the_repeated_unit() {
-        assert_eq!(bytes_pair(4 << 30, 9 << 30), "4 / 9 GiB");
-        // 单位不同就得都写全，否则读者会误以为同一量级。
-        let mixed = bytes_pair(151 << 20, 17 << 30);
-        assert!(mixed.contains("MiB") && mixed.contains("GiB"), "{mixed}");
-    }
-
-    /// 短名字原样保留，不该无端加省略号。
-    #[test]
-    fn short_names_pass_through() {
-        assert_eq!(ellipsize_middle("a.txt"), "a.txt");
-        assert_eq!(ellipsize_middle("报告.pdf"), "报告.pdf");
-        // 正好 5+1+5 也不截。
-        assert_eq!(ellipsize_middle("abcdeXfghij"), "abcdeXfghij");
-    }
-
-    /// 超长时固定取头 5 尾 5，**扩展名必须留着**。
-    #[test]
-    fn long_names_keep_five_at_each_end() {
-        let out = ellipsize_middle("2026年度第三季度产品发布会现场录像完整版第三部分.mp4");
-        assert_eq!(out, "2026年…分.mp4");
-        assert_eq!(out.chars().count(), 11);
-
-        let iso = ellipsize_middle("Ubuntu-24.04.1-desktop-amd64-live-server-installer.iso");
-        assert_eq!(iso, "Ubunt…r.iso");
-    }
-
-    /// 截断长度**不随剩余空间浮动**。
-    ///
-    /// 回归自实机观感："有时候换行有时候不换行"。若按剩余预算分配头尾，
-    /// 速率位数一变（9.8 ↔ 123.4 MiB/s）名字长度就跟着变，总宽在折行临界点
-    /// 上下抖，提示一会儿一行一会儿两行。
-    #[test]
-    fn name_length_is_fixed_regardless_of_context() {
-        let long = "IMG_20260807_143052_HDR_Portrait_Enhanced_Final_v3.heic";
-        let a = ellipsize_middle(long);
-        let b = ellipsize_middle(long);
-        assert_eq!(a, b);
-        assert_eq!(a.chars().count(), NAME_HEAD + 1 + NAME_TAIL);
-    }
-
-    /// 托盘提示**任何情况下**都不能超过 63 个字符。
-    ///
-    /// 回归自实机截图：文案在第 64 个字符上被系统一刀切断，后半截连百分比
-    /// 都看不到。上一轮只截了文件名，可固定部分（`ClipSync — 接收 ` 加上
-    /// 绝对字节数与速率）本身就占掉五十来个，光截名字不够。
-    #[test]
-    fn tooltip_never_exceeds_the_windows_limit() {
-        let cases: [(&str, u64, u64); 4] = [
-            ("sha256-1194192cf2b8e4a09d7c3f5061e2a78863006a.tar.zst", 159_000_000, 18_500_000_000),
-            ("这是一个特别特别特别特别长的中文文件名用来测试截断.mkv", 1, 100),
-            ("a.txt", 50, 100),
-            (&"x".repeat(300), 1, 2),
-        ];
-        for (name, done, total) in cases {
-            let s = TrayStatus::new(3);
-            s.set_connected_ids(["a".into(), "b".into()].into_iter().collect());
-            s.note_transfer(TransferProgress {
-                sending: false,
-                name: name.into(),
-                done,
-                total,
-            });
-            // 走一遍会显示速率的分支：预算是倒推出来的，速率位数变化不该把
-            // 总长顶出去。
-            std::thread::sleep(std::time::Duration::from_millis(600));
-            s.note_transfer(TransferProgress {
-                sending: false,
-                name: name.into(),
-                done: done + 12_345_678,
-                total,
-            });
-
-            let tip = s.tooltip();
-            let n = tip.chars().count();
-            assert!(n <= 63, "提示 {n} 字符，超了：{tip}");
-            assert!(tip.contains('%'), "百分比不能被挤掉：{tip}");
-
-            // 固定两行：自己换行才不会随宽度抖。
-            let lines: Vec<&str> = tip.split('\n').collect();
-            assert_eq!(lines.len(), 2, "传输中的提示应恒为两行：{tip:?}");
-            assert!(lines[0].contains('%'), "第一行给方向、名字、进度：{tip:?}");
-            assert!(lines[1].contains('/'), "第二行给已传/总量：{tip:?}");
-            // 任一行都不该长到被系统再折一次。
-            for l in &lines {
-                assert!(l.chars().count() <= 40, "行太长会被再折一次：{l}");
-            }
-        }
-    }
-
-    /// 没有传输时提示也得守住上限（设备名可以很长）。
-    #[test]
-    fn idle_tooltip_also_fits() {
-        let s = TrayStatus::new(9);
-        assert!(s.tooltip().chars().count() <= 63);
-        s.set_connected_ids((0..9).map(|i| i.to_string()).collect());
-        assert!(s.tooltip().chars().count() <= 63);
-    }
-
-    /// 菜单与提示都要给出绝对字节数——只看百分比不知道还剩多少。
-    #[test]
-    fn menu_summary_keeps_the_absolute_bytes() {
-        let s = TrayStatus::new(1);
-        s.note_transfer(TransferProgress {
-            sending: false,
-            name: "video.mkv".into(),
-            done: 0,
-            total: 17_300_000_000,
-        });
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        s.note_transfer(TransferProgress {
-            sending: false,
-            name: "video.mkv".into(),
-            done: 151_800_000,
-            total: 17_300_000_000,
-        });
-        let sum = s.summary();
-        assert!(sum.contains("GiB") || sum.contains("MiB"), "菜单里该有字节数：{sum}");
-        // 提示里也要有已传/总量——只看百分比不知道还剩多少。
-        let tip = s.tooltip();
-        assert!(tip.contains(" / "), "提示第二行该给出已传/总量：{tip}");
-    }
-
-    /// 人工核对截断效果。
-    #[test]
-    #[ignore = "只为肉眼看效果"]
-    fn manual_show_truncation() {
-        for name in [
-            "report.pdf",
-            "2026年度第三季度产品发布会现场录像完整版第三部分.mp4",
-            "Ubuntu-24.04.1-desktop-amd64-live-server-installer.iso",
-            "会议纪要.docx",
-            "IMG_20260807_143052_HDR_Portrait_Enhanced_Final_v3.heic",
-            "备份-王信的Mac mini-2026-08-07-完整系统镜像.dmg",
-        ] {
-            let s = TrayStatus::new(1);
-            s.note_transfer(TransferProgress {
-                sending: false,
-                name: name.into(),
-                done: 4_200_000_000,
-                total: 10_000_000_000,
-            });
-            // 走到会显示速率的分支——那才是传输中的常态，文案也最长。
-            std::thread::sleep(std::time::Duration::from_millis(600));
-            s.note_transfer(TransferProgress {
-                sending: false,
-                name: name.into(),
-                done: 4_230_000_000,
-                total: 10_000_000_000,
-            });
-            println!("原名 {name}");
-            println!("  菜单 {}", s.summary());
-            let tip = s.tooltip();
-            for (i, l) in tip.split('\n').enumerate() {
-                println!("  提示{} {l}", i + 1);
-            }
-            println!("       [共 {} 字符]", tip.chars().count());
-        }
-    }
-}
+#[path = "tray_status_tests.rs"]
+mod tests;

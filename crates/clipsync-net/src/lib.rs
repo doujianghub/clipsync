@@ -10,12 +10,14 @@
 //! M0 阶段提供类型与接口定义；重实现（tokio/snow/mdns-sd/spake2）在
 //! 对应里程碑填充并核实依赖版本。
 
+pub mod compress;
 pub mod crypto;
 pub mod discovery;
 pub mod local;
 pub mod pairing;
 pub mod pairing_handshake;
 pub mod peer;
+pub mod sockopt;
 pub mod transport;
 pub mod wire;
 

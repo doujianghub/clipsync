@@ -49,10 +49,60 @@ pub fn confirm(title: &str, body: &str) -> bool {
     }
 }
 
+/// 信息框 + 一个动作按钮，返回用户是否按了那个动作。
+///
+/// 与 [`confirm`] 的区别在语气与默认值：这里正文本身是要给人看的内容
+/// （配对码），动作按钮是顺手提供的一条岔路，默认按钮仍是「好」。confirm 是
+/// "你确定要毁掉它吗"，默认落在取消。
+///
+/// 弹不出窗时返回 `false`——没能显示按钮就等于没人按过它。
+pub fn ask_action(title: &str, body: &str, action: &str) -> bool {
+    match platform::ask_action(title, body, action) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("弹窗失败（内容仍见于日志/终端）: {e:#}");
+            false
+        }
+    }
+}
+
+/// 系统拒绝读取文件时，**当场**告诉用户一次。
+///
+/// **为什么非说不可**：这类失败的默认表现是"什么都没发生"，甚至更坏——本机
+/// 以为同步成功了，对端却因为拿不到内容而保持原样，用户在那边一粘贴出来的是
+/// 上一次复制的东西。两边都没提示，现象像是"同步串台了"，谁也想不到根因是
+/// 一个权限开关。只记日志等于没说：托盘程序的用户不会去翻日志。
+///
+/// **为什么只说一次**：授权是一次性的事，说清就够了。用户若选择不理会（比如
+/// 他就是不想让程序读那个目录），此后每复制一次都弹一遍才真是骚扰。重启程序
+/// 后可以再说一次——那多半意味着他改过设置、正在重新试。
+///
+/// 弹窗会阻塞到用户点掉，所以一律另起线程：调用方多半是剪贴板监听线程或收发
+/// 泵，占住任何一个都会让同步整体停摆，比原本的问题严重得多。
+pub fn permission_hint_once(what: &std::path::Path, reason: &str, where_to_fix: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static TOLD: AtomicBool = AtomicBool::new(false);
+
+    if TOLD.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let name = what
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| what.display().to_string());
+    let body = format!(
+        "系统不允许 ClipSync 读取「{name}」，这次复制没能同步过去。\n\n\
+         {reason}。\n\n\
+         去「{where_to_fix}」里把 ClipSync 打开即可。\n\n\
+         这句提示每次运行只出现一次；用 `clipsync clipdiag` 可逐条查看。"
+    );
+    std::thread::spawn(move || show_info("ClipSync 无法读取文件", &body));
+}
+
 /// 弹出一个列表让用户点选，返回选中项的下标。
 ///
 /// **为什么设置项优先用它而不是输入框**：选常用值这件事，点一下本来就比
-/// 打字省事。菜单里只留一行（`单次上限：100 MiB…`）保持清爽，把选择放进
+/// 打字省事。菜单里只留一行（`自动取回：100 MiB…`）保持清爽，把选择放进
 /// 点击后的对话框——两头都不牺牲。
 ///
 /// 列表末尾通常留一个「自定义…」，选中它再走 [`prompt`]。
@@ -129,7 +179,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let r = super::choose("单次上限", "当前：100 MiB", &items);
+        let r = super::choose("自动取回上限", "当前：100 MiB", &items);
         println!("RESULT={r:?}");
     }
 
