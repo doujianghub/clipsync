@@ -56,7 +56,7 @@ jobs:
       # 这一步把"为什么不通"记录下来——否则那句跳过就只是一个无从查证的
       # 断言。走 ::warning:: 是因为注解能被匿名 API 读到，原始日志不能。
       - name: Multicast capability (diagnostic)
-        if: always()
+        if: failure()
         continue-on-error: true
         shell: bash
         run: |
