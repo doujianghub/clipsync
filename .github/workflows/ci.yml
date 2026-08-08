@@ -47,18 +47,32 @@ jobs:
           set -o pipefail
           cargo test --workspace 2>&1 | tee test-output.txt
 
+      # 失败原因同时走两条路：
+      #   - job summary：网页上看着方便；
+      #   - ::error:: 注解：会进 check-run 的 annotations，**匿名 API 也读得到**。
+      # 后者才是关键——Actions 的原始日志要登录才能下载，排查时拿不到具体
+      # 断言，只能看到一句 "Process completed with exit code 101"。
       - name: Surface test failures
         if: failure()
         shell: bash
         run: |
+          detail=$(grep -E "^(test .* FAILED|failures:|thread .* panicked|assertion|  left:|  right:|---- .* stdout ----)" \
+                     test-output.txt | head -40)
+          [ -z "$detail" ] && detail=$(tail -40 test-output.txt)
+
           {
             echo "### ❌ ${{ matrix.name }} 测试失败"
             echo
             echo '```'
-            grep -E "^(test .*FAILED|failures:|---- .* stdout ----|thread .* panicked|assertion)" -A4 test-output.txt | head -80 \
-              || tail -60 test-output.txt
+            echo "$detail"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # 注解是单行的，换行要编码成 %0A。
+          encoded="${detail//'%'/%25}"
+          encoded="${encoded//$'\r'/}"
+          encoded="${encoded//$'\n'/%0A}"
+          echo "::error title=${{ matrix.name }} 测试失败::$encoded"
 
   lint:
     name: Format and lint
