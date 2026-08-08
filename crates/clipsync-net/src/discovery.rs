@@ -504,6 +504,45 @@ mod loopback_smoke {
         );
     }
 
+    /// 这台机器现在能不能**自发自收**组播。
+    ///
+    /// CI runner（实测 GitHub 的 macOS runner）的网络沙箱里，组播组加得进去、
+    /// 包却回不来。所以判据必须是真的发一份再收一份——只看 `join_multicast_v4`
+    /// 是否成功会误判成"可用"，测试照样红。
+    ///
+    /// 用另一个端口探测，免得和真实信标端口上的监听者互相干扰。
+    fn multicast_loopback_works() -> bool {
+        const PROBE_PORT: u16 = 47_699;
+        const MAGIC: &[u8] = b"clipsync-multicast-probe";
+
+        let Ok(rx) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, PROBE_PORT)) else {
+            return false;
+        };
+        if join_multicast_on_all_ifaces(&rx) == 0 {
+            return false;
+        }
+        if rx
+            .set_read_timeout(Some(Duration::from_millis(800)))
+            .is_err()
+        {
+            return false;
+        }
+
+        let Ok(tx) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+            return false;
+        };
+        let _ = tx.set_multicast_loop_v4(true);
+        if tx
+            .send_to(MAGIC, SocketAddr::new(IpAddr::V4(BEACON_GROUP), PROBE_PORT))
+            .is_err()
+        {
+            return false;
+        }
+
+        let mut buf = [0u8; 64];
+        matches!(rx.recv_from(&mut buf), Ok((n, _)) if &buf[..n] == MAGIC)
+    }
+
     /// 同机自发自收：宣告线程发出的配对信标，发现函数必须收得到，
     /// 且**多网卡来的多份必须算作一台设备**。
     ///
@@ -517,8 +556,16 @@ mod loopback_smoke {
     /// 和覆盖网口各发一份就成了"两台设备在等待配对"，调用方直接报错退出。
     /// 当时这个测试只断言"能找到"，于是绿着放过了；同机 e2e 一跑才露馅。
     /// 教训是断言要覆盖**调用方真正依赖的性质**，而不只是"有结果"。
+
     #[test]
     fn pairing_beacon_reaches_a_local_listener_as_one_host() {
+        // 没有组播就没有可测的东西——这里跳过而不是失败。失败会把"环境没有
+        // 这个能力"报成"功能坏了"，两者需要区分开：本机与 Windows runner 上
+        // 它照常运行，真的回归了仍然抓得住。
+        if !multicast_loopback_works() {
+            eprintln!("跳过：本机网络不支持组播回环（CI 沙箱常见）");
+            return;
+        }
         let _ann = spawn_pairing_announcer("测试机".into(), 47_685).expect("启动宣告失败");
         let hosts = discover_pairing_hosts(Duration::from_secs(4)).expect("发现失败");
 
