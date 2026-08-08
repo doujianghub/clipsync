@@ -9,6 +9,7 @@
 //! 二者对称调用 `clipsync_net::pairing_handshake::run_pairing`。配对端口与同步
 //! 端口分开，避免与常规同步连接混淆。M3 起可用 mDNS 免去手填 IP。
 
+use clipsync_core::{tf, tprintln};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -232,10 +233,13 @@ pub fn host(
     on_code(code.as_str(), deadline);
 
     println!();
-    println!("  配对码： {}", code);
+    tprintln!("  配对码： {}", "  Pairing code: {}", code);
     println!();
     if announcing {
-        println!("  在另一台设备上运行（同一局域网内，无需输入 IP）：");
+        tprintln!(
+            "  在另一台设备上运行（同一局域网内，无需输入 IP）：",
+            "  On the other machine run (same LAN, no IP needed):"
+        );
         println!("      clipsync pair {}", code);
         println!();
     }
@@ -257,7 +261,11 @@ pub fn host(
                 HOST_SESSION_TIMEOUT.as_secs()
             );
         };
-        println!("  对方已连接：{addr}，正在协商…");
+        tprintln!(
+            "  对方已连接：{}，正在协商…",
+            "  Peer connected: {}, negotiating…",
+            addr
+        );
 
         // 握手本身也要有超时，否则一个连上就不说话的对端能把会话挂死，
         // 端口又回到"占着不放"的老问题上。
@@ -268,7 +276,12 @@ pub fn host(
         match run_pairing(&mut stream, &code, &local) {
             Ok(record) => {
                 config::upsert_pairing(dir, record.clone())?;
-                println!("  ✓ 配对成功：{} ({})", record.name, record.device);
+                tprintln!(
+                    "  ✓ 配对成功：{} ({})",
+                    "  ✓ Paired: {} ({})",
+                    record.name,
+                    record.device
+                );
                 print_learned_addrs(&record);
                 return Ok(record);
             }
@@ -279,7 +292,7 @@ pub fn host(
                     continue;
                 }
                 failures += 1;
-                println!("  ✗ 配对码不对：{e:#}");
+                tprintln!("  ✗ 配对码不对：{e:#}", "  ✗ Wrong pairing code: {e:#}");
                 if failures >= MAX_FAILED_ATTEMPTS {
                     anyhow::bail!(
                         "配对码连错 {failures} 次，已结束本次配对以防猜测；\
@@ -334,7 +347,10 @@ fn print_manual_hint(code: &PairingCode, sync_port: u16) {
     if addrs.is_empty() {
         return;
     }
-    println!("  若两台设备不在同一局域网，在对方设备上运行：");
+    tprintln!(
+        "  若两台设备不在同一局域网，在对方设备上运行：",
+        "  If they are not on the same LAN, run this on the other machine:"
+    );
     for sa in &addrs {
         println!("      clipsync pair {} {}", fmt_host(sa), code);
     }
@@ -362,17 +378,29 @@ fn fmt_host(sa: &std::net::SocketAddr) -> String {
 /// 取不到系统时钟时退回说总时长——那仍然是真话，只是粗一些。
 pub fn code_dialog_body(code: &str, sync_port: u16, expires_in: Duration) -> String {
     let validity = match crate::wallclock::hms_after(expires_in) {
-        Some(at) => format!("有效至 {at}"),
-        None => format!("{} 分钟内有效", HOST_SESSION_TIMEOUT.as_secs() / 60),
+        Some(at) => tf!("有效至 {}", "valid until {}", at),
+        None => tf!(
+            "{} 分钟内有效",
+            "valid for {} minutes",
+            HOST_SESSION_TIMEOUT.as_secs() / 60
+        ),
     };
-    let mut s = format!(
-        "配对码  {code}\n\n\
+    let mut s = tf!(
+        "配对码  {}\n\n\
          在对方设备上选「输入配对码…」，输入这四位。\n\
-         {validity}，配对成功即失效。"
+         {}，配对成功即失效。",
+        "Pairing code  {}\n\n\
+         On the other machine choose \"Enter pairing code…\" and type these four \
+         digits.\n\
+         This code is {} and stops working once pairing succeeds.",
+        code,
+        validity
     );
     if let Some(block) = addr_block(sync_port) {
-        s.push_str(&format!(
-            "\n\n若对方提示需要地址，挑一个与它同网段的：\n{block}"
+        s.push_str(&tf!(
+            "\n\n若对方提示需要地址，挑一个与它同网段的：\n{}",
+            "\n\nIf it asks for an address, pick the one on its subnet:\n{}",
+            block
         ));
     }
     s
@@ -413,7 +441,7 @@ pub fn join(
 pub fn connect_hosts(host_ip: Option<&str>) -> Result<Vec<TcpStream>> {
     if let Some(ip) = host_ip {
         let addr = format!("{ip}:{PAIRING_PORT}");
-        println!("  正在连接 {addr} …");
+        tprintln!("  正在连接 {addr} …", "  Connecting to {addr}…");
         let s = TcpStream::connect(&addr).with_context(|| format!("连接 {addr} 失败"))?;
         return Ok(vec![s]);
     }
@@ -422,7 +450,11 @@ pub fn connect_hosts(host_ip: Option<&str>) -> Result<Vec<TcpStream>> {
     // 服务，而且一台主机会给出多个地址（逐网卡宣告），挨个连才知道哪条通。
     match discover_host() {
         Ok(addrs) => {
-            println!("  正在连接 {} 个组播发现的地址…", addrs.len());
+            tprintln!(
+                "  正在连接 {} 个组播发现的地址…",
+                "  Connecting to {} address(es) found via multicast…",
+                addrs.len()
+            );
             let found = crate::host_probe::probe_candidates(addrs);
             if !found.is_empty() {
                 return Ok(found.into_iter().map(|(_, s)| s).collect());
@@ -432,7 +464,7 @@ pub fn connect_hosts(host_ip: Option<&str>) -> Result<Vec<TcpStream>> {
         Err(e) => debug!("局域网组播未发现主持方，改为主动探测: {e:#}"),
     }
 
-    println!("  正在探测可达设备…");
+    tprintln!("  正在探测可达设备…", "  Probing for reachable devices…");
     let found = crate::host_probe::find_hosts(PAIRING_PORT);
     if found.is_empty() {
         anyhow::bail!(
@@ -456,12 +488,17 @@ pub fn join_on(
     let code =
         PairingCode::parse(code_str).with_context(|| format!("配对码格式非法: {code_str}"))?;
 
-    println!("  已连接，正在协商…");
+    tprintln!("  已连接，正在协商…", "  Connected, negotiating…");
     let local = local_info(identity, device_name, sync_port);
     let record = run_pairing(stream, &code, &local).context("配对握手失败")?;
 
     config::upsert_pairing(dir, record.clone())?;
-    println!("  ✓ 配对成功：{} ({})", record.name, record.device);
+    tprintln!(
+        "  ✓ 配对成功：{} ({})",
+        "  ✓ Paired: {} ({})",
+        record.name,
+        record.device
+    );
     print_learned_addrs(&record);
     Ok(record)
 }
@@ -473,7 +510,10 @@ pub fn join_on(
 fn discover_host() -> Result<Vec<std::net::SocketAddr>> {
     use clipsync_net::discovery::discover_pairing_hosts;
 
-    println!("  正在局域网中查找等待配对的设备…");
+    tprintln!(
+        "  正在局域网中查找等待配对的设备…",
+        "  Looking for a device waiting to pair…"
+    );
     let hosts =
         discover_pairing_hosts(std::time::Duration::from_secs(2)).context("局域网配对发现失败")?;
 
@@ -485,7 +525,12 @@ fn discover_host() -> Result<Vec<std::net::SocketAddr>> {
         ),
         1 => {
             let h = &hosts[0];
-            println!("  找到设备：{}（{} 个地址）", h.device_name, h.addrs.len());
+            tprintln!(
+                "  找到设备：{}（{} 个地址）",
+                "  Found: {} ({} address(es))",
+                h.device_name,
+                h.addrs.len()
+            );
             Ok(h.addrs.clone())
         }
         _ => {
@@ -511,7 +556,11 @@ fn print_learned_addrs(record: &clipsync_net::pairing::PairingRecord) {
     if record.addrs.is_empty() {
         return;
     }
-    println!("  已记录对方 {} 个可达地址：", record.addrs.len());
+    tprintln!(
+        "  已记录对方 {} 个可达地址：",
+        "  Recorded {} reachable address(es):",
+        record.addrs.len()
+    );
     for a in &record.addrs {
         println!("      {a}");
     }

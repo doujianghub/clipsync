@@ -11,6 +11,7 @@
 //!   - [`join`]——「输入配对码…」那一侧的交互。
 
 use anyhow::Result;
+use clipsync_core::{t, tf};
 use clipsync_net::peer::AddrSource;
 use tracing::{info, warn};
 
@@ -160,11 +161,15 @@ pub(crate) fn remove_peer_interactive(pairing: &PairingDeps, device_id: &str) {
     // 说清这是**全组**操作。只写"本机不再同步"会让人以为别人那边还留着，
     // 而实际上其它设备也会一起把它删掉。
     if !dialog::confirm(
-        "移出设备组",
-        &format!(
+        t!("移出设备组", "Remove from group"),
+        &tf!(
             "确定把「{name}」移出设备组吗？\n\n\
              组里所有设备都会移除它，它自己也会清空配对。\n\
-             想加回来的话，重新配对一次即可。"
+             想加回来的话，重新配对一次即可。",
+            "Remove \"{name}\" from the device group?\n\n\
+             Every device in the group will drop it, and it will clear its own \
+             pairings too.\n\
+             To bring it back, just pair again."
         ),
     ) {
         return;
@@ -173,12 +178,18 @@ pub(crate) fn remove_peer_interactive(pairing: &PairingDeps, device_id: &str) {
     match pairing.remove_peer(device_id) {
         Ok(Some(name)) => {
             info!("已把 {name} 移出设备组");
-            dialog::show_info("ClipSync", &format!("已把「{name}」移出设备组。"));
+            dialog::show_info(
+                "ClipSync",
+                &tf!(
+                    "已把「{name}」移出设备组。",
+                    "\"{name}\" has been removed from the device group."
+                ),
+            );
         }
         Ok(None) => info!("设备 {device_id} 已不在配对列表中，无需移出"),
         Err(e) => {
             warn!("移出设备失败: {e:#}");
-            dialog::show_info("ClipSync", &format!("移出失败：{e}"));
+            dialog::show_info("ClipSync", &tf!("移出失败：{e}", "Removal failed: {e}"));
         }
     }
 }
@@ -187,16 +198,26 @@ pub(crate) fn remove_peer_interactive(pairing: &PairingDeps, device_id: &str) {
 pub(crate) fn leave_group_interactive(pairing: &PairingDeps) {
     let count = pairing.known.len();
     if count == 0 {
-        dialog::show_info("ClipSync", "本机尚未配对任何设备。");
+        dialog::show_info(
+            "ClipSync",
+            t!(
+                "本机尚未配对任何设备。",
+                "This device is not paired with anything yet."
+            ),
+        );
         return;
     }
 
     if !dialog::confirm(
-        "退出设备组",
-        &format!(
+        t!("退出设备组", "Leave device group"),
+        &tf!(
             "确定退出设备组吗？\n\n\
              本机将清空全部 {count} 台配对，其它设备也会移除本机。\n\
-             想回来的话，重新配对一次即可。"
+             想回来的话，重新配对一次即可。",
+            "Leave the device group?\n\n\
+             This machine will clear all {count} pairing(s), and the other \
+             devices will drop it too.\n\
+             To come back, just pair again."
         ),
     ) {
         return;
@@ -205,11 +226,11 @@ pub(crate) fn leave_group_interactive(pairing: &PairingDeps) {
     match pairing.leave_group() {
         Ok(n) => {
             info!("已退出设备组，清空 {n} 台配对");
-            dialog::show_info("ClipSync", "已退出设备组。");
+            dialog::show_info("ClipSync", t!("已退出设备组。", "Left the device group."));
         }
         Err(e) => {
             warn!("退出设备组失败: {e:#}");
-            dialog::show_info("ClipSync", &format!("退出失败：{e}"));
+            dialog::show_info("ClipSync", &tf!("退出失败：{e}", "Failed to leave: {e}"));
         }
     }
 }
@@ -263,7 +284,11 @@ pub(crate) fn host_pairing_interactive(
                 );
                 let code = code.to_string();
                 std::thread::spawn(move || {
-                    if dialog::ask_action("ClipSync 配对", &body, new_code_label()) {
+                    if dialog::ask_action(
+                        t!("ClipSync 配对", "ClipSync pairing"),
+                        &body,
+                        new_code_label(),
+                    ) {
                         request_new_code(&slot_for_dialog, Some(&code));
                     }
                 });
@@ -275,8 +300,12 @@ pub(crate) fn host_pairing_interactive(
             Ok(record) => {
                 pairing.register(&record);
                 dialog::show_info(
-                    "ClipSync 配对成功",
-                    &format!("已与「{}」配对，现在可以互相同步了。", record.name),
+                    t!("ClipSync 配对成功", "ClipSync paired"),
+                    &tf!(
+                        "已与「{}」配对，现在可以互相同步了。",
+                        "Paired with \"{}\". You can now sync between them.",
+                        record.name
+                    ),
                 );
                 return;
             }
@@ -287,7 +316,10 @@ pub(crate) fn host_pairing_interactive(
             }
             Err(e) => {
                 warn!("配对失败: {e:#}");
-                dialog::show_info("ClipSync 配对失败", &format!("{e:#}"));
+                dialog::show_info(
+                    t!("ClipSync 配对失败", "ClipSync pairing failed"),
+                    &format!("{e:#}"),
+                );
                 return;
             }
         }
@@ -307,11 +339,21 @@ pub(crate) fn new_code_label() -> &'static str {
 /// 就少一个选项。
 fn show_code_dialog(slot: &PairingHostSlot, sync_port: u16) {
     let Some(live) = slot.live() else {
-        dialog::show_info("ClipSync 配对", "配对会话正在启动，请稍候再看。");
+        dialog::show_info(
+            t!("ClipSync 配对", "ClipSync pairing"),
+            t!(
+                "配对会话正在启动，请稍候再看。",
+                "The pairing session is starting; check again in a moment."
+            ),
+        );
         return;
     };
     let body = pairing_cli::code_dialog_body(&live.code, sync_port, live.remaining);
-    if dialog::ask_action("ClipSync 配对", &body, new_code_label()) {
+    if dialog::ask_action(
+        t!("ClipSync 配对", "ClipSync pairing"),
+        &body,
+        new_code_label(),
+    ) {
         request_new_code(slot, Some(&live.code));
     }
 }
@@ -326,8 +368,11 @@ fn request_new_code(slot: &PairingHostSlot, only_if: Option<&str>) {
     }
     info!("「{}」落空：对应的配对会话已经结束", new_code_label());
     dialog::show_info(
-        "ClipSync 配对",
-        "这个配对码已经失效了。\n\n请在托盘菜单里重新选「显示配对码…」。",
+        t!("ClipSync 配对", "ClipSync pairing"),
+        t!(
+            "这个配对码已经失效了。\n\n请在托盘菜单里重新选「显示配对码…」。",
+            "This pairing code has expired.\n\nPick \"Show pairing code…\" from the tray menu again."
+        ),
     );
 }
 

@@ -29,11 +29,11 @@ and macOS** — and without an Apple ID, an account of any kind, or a cloud
 service in the middle.
 
 > [!NOTE]
-> **The application interface is currently Chinese-only.** Menus, dialogs, and
-> log messages are in Simplified Chinese. Everything works identically
-> regardless of your system language, but you will be reading Chinese labels.
-> Localisation is on the roadmap; this documentation is in English so you can
-> evaluate, build, and contribute to the project in the meantime.
+> **The interface is available in English and Simplified Chinese**, following
+> your system language by default. Change it any time under *Advanced →
+> Language*; it applies immediately without a restart. Log messages remain in
+> Chinese — they are diagnostic output rather than interface text, and keeping
+> them in one language makes bug reports comparable across users.
 
 ## Use cases
 
@@ -85,6 +85,8 @@ integrity verification, and no size limit beyond what you configure.
   traffic on macOS so they yield to screen sharing and video calls.
 - **Respects sensitive content.** Clipboard entries marked confidential by
   password managers are skipped automatically.
+- **English and Chinese interface.** Follows your system language, switchable
+  from the tray without restarting.
 
 ## How it compares
 
@@ -153,10 +155,9 @@ scripts/package-macos.sh --universal --dmg  # also build a .dmg
 ## Quick start
 
 1. Launch ClipSync on both machines. A tray icon appears.
-2. On machine A: tray menu → **显示配对码… / Show pairing code**. A 4-digit code
-   appears with a live countdown.
-3. On machine B: tray menu → **输入配对码… / Enter pairing code**. Type those
-   four digits.
+2. On machine A: tray menu → **Show pairing code…**. A 4-digit code appears
+   with a live countdown.
+3. On machine B: tray menu → **Enter pairing code…**. Type those four digits.
 4. Done. Copy something on either machine.
 
 You never type an IP address — machine B finds machine A on its own. The code is
@@ -330,8 +331,8 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 ## Troubleshooting
 
 Logs live at `logs/clipsync.log` in the config directory (4 MB rotating, one
-generation kept). Enable **详细日志 / Verbose logging** in the tray for
-debug-level detail — it takes effect without restarting.
+generation kept). Enable **Verbose logging** in the tray for debug-level
+detail — it takes effect without restarting.
 
 Useful signals in the log:
 
@@ -347,10 +348,9 @@ Useful signals in the log:
 
 ## Known limitations
 
-- **The interface is Chinese-only.** Roughly 450 user-facing strings — tray
-  menu, dialogs, error messages, and CLI output — are currently hard-coded in
-  Simplified Chinese. Localisation is planned but not scheduled; contributions
-  are welcome.
+- **Log messages are Chinese-only.** The interface is fully localised, but log
+  output is not. This is deliberate: logs are diagnostic, and one language keeps
+  bug reports comparable. Say so in an issue if it gets in your way.
 - **Linux is not supported.** The code compiles, but clipboard change detection,
   dialogs, and launch-at-login are all no-ops, which makes it non-functional
   rather than merely degraded.

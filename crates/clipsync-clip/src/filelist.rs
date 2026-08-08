@@ -63,34 +63,64 @@ pub fn explain_denied(path: &Path) -> Denied {
 
     if under("Library/Containers") || under("Library/Group Containers") {
         return Denied {
-            reason: "这是另一个 App 的私有数据目录（微信、QQ 这类把收到的文件存在自己容器里）",
+            reason: clipsync_core::t!(
+                "这是另一个 App 的私有数据目录（微信、QQ 这类把收到的文件存在自己容器里）",
+                "this is another app's private container (WeChat, QQ and the like keep received files there)"
+            ),
             // 实机截图确认过：这类授权出现在「文件与文件夹」里 ClipSync 名下，
             // 与「桌面」「下载」并列，条目名就是那个 App（如「微信」）。
             // 不是「App 管理」——那一项管的是"修改其它 App"，另一回事。
-            where_to_fix: "系统设置 › 隐私与安全性 › 文件与文件夹 › ClipSync",
+            where_to_fix: clipsync_core::t!(
+                "系统设置 › 隐私与安全性 › 文件与文件夹 › ClipSync",
+                "System Settings › Privacy & Security › Files and Folders › ClipSync"
+            ),
         };
     }
     for (dir, label) in [
-        ("Desktop", "「桌面」文件夹"),
-        ("Documents", "「文稿」文件夹"),
-        ("Downloads", "「下载」文件夹"),
+        (
+            "Desktop",
+            clipsync_core::t!("「桌面」文件夹", "the Desktop folder"),
+        ),
+        (
+            "Documents",
+            clipsync_core::t!("「文稿」文件夹", "the Documents folder"),
+        ),
+        (
+            "Downloads",
+            clipsync_core::t!("「下载」文件夹", "the Downloads folder"),
+        ),
     ] {
         if under(dir) {
             return Denied {
                 reason: label,
-                where_to_fix: "系统设置 › 隐私与安全性 › 文件与文件夹",
+                where_to_fix: clipsync_core::t!(
+                    "系统设置 › 隐私与安全性 › 文件与文件夹",
+                    "System Settings › Privacy & Security › Files and Folders"
+                ),
             };
         }
     }
     if p.starts_with("/Volumes/") {
         return Denied {
-            reason: "这是外置磁盘或网络卷",
-            where_to_fix: "系统设置 › 隐私与安全性 › 可移除卷宗／网络卷宗",
+            reason: clipsync_core::t!(
+                "这是外置磁盘或网络卷",
+                "this is a removable or network volume"
+            ),
+            where_to_fix: clipsync_core::t!(
+                "系统设置 › 隐私与安全性 › 可移除卷宗／网络卷宗",
+                "System Settings › Privacy & Security › Removable Volumes / Network Volumes"
+            ),
         };
     }
     Denied {
-        reason: "系统拒绝了访问，但路径不属于已知的几类受保护位置",
-        where_to_fix: "系统设置 › 隐私与安全性 › 完全磁盘访问权限（最后的办法）",
+        reason: clipsync_core::t!(
+            "系统拒绝了访问，但路径不属于已知的几类受保护位置",
+            "access was denied, but this path is not one of the known protected locations"
+        ),
+        where_to_fix: clipsync_core::t!(
+            "系统设置 › 隐私与安全性 › 完全磁盘访问权限（最后的办法）",
+            "System Settings › Privacy & Security › Full Disk Access (last resort)"
+        ),
     }
 }
 
