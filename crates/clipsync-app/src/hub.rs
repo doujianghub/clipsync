@@ -334,11 +334,15 @@ impl HubState {
                 crate::logging::note_slow("写入剪贴板", t0);
                 if let Err(e) = wrote {
                     warn!("写入本地剪贴板失败: {e:#}");
+                    self.engine.abandon_apply(content_hash);
                 } else {
                     info!("已应用来自 {} 的 [{}] {} 字节", from, kind_label(content), content.byte_size());
                 }
             }
-            Err(e) => warn!("获取剪贴板锁失败: {e}"),
+            Err(e) => {
+                warn!("获取剪贴板锁失败: {e}");
+                self.engine.abandon_apply(content_hash);
+            }
         }
     }
 

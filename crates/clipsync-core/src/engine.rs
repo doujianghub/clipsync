@@ -306,6 +306,24 @@ impl SyncEngine {
         self.last_hash = None;
     }
 
+    /// 远端内容没能写进本地剪贴板：把这次应用当作从未发生。
+    ///
+    /// 写剪贴板是会失败的——Windows 上剪贴板是全局独占资源，被输入法或别的
+    /// 程序占着时 `SetClipboardData` 会直接报错（实机见过 os error 1418）。
+    /// 失败之后有两处状态必须回退，否则都会**悄悄**咬人：
+    ///
+    ///   - **回声登记**：我们压根没改写剪贴板，那个回声永远不会到来。留着它，
+    ///     将来用户自己复制到同样的内容时会被当成回声吞掉，不同步出去。
+    ///   - **当前内容哈希**：剪贴板里还是旧东西。记成新的，用户之后复制到这份
+    ///     内容时会被去重逻辑判为"没变化"而跳过。
+    ///
+    /// 两者的共同点是：症状都不是报错，而是"某次复制莫名其妙没同步"，
+    /// 且要等到很久以后才发作。
+    pub fn abandon_apply(&mut self, content_hash: u64) {
+        self.take_echo(content_hash);
+        self.last_hash = None;
+    }
+
     /// 记住一个敏感内容哈希，按容量淘汰最旧的。
     fn remember_sensitive(&mut self, hash: u64) {
         if self.sensitive_hashes.insert(hash) {
