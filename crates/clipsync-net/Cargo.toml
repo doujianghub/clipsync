@@ -26,6 +26,13 @@ blake2 = "0.10"
 # Tailscale/ZeroTier/Netbird/WireGuard 等覆盖网虚拟网卡，一律作为候选地址，
 # 无需针对特定组网产品写适配。
 if-addrs = "0.13"
+# 帧层的自适应压缩。图片以裸 RGBA 传输，一张 4K 截图 33 MB、压完只剩 6%。
+flate2 = { workspace = true }
+
+# macOS 的套接字服务类型（把文件传输声明为后台流量，见 sockopt.rs）。
+# libc 尚未导出这几个常量，但 setsockopt 本身要靠它。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = []

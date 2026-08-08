@@ -27,6 +27,10 @@ pub fn show(title: &str, body: &str) -> Result<()> {
     task::show(title, body)
 }
 
+pub fn ask_action(title: &str, body: &str, action: &str) -> Result<bool> {
+    task::ask_action(title, body, action)
+}
+
 pub fn confirm(title: &str, body: &str) -> Result<bool> {
     task::confirm(title, body)
 }

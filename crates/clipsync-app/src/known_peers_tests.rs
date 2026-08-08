@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// 台数句柄必须与表本身寸步不离——托盘的「已连接 m / n 台」里的 n 就是它。
+///
+/// 回归自实机反馈「已连接 2 / 1 台」：托盘原先自己存了一份台数，靠配对流程
+/// 手工同步，而引荐认识的设备和对端广播的移出都不走配对流程。
+#[test]
+fn counter_tracks_every_mutation() {
+    let known = KnownPeers::new(vec![peer("a", 1)]);
+    let n = known.counter();
+    assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 1);
+
+    known.upsert(peer("b", 2));
+    assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 2, "引荐认识一台");
+
+    known.upsert(peer("b", 2)); // 重复登记不该把台数记成三台
+    assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 2);
+
+    known.remove(&peer("b", 2).device);
+    assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 1, "对端广播移出");
+
+    known.remove(&peer("ghost", 9).device); // 不存在的设备
+    assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 1);
+
+    assert_eq!(known.len(), 1, "len 与句柄同源");
+}
+
 fn peer(id: &str, key: u8) -> KnownPeer {
     KnownPeer {
         device: DeviceId::from_public_key(id.as_bytes()),

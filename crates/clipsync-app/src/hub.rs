@@ -16,15 +16,17 @@ use std::sync::{Arc, Mutex};
 
 use clipsync_clip::{ArboardClipboard, Clipboard};
 use clipsync_core::{
-    ClipContent, DeviceId, LocalDecision, RemoteDecision, SkipReason, SyncEngine,
-    SyncMessage,
+    ClipContent, DeviceId, RemoteDecision, SkipReason, SyncEngine, SyncMessage,
 };
 use tracing::{debug, info, warn};
 
 #[path = "hub_incoming.rs"]
 mod hub_incoming;
+#[path = "hub_outgoing.rs"]
+mod hub_outgoing;
 
-use hub_incoming::IncomingTransfer;
+use hub_incoming::{IncomingTransfer, PendingFetch};
+use hub_outgoing::kind_label;
 
 use crate::filecache::FileCache;
 use crate::filetransfer::OutgoingFiles;
@@ -58,6 +60,11 @@ pub enum HubEvent {
     /// 变体会断开重连——不好看，但不会出错，而且只在混版运行时出现一次。
     /// 为此在中枢里再记一份每对端的协议版本，代价高于收益。
     AnnounceRemoval { device: DeviceId },
+    /// 用户在托盘上点了「取回」：把挂起的那批大文件拉回来。
+    ///
+    /// 超过「自动取回上限」的文件不会自动拉——带宽、磁盘、等待时间都落在
+    /// 接收方，该由接收方说了算。挂起项的摘要见 `TrayStatus::pending`。
+    FetchPending,
     /// 用户解除了与某设备的配对：立即断开与它的连接。
     ///
     /// 中枢是唯一持有各对端发送通道的地方，移除该通道会让对应连接的收发泵
@@ -115,6 +122,8 @@ struct HubState {
     deps: HubDeps,
     peers: HashMap<DeviceId, Peer>,
     incoming: Option<IncomingTransfer>,
+    /// 超过自动取回上限、等着用户点一下的那一批文件。
+    pending: Option<PendingFetch>,
     /// 上一次跳过的原因，用于抑制重复的 INFO 提示（见 `log_skip`）。
     last_skip: Option<SkipReason>,
 }
@@ -125,6 +134,7 @@ fn hub_loop(engine: SyncEngine, deps: HubDeps, rx: Receiver<HubEvent>) {
         deps,
         peers: HashMap::new(),
         incoming: None,
+        pending: None,
         last_skip: None,
     };
     // 已应用的设置版本；与句柄里的版本不同即说明用户改过设置。
@@ -155,6 +165,7 @@ fn hub_loop(engine: SyncEngine, deps: HubDeps, rx: Receiver<HubEvent>) {
                 file_paths,
             } => st.on_local(content, sensitive, file_paths),
             HubEvent::Remote { from, msg } => st.on_remote(from, msg),
+            HubEvent::FetchPending => st.fetch_pending(),
             HubEvent::PeerConnected { device, name, tx } => {
                 info!("对端已连接: {} ({})", name, device);
                 st.peers.insert(device, Peer { name, tx });
@@ -181,6 +192,11 @@ fn hub_loop(engine: SyncEngine, deps: HubDeps, rx: Receiver<HubEvent>) {
                     st.incoming = None;
                     st.engine.forget_current();
                 }
+                // 设备都移出组了，它那份待取项自然也不该再挂着。
+                // （对端只是掉线则**保留**——它回来时剪贴板多半还是那份内容。）
+                if st.pending.as_ref().map(|p| &p.from) == Some(&device) {
+                    st.clear_pending();
+                }
             }
             HubEvent::PeerDisconnected { device } => {
                 if let Some(p) = st.peers.remove(&device) {
@@ -190,6 +206,8 @@ fn hub_loop(engine: SyncEngine, deps: HubDeps, rx: Receiver<HubEvent>) {
                 // 正在从该对端接收的传输就此中断；保留已收字节以便将来续传。
                 if st.incoming.as_ref().map(|t| &t.from) == Some(&device) {
                     debug!("对端断开，接收中的文件传输暂停（已收部分保留待续传）");
+                    // 手动取回的放回待取队列——人专门点过一次，不该悄悄消失。
+                    st.requeue_if_manual();
                     st.incoming = None;
                     st.engine.forget_current();
                 }
@@ -210,86 +228,6 @@ impl HubState {
             .map(|d| d.to_string())
             .collect::<std::collections::HashSet<_>>();
         self.deps.status.set_connected_ids(ids);
-    }
-
-    /// 处理本地剪贴板变化：判定后广播给所有对端。
-    fn on_local(
-        &mut self,
-        content: ClipContent,
-        sensitive: bool,
-        file_paths: Vec<std::path::PathBuf>,
-    ) {
-        match self.engine.on_local_change(&content, sensitive) {
-            LocalDecision::Broadcast { seq, content_hash } => {
-                let kind = kind_label(&content);
-                let size = content.byte_size();
-
-                // 文件内容不随消息发送，只登记路径等待对端索取。
-                // 推进代际号会立即中止任何仍在进行的旧文件传输。
-                match &content {
-                    ClipContent::Files(metas) => {
-                        let pairs: Vec<(u64, std::path::PathBuf)> = metas
-                            .iter()
-                            .zip(file_paths.iter())
-                            .map(|(m, p)| (m.id, p.clone()))
-                            .collect();
-                        self.deps.outgoing.register(seq, pairs);
-                    }
-                    _ => self.deps.outgoing.advance(seq),
-                }
-
-                let msg = SyncMessage::Clip {
-                    origin: self.engine.device_id().clone(),
-                    seq,
-                    content_hash,
-                    content,
-                };
-                if self.peers.is_empty() {
-                    info!("已复制 [{kind}] {size} 字节，但暂无对端连接（seq={seq}）");
-                    return;
-                }
-                for peer in self.peers.values() {
-                    let _ = peer.tx.send(msg.clone());
-                }
-                info!("已同步 [{kind}] {size} 字节 → {} 台设备", self.peers.len());
-            }
-            LocalDecision::Skip(reason) => {
-                self.log_skip(reason, &content);
-            }
-        }
-    }
-
-    /// 记录一次跳过。
-    ///
-    /// `TooLarge` 与 `KindDisabled` 是**用户需要知道**的——内容没同步过去，
-    /// 而原因是可调的设置，若只写在 DEBUG 里，用户只会觉得"东西怎么没过去"
-    /// 却无从查起（我们自己联调时就在 TooLarge 上栽过一次）。
-    ///
-    /// 但它们也可能连续触发（关掉图片同步后每次截图都会命中），所以同一原因
-    /// 只在**第一次**打 INFO，重复时降到 DEBUG，原因变化后重新计数。
-    /// `Echo`/`Duplicate` 每次复制都会出现，始终留在 DEBUG。
-    fn log_skip(&mut self, reason: SkipReason, content: &ClipContent) {
-        let noteworthy = matches!(reason, SkipReason::TooLarge | SkipReason::KindDisabled);
-        let repeated = self.last_skip == Some(reason);
-        self.last_skip = Some(reason);
-
-        if !noteworthy || repeated {
-            debug!("本地变化跳过 ({reason:?})");
-            return;
-        }
-
-        match reason {
-            SkipReason::TooLarge => info!(
-                "内容 {} 字节，超过单次上限 {} 字节，未同步（可在托盘菜单调整上限）",
-                content.byte_size(),
-                self.engine.limits().max_bytes
-            ),
-            SkipReason::KindDisabled => info!(
-                "[{}] 未同步：该类型的发送已在托盘菜单中关闭",
-                kind_label(content)
-            ),
-            _ => unreachable!("noteworthy 已限定分支"),
-        }
     }
 
     /// 处理远端消息。
@@ -320,8 +258,7 @@ impl HubState {
             SyncMessage::FileAbort { generation } => {
                 if self.matches_incoming(generation) {
                     info!("对端已取消文件传输（其剪贴板已更新），已收部分保留待续传");
-                    self.incoming = None;
-                    self.engine.forget_current();
+                    self.finish_failed("对方已经不再提供这份内容了。\n\n让它重新复制一次即可。");
                 }
             }
 
@@ -332,8 +269,7 @@ impl HubState {
             } => {
                 if self.matches_incoming(generation) {
                     warn!("对端无法提供文件（id={file_id:016x}）: {reason}");
-                    self.incoming = None;
-                    self.engine.forget_current();
+                    self.finish_failed(&format!("对方拿不到这个文件了：{reason}"));
                 }
             }
 
@@ -376,7 +312,7 @@ impl HubState {
                 debug!("远端内容跳过 ({:?})", reason);
             }
             RemoteDecision::Apply => match content {
-                ClipContent::Files(metas) => self.begin_incoming_files(from, seq, metas),
+                ClipContent::Files(metas) => self.offer_incoming_files(from, seq, metas),
                 other => {
                     // 文本/图片可立即落地。
                     self.apply_to_clipboard(&other, content_hash, &from);
@@ -392,13 +328,28 @@ impl HubState {
         self.engine.expect_echo(content_hash);
         match self.deps.clipboard.lock() {
             Ok(mut cb) => {
-                if let Err(e) = cb.write(content) {
+                // 与读取对称：写回系统剪贴板同样要现场编码，大图不便宜。
+                let t0 = std::time::Instant::now();
+                let wrote = cb.write(content);
+                crate::logging::note_slow("写入剪贴板", t0);
+                if let Err(e) = wrote {
                     warn!("写入本地剪贴板失败: {e:#}");
                 } else {
                     info!("已应用来自 {} 的 [{}] {} 字节", from, kind_label(content), content.byte_size());
                 }
             }
             Err(e) => warn!("获取剪贴板锁失败: {e}"),
+        }
+    }
+
+    /// 接收失败收尾。手动取回那次额外弹一句——人刚点过，静默等于按钮坏了。
+    fn finish_failed(&mut self, message: &str) {
+        let manual = self.incoming.as_ref().is_some_and(|t| t.manual);
+        self.incoming = None;
+        self.engine.forget_current();
+        self.deps.status.clear_transfer();
+        if manual {
+            notify(message);
         }
     }
 
@@ -409,10 +360,12 @@ impl HubState {
     }
 }
 
-fn kind_label(content: &ClipContent) -> &'static str {
-    match content.kind() {
-        clipsync_core::ContentKind::Text => "文本",
-        clipsync_core::ContentKind::Image => "图片",
-        clipsync_core::ContentKind::Files => "文件",
-    }
+/// 弹一句给用户看，**不阻塞中枢**。
+///
+/// 弹窗会一直挡到用户点掉，而中枢是全局串行的——占住它等于整个同步停摆。
+/// 只用在用户刚刚点过某个按钮、静默会让人以为程序坏了的地方。
+pub(super) fn notify(message: &str) {
+    let message = message.to_string();
+    std::thread::spawn(move || crate::dialog::show_info("ClipSync", &message));
 }
+

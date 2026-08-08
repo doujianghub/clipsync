@@ -3,10 +3,12 @@
 //! 与 `pairing_cli` 的分工：那边是协议流程（监听、握手、落盘），这边是
 //! **用户交互**——弹哪些窗、什么时候弹、配对成功后还要动哪些运行期状态。
 //!
-//! 三个流程都跑在后台线程：弹窗会阻塞到用户点掉，放在托盘事件循环里会让
+//! 所有流程都跑在后台线程：弹窗会阻塞到用户点掉，放在托盘事件循环里会让
 //! 整个菜单卡住。
-
-use std::sync::{Arc, Mutex};
+//!
+//! 本文件留主持方与设备组操作；另外两块各自成文件（按行数约定拆分）：
+//!   - [`session`]——主持会话的槽位：当前码、剩余时间、取消；
+//!   - [`join`]——「输入配对码…」那一侧的交互。
 
 use anyhow::Result;
 use clipsync_net::peer::AddrSource;
@@ -14,52 +16,13 @@ use tracing::{info, warn};
 
 use crate::{addrbook, config, dialog, hub, known_peers, pairing_cli, tray};
 
-/// 保证同一时刻只有一个"主持配对"会话在跑。
-///
-/// 没有这层控制时，用户第二次点「显示配对码」会新起一个线程去 bind 已被占用
-/// 的 47685，直接抛出 `os error 10048`（Windows）/ `48`（macOS）给用户看。
-/// 而用户的真实意图通常只是**再看一眼那个码**——所以这里不报错、也不新开
-/// 会话，而是把当前会话的配对码重新弹出来。
-#[derive(Clone, Default)]
-pub(crate) struct PairingHostSlot {
-    /// 会话进行中时持有当前配对码；结束后自动清空。
-    pub(crate) active: Arc<Mutex<Option<String>>>,
-}
+#[path = "pairing_join.rs"]
+mod join;
+#[path = "pairing_session.rs"]
+mod session;
 
-impl PairingHostSlot {
-    /// 尝试占用槽位。已被占用时返回当前会话的配对码。
-    pub(crate) fn try_acquire(&self) -> Result<PairingHostGuard, String> {
-        let mut g = self.active.lock().unwrap();
-        match g.as_ref() {
-            Some(code) => Err(code.clone()),
-            None => {
-                *g = Some(String::new()); // 先占位，拿到码后再补
-                Ok(PairingHostGuard {
-                    slot: self.clone(),
-                })
-            }
-        }
-    }
-
-    pub(crate) fn set_code(&self, code: &str) {
-        *self.active.lock().unwrap() = Some(code.to_string());
-    }
-
-    pub(crate) fn release(&self) {
-        *self.active.lock().unwrap() = None;
-    }
-}
-
-/// 持有期间槽位被占用；**丢弃即释放**，包括 host() 提前返回错误的路径。
-pub(crate) struct PairingHostGuard {
-    pub(crate) slot: PairingHostSlot,
-}
-
-impl Drop for PairingHostGuard {
-    fn drop(&mut self) {
-        self.slot.release();
-    }
-}
+pub(crate) use join::join_by_code_interactive;
+pub(crate) use session::PairingHostSlot;
 
 /// 从托盘发起配对时，"配对成功"之后还需要让它**立刻**生效所需的东西。
 #[derive(Clone)]
@@ -85,15 +48,14 @@ impl PairingDeps {
     ///   - **地址簿**——配对时对方告知的可达地址，是首次连接的唯一线索
     ///     （信标只覆盖同网段）。
     ///
-    /// 顺带刷新托盘上的已配对台数，否则菜单首行会停在"尚未配对设备"，
-    /// 而同步其实已经跑起来了。
+    /// 托盘不用管：菜单首行的台数与设备子菜单都挂在设备表的台数与版本号上，
+    /// 这里一 upsert 它们自己就跟着变了。
     pub(crate) fn register(&self, record: &clipsync_net::pairing::PairingRecord) {
         self.known.upsert(record.clone().into());
         if !record.addrs.is_empty() {
             self.addrbook
                 .add_addrs(&record.device, record.addrs.iter().copied(), AddrSource::Pairing);
         }
-        self.status.set_paired(self.known.len());
         info!(
             "已登记新配对设备 {} ({})，无需重启即可开始同步",
             record.name, record.device
@@ -150,7 +112,6 @@ impl PairingDeps {
             device: device.clone(),
         });
         self.forget_locally(&device);
-        self.status.set_paired(self.known.len());
         Ok(name)
     }
 
@@ -167,7 +128,6 @@ impl PairingDeps {
             self.forget_locally(&p.device);
         }
         config::clear_pairings(&self.dir)?;
-        self.status.set_paired(0);
         Ok(peers.len())
     }
 
@@ -252,11 +212,15 @@ pub(crate) fn leave_group_interactive(pairing: &PairingDeps) {
     }
 }
 
-/// 托盘「显示配对码…」的完整流程，含单例控制。
+/// 托盘「显示配对码…」的完整流程，含单例控制与「换个配对码」。
 ///
 /// 重复点击时**不再** bind 一个已被占用的端口（那会给用户抛 `os error 10048`
 /// 且只能重启程序恢复），而是把当前会话的配对码重新弹出来——这本就是用户
 /// 重复点击时想要的。
+///
+/// **循环而不是递归开新线程**：用户点「换个配对码」时旧会话还占着 47685，
+/// 新起一路去 bind 是撞车。留在同一个线程里 `continue`，`host()` 已经返回、
+/// guard 也已析构，端口必然是空的。
 pub(crate) fn host_pairing_interactive(
     dir: &std::path::Path,
     identity: &clipsync_net::crypto::StaticIdentity,
@@ -264,230 +228,109 @@ pub(crate) fn host_pairing_interactive(
     sync_port: u16,
     pairing: &PairingDeps,
 ) {
-    let guard = match pairing.host_slot.try_acquire() {
-        Ok(g) => g,
-        Err(code) => {
+    loop {
+        let Some(guard) = pairing.host_slot.try_acquire() else {
             // 已有会话在等待——把**同一份**文案再显示一遍。
             //
             // 此前这里另写了一段更短的，不含地址列表，于是"关掉窗口再打开，
             // 地址就没了"，用户以为程序把信息弄丢了。同一件事只该有一份文案。
             info!("配对会话已在进行中，重新显示当前配对码");
-            dialog::show_info(
-                "ClipSync 配对",
-                &pairing_cli::code_dialog_body(&code, sync_port),
-            );
+            show_code_dialog(&pairing.host_slot, sync_port);
             return;
-        }
-    };
-
-    let slot = pairing.host_slot.clone();
-    let result = pairing_cli::host(dir, identity, device_name, sync_port, true, |share| {
-        slot.set_code(share);
-    });
-    drop(guard); // 显式释放槽位，后续弹窗期间允许再次发起
-
-    match result {
-        Ok(record) => {
-            pairing.register(&record);
-            dialog::show_info(
-                "ClipSync 配对成功",
-                &format!("已与「{}」配对，现在可以互相同步了。", record.name),
-            );
-        }
-        Err(e) => {
-            warn!("配对失败: {e:#}");
-            dialog::show_info("ClipSync 配对失败", &format!("{e:#}"));
-        }
-    }
-}
-
-/// 托盘「输入配对码…」的完整流程：拿到码 → 找到对方 → 配对 → 告知结果。
-///
-/// 跑在后台线程（弹窗会阻塞到用户点掉，不能占着托盘事件循环）。
-///
-/// **码只能人念人敲**，所以是 4 位数字。曾经走过一条弯路：把码自动放进
-/// 主持方的剪贴板，让用户"复制粘贴过去"——这是循环依赖，本工具要解决的
-/// 正是"跨设备复制粘贴还没打通"；也不该假设用户手边有微信之类的通道。
-///
-/// **地址一律自动找**，用户不必输 IP（见 [`pairing_cli::connect_hosts`]）。
-/// 只有全部落空才问一句，那时对方窗口里也正好印着本机地址。
-pub(crate) fn join_by_code_interactive(
-    dir: &std::path::Path,
-    identity: &clipsync_net::crypto::StaticIdentity,
-    device_name: &str,
-    sync_port: u16,
-    pairing: &PairingDeps,
-) {
-    // 循环：找不到对方时最可能是码过期了，那就让用户拿新码再来一遍——
-    // 而不是把他推去填 IP。对方根本没在监听的话，IP 填对了也连不上。
-    loop {
-        let Some((code, host)) = obtain_code() else {
-            return; // 用户取消，或输入的不是有效配对码
         };
-        let code = code.to_string();
 
-        let streams = match pairing_cli::connect_hosts(host.as_deref()) {
-            Ok(s) => s,
-            Err(e) => {
-                info!("没找到等待配对的设备: {e:#}");
-                match ask_what_next() {
-                    Some(NotFound::RetryWithNewCode) => continue,
-                    Some(NotFound::EnterAddress) => {
-                        let Some(h) = dialog::prompt("配对", &ask_address_body(sync_port)) else {
-                            return;
-                        };
-                        match pairing_cli::connect_hosts(Some(h.trim())) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                warn!("配对失败: {e:#}");
-                                dialog::show_info("配对失败", &format!("{e:#}"));
-                                return;
-                            }
-                        }
+        let slot = pairing.host_slot.clone();
+        let slot_for_dialog = pairing.host_slot.clone();
+        let result = pairing_cli::host(
+            dir,
+            identity,
+            device_name,
+            sync_port,
+            &guard.cancel,
+            |code, deadline| {
+                slot.begin(code, deadline);
+                // 弹窗会一直阻塞到用户点掉，而配对握手要我们主动 accept 并
+                // 收发——占着这个线程的后果是：对方 TCP 连上了（内核替我们
+                // 完成三次握手，连接躺在 backlog 里），发来 PAKE 却没人读，
+                // 他那边一直等到超时。用户看到的现象就是"必须先点掉配对码
+                // 窗口，别人才连得上"。所以弹窗必须与 accept 并行。
+                let body = pairing_cli::code_dialog_body(
+                    code,
+                    sync_port,
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                );
+                let code = code.to_string();
+                std::thread::spawn(move || {
+                    if dialog::ask_action("ClipSync 配对", &body, NEW_CODE_LABEL) {
+                        request_new_code(&slot_for_dialog, Some(&code));
                     }
-                    None => return,
-                }
+                });
+            },
+        );
+        drop(guard); // 显式释放槽位，后续弹窗期间允许再次发起
+
+        match result {
+            Ok(record) => {
+                pairing.register(&record);
+                dialog::show_info(
+                    "ClipSync 配对成功",
+                    &format!("已与「{}」配对，现在可以互相同步了。", record.name),
+                );
+                return;
             }
-        };
-
-        // 逐个试：占着配对端口的不一定就是 ClipSync，通常只有一个。
-        let mut last = None;
-        for mut s in streams {
-            match pairing_cli::join_on(&mut s, dir, identity, device_name, &code, sync_port) {
-                Ok(record) => return finish_join(Ok(record), pairing),
-                Err(e) => last = Some(e),
+            // 换码：不是故障，接着开下一轮，不弹任何"失败"。
+            Err(e) if e.downcast_ref::<pairing_cli::Cancelled>().is_some() => {
+                info!("用户要求换一个配对码，正在开始新一轮");
+                continue;
+            }
+            Err(e) => {
+                warn!("配对失败: {e:#}");
+                dialog::show_info("ClipSync 配对失败", &format!("{e:#}"));
+                return;
             }
         }
-        return finish_join(
-            Err(last.unwrap_or_else(|| anyhow::anyhow!("没有可用的连接"))),
-            pairing,
-        );
     }
 }
 
-/// 没找到对方时，用户接下来想干什么。
-enum NotFound {
-    /// 让对方重新显示配对码，自己再输一次新的。
-    RetryWithNewCode,
-    /// 手动填对方地址。
-    EnterAddress,
-}
-
-/// 手输对方地址时的提示语。
+/// 「换个配对码」在菜单与弹窗上的统一叫法。
 ///
-/// 一并列出**本机**的地址：对方窗口里可能有好几个，用户得挑一个跟自己同
-/// 网段的才连得通。不给参照物的话，这个判断只能靠猜——而这恰恰是程序能
-/// 帮上忙、用户又最容易搞错的地方。
-fn ask_address_body(sync_port: u16) -> String {
-    let mut s = "请输入对方的 IP（对方窗口里有）：".to_string();
-    if let Some(block) = pairing_cli::addr_block(sync_port) {
-        s.push_str(&format!("\n\n本机地址，供对照挑同网段的：\n{block}"));
-    }
-    s
-}
+/// 不叫「刷新」：刷新听起来像"重新拿一遍同一个东西"，而这里旧码当场作废。
+pub(crate) const NEW_CODE_LABEL: &str = "换个配对码";
 
-/// 没找到对方时问一句下一步。
+/// 显示当前会话的配对码；窗口上的「换个配对码」照常可用。
 ///
-/// **把最可能的原因说在前面**：自动发现覆盖到局域网、覆盖网与可枚举的虚拟
-/// 网段，都落空的话，绝大多数时候不是"找不到路"，而是"对方那边已经过期了"
-/// ——配对码只有 3 分钟有效。此前这里直接弹出"请输入对方 IP"，把用户引向一条
-/// 死路：对方根本没在监听，IP 填得再对也连不上。
-fn ask_what_next() -> Option<NotFound> {
-    let opts = [
-        "让对方重新显示配对码，我输新的".to_string(),
-        "手动填对方地址".to_string(),
-    ];
-    match dialog::choose(
-        "没找到对方",
-        &format!(
-            "没找到正在等待配对的设备。\n\n\
-             配对码 {} 分钟内有效，多半是过期了。",
-            pairing_cli::HOST_SESSION_TIMEOUT.as_secs() / 60
-        ),
-        &opts,
-    ) {
-        Some(0) => Some(NotFound::RetryWithNewCode),
-        Some(1) => Some(NotFound::EnterAddress),
-        _ => None,
+/// 与首次显示走的是同一份文案与同一个按钮——用户不该因为"这是第二次打开"
+/// 就少一个选项。
+fn show_code_dialog(slot: &PairingHostSlot, sync_port: u16) {
+    let Some(live) = slot.live() else {
+        dialog::show_info("ClipSync 配对", "配对会话正在启动，请稍候再看。");
+        return;
+    };
+    let body = pairing_cli::code_dialog_body(&live.code, sync_port, live.remaining);
+    if dialog::ask_action("ClipSync 配对", &body, NEW_CODE_LABEL) {
+        request_new_code(slot, Some(&live.code));
     }
 }
 
-/// 让用户输入配对码。
+/// 请求换码，并在请求落空时说明原因。
 ///
-/// 也接受 `1234@地址` 这种写法——自动发现全落空时的手动出口，命令行同款。
-fn obtain_code() -> Option<(clipsync_net::pairing::PairingCode, Option<String>)> {
-    let input = dialog::prompt("输入配对码", "输入对方显示的 4 位配对码：")?;
-    match pairing_cli::parse_pairing_input(&input) {
-        Some(v) => Some(v),
-        None => {
-            dialog::show_info(
-                "配对失败",
-                &format!("「{input}」不是有效的配对码。\n\n应为 4 位数字。"),
-            );
-            None
-        }
+/// 落空的情形是弹窗停在屏幕上、而它那一轮早已结束（超时或已配对成功）。
+/// 静默无反应会让人以为按钮坏了。
+fn request_new_code(slot: &PairingHostSlot, only_if: Option<&str>) {
+    if slot.request_new_code(only_if) {
+        return;
     }
+    info!("「{NEW_CODE_LABEL}」落空：对应的配对会话已经结束");
+    dialog::show_info(
+        "ClipSync 配对",
+        "这个配对码已经失效了。\n\n请在托盘菜单里重新选「显示配对码…」。",
+    );
 }
 
-/// 配对收尾：登记 + 告知结果。各路径共用。
-fn finish_join(
-    result: Result<clipsync_net::pairing::PairingRecord>,
-    pairing: &PairingDeps,
-) {
-    match result {
-        Ok(record) => {
-            pairing.register(&record);
-            dialog::show_info("配对成功", &format!("已与「{}」配对。", record.name));
-        }
-        Err(e) => {
-            warn!("配对失败: {e:#}");
-            dialog::show_info("配对失败", &format!("{e:#}"));
-        }
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 重复发起主持配对时，不得去 bind 一个已被占用的端口。
-    ///
-    /// 用户第二次点「显示配对码」通常只是想再看一眼码。原先每次点击都新起
-    /// 线程去 bind 47685，第二次必然失败并把 `os error 10048` 抛给用户看，
-    /// 且只能重启程序恢复。槽位被占用时应返回**当前会话的码**供重新显示。
-    #[test]
-    fn host_slot_reports_existing_code_instead_of_starting_over() {
-        let slot = PairingHostSlot::default();
-
-        let guard = slot.try_acquire().expect("首次应能占用");
-        slot.set_code("ABC123");
-
-        match slot.try_acquire() {
-            Err(code) => assert_eq!(code, "ABC123", "应返回当前会话的码以便重新显示"),
-            Ok(_) => panic!("已有会话时不应再次占用槽位——那会撞上端口占用"),
-        }
-
-        // 会话结束后必须能重新发起，否则功能就永久坏掉了。
-        drop(guard);
-        assert!(
-            slot.try_acquire().is_ok(),
-            "会话结束后槽位应释放，允许发起新一轮配对"
-        );
-    }
-
-    /// 槽位在 `host()` 报错返回时也要释放（靠 guard 的 Drop，不能靠成功路径）。
-    #[test]
-    fn host_slot_releases_on_error_path() {
-        let slot = PairingHostSlot::default();
-        {
-            let _guard = slot.try_acquire().expect("应能占用");
-            slot.set_code("XYZ789");
-            // 模拟 host() 中途 bail!——guard 在作用域结束时析构。
-        }
-        assert!(
-            slot.try_acquire().is_ok(),
-            "出错路径也必须释放槽位，否则一次配对失败就再也发起不了"
-        );
-    }
+/// 托盘菜单里的「换个配对码」。
+///
+/// 与弹窗上那个按钮不同，这里**不限定码**：用户看着菜单上的倒计时点下去，
+/// 想换的就是眼前这一轮。
+pub(crate) fn new_code_from_tray(pairing: &PairingDeps) {
+    request_new_code(&pairing.host_slot, None);
 }

@@ -4,7 +4,7 @@
 //!
 //! **文案原则**：短、不解释、不吓人。菜单是给人扫一眼的，不是说明书——
 //! 需要解释的地方交给点击后的对话框，那里有足够篇幅把话说清楚。
-//! 可调的项一律把**当前值写进标签**（`单次上限：100 MiB…`），省掉一层
+//! 可调的项一律把**当前值写进标签**（`自动取回：100 MiB…`），省掉一层
 //! "点进去才知道现在是多少"。
 
 use super::TrayPeer;
@@ -27,12 +27,28 @@ pub(crate) fn human_bytes(n: u64) -> String {
     format!("{n} B")
 }
 
-/// 单次上限的显示值。`usize::MAX` 表示不限制。
-pub(crate) fn max_bytes_label(v: usize) -> String {
+/// 自动取回上限的显示值。`usize::MAX` 表示多大都自动取。
+///
+/// 叫「自动取回」而不是「单次上限」：它管的是**收到的文件多大以内自动拉**，
+/// 超过的挂起来等你点一下，而不是"超过就不同步了"。发送侧不受它影响。
+pub(crate) fn auto_fetch_label(v: usize) -> String {
     if v == usize::MAX {
-        "单次上限：不限…".to_string()
+        "自动取回：不限…".to_string()
     } else {
-        format!("单次上限：{}…", human_bytes(v as u64))
+        format!("自动取回：{}…", human_bytes(v as u64))
+    }
+}
+
+/// 「取回」那一项的标签：说清是什么、有多大。
+///
+/// 名字用与传输进度同一套的截断（前5…后5），免得一个长文件名把菜单撑宽。
+/// 多个文件时只报头一个加个数——列全了既放不下，也不比"3 个"更有用。
+pub(crate) fn fetch_label(first_name: &str, count: usize, total: u64) -> String {
+    let name = crate::tray::ellipsize_middle(first_name);
+    if count > 1 {
+        format!("取回 {name} 等 {count} 个（{}）", human_bytes(total))
+    } else {
+        format!("取回 {name}（{}）", human_bytes(total))
     }
 }
 
@@ -47,6 +63,21 @@ pub(crate) fn rate_label(v: u64) -> String {
 
 pub(crate) fn port_label(port: u16) -> String {
     format!("同步端口：{port}…")
+}
+
+/// 「显示配对码…」那一项的标签。
+///
+/// 会话进行中时把码和剩余秒数直接写在菜单上：这是唯一能**实时**更新的地方
+/// ——弹窗是系统原生模态窗，显示出来文字就定死了，而托盘循环本来就每 200ms
+/// 转一圈。用户想知道"还来得及吗"，扫一眼菜单即可，不必再把窗口调出来。
+///
+/// 分与秒都写出来（`1:23`）而不是纯秒数（`83 秒`）：三位数的秒读起来要在
+/// 心里除一遍，而这一栏的宽度也会跟着位数抖。
+pub(crate) fn pairing_label(live: Option<(&str, u64)>) -> String {
+    match live {
+        Some((code, secs)) => format!("配对码 {code} · 剩 {}:{:02}", secs / 60, secs % 60),
+        None => "显示配对码…".to_string(),
+    }
 }
 
 /// 设备子菜单里「退出设备组」那一项占用的假 device id。
@@ -125,10 +156,40 @@ mod tests {
     /// 标签要把当前值写进去——省掉"点进去才知道现在是多少"这一步。
     #[test]
     fn labels_carry_the_current_value() {
-        assert_eq!(max_bytes_label(100 * 1024 * 1024), "单次上限：100 MiB…");
-        assert_eq!(max_bytes_label(usize::MAX), "单次上限：不限…");
+        assert_eq!(auto_fetch_label(100 * 1024 * 1024), "自动取回：100 MiB…");
+        assert_eq!(auto_fetch_label(usize::MAX), "自动取回：不限…");
         assert_eq!(rate_label(0), "发送限速：不限…");
         assert_eq!(rate_label(10 * 1024 * 1024), "发送限速：10 MiB/s…");
         assert_eq!(port_label(47684), "同步端口：47684…");
+    }
+
+    /// 「取回」那一项要说清是什么、几个、多大。
+    ///
+    /// 长文件名会把菜单撑得很宽（macOS 尤其明显），所以走与传输进度同一套的
+    /// 定长截断。
+    #[test]
+    fn fetch_label_says_what_and_how_big() {
+        assert_eq!(
+            fetch_label("报告.zip", 1, 4_500_000_000),
+            "取回 报告.zip（4.2 GiB）"
+        );
+        assert_eq!(
+            fetch_label("报告.zip", 3, 4_500_000_000),
+            "取回 报告.zip 等 3 个（4.2 GiB）"
+        );
+        // 超长名字截断，菜单不至于被撑宽。
+        let long = fetch_label("IMG_20260807_143052_HDR_Portrait_Final.heic", 1, 1 << 20);
+        assert!(long.contains('…'), "长名字该截断：{long}");
+        assert!(long.chars().count() < 30, "截断后应足够短：{long}");
+    }
+
+    /// 配对码那一项：没会话时是入口，有会话时是实时倒计时。
+    #[test]
+    fn pairing_label_switches_between_entry_and_countdown() {
+        assert_eq!(pairing_label(None), "显示配对码…");
+        assert_eq!(pairing_label(Some(("1234", 167))), "配对码 1234 · 剩 2:47");
+        // 秒要补零，否则 `2:7` 读起来像 2 分 7 秒还是 2 分 70 秒都说不准。
+        assert_eq!(pairing_label(Some(("0042", 7))), "配对码 0042 · 剩 0:07");
+        assert_eq!(pairing_label(Some(("1234", 180))), "配对码 1234 · 剩 3:00");
     }
 }

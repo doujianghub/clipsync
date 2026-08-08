@@ -28,6 +28,15 @@ pub struct OutgoingFiles {
     inner: Arc<Mutex<HashMap<u64, Vec<(u64, PathBuf)>>>>,
     /// 当前代际号：由本地剪贴板变化递增，用于判断传输是否已被取代。
     current: Arc<AtomicU64>,
+    /// 最近一次**文件**复制的代际号。
+    ///
+    /// 支撑对端的"延后取回"：超过对方自动取回上限的文件会挂在它那儿等人点，
+    /// 而这期间本机很可能已经复制过文字、截过图——`current` 早就不是它了。
+    /// 若照 `current` 判定，那个「取回」按钮基本上一按一个空。
+    ///
+    /// 只多留一个代际号，不额外占资源：`inner` 里本来就只有文件代际
+    /// （文本走 `advance`，不建表项），最近 4 代都在，`last_file` 必在其中。
+    last_file: Arc<AtomicU64>,
 }
 
 impl OutgoingFiles {
@@ -49,6 +58,7 @@ impl OutgoingFiles {
             }
         }
         drop(map);
+        self.last_file.store(generation, Ordering::SeqCst);
         self.current.store(generation, Ordering::SeqCst);
     }
 
@@ -65,6 +75,14 @@ impl OutgoingFiles {
     /// 该代际是否仍是当前剪贴板内容。
     pub fn is_current(&self, generation: u64) -> bool {
         self.current() == generation
+    }
+
+    /// 该代际是否**还愿意服务**——当前内容，或最近一次文件复制。
+    ///
+    /// 比 `is_current` 宽一档，专为对端的"延后取回"留的口子：本机复制过文字
+    /// 之后，那份大文件仍然拿得到，直到本机再复制一个文件（或退出）。
+    pub fn is_servable(&self, generation: u64) -> bool {
+        self.is_current(generation) || self.last_file.load(Ordering::SeqCst) == generation
     }
 
     /// 查某代际下某文件的本机路径。
@@ -91,6 +109,13 @@ pub struct OutgoingStream {
     compress: bool,
     /// 文件总字节数（开流时定格），用于报进度。
     size: u64,
+    /// 剪贴板一变就该中止吗？
+    ///
+    /// 自动传输：**是**。对端剪贴板已经是别的内容了，继续传完还会把它的剪贴板
+    /// 覆盖回旧内容，两端反而更不一致。
+    /// 手动取回：**否**。人明确点了「取回」，要的就是这一份，本机剪贴板后来
+    /// 换成什么与他无关。开流那一刻请求的代际已不是当前内容，就说明是这种。
+    abort_on_supersede: bool,
     /// 从头开始发送时，边读边算的内容哈希。
     ///
     /// `None` 表示这是一次**续传**（起始偏移不为 0）——前半段的字节我们根本
@@ -111,6 +136,7 @@ impl OutgoingStream {
         path: PathBuf,
         offset: u64,
         allow_compress: bool,
+        abort_on_supersede: bool,
     ) -> Result<Self> {
         let mut file = std::fs::File::open(&path)
             .with_context(|| format!("打开待发送文件失败: {}", path.display()))?;
@@ -132,6 +158,7 @@ impl OutgoingStream {
             size,
             buf: vec![0u8; CHUNK_SIZE],
             compress,
+            abort_on_supersede,
             // 只有从头发才能边读边算；续传缺了前半段，结尾仍需重读一遍。
             running_hash: (offset == 0).then(clipsync_core::hash::Hasher::new),
         })
@@ -149,6 +176,11 @@ impl OutgoingStream {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// 见 [`abort_on_supersede`](Self::abort_on_supersede) 字段说明。
+    pub fn abort_on_supersede(&self) -> bool {
+        self.abort_on_supersede
     }
 
     /// 产出下一条待发消息。返回 `None` 表示本文件已发送完毕。
@@ -215,11 +247,15 @@ pub fn begin_stream(
     offset: u64,
     allow_compress: bool,
 ) -> std::result::Result<OutgoingStream, SyncMessage> {
-    // 请求的代际已被新剪贴板内容取代：告知对端放弃，不再浪费带宽。
-    if !outgoing.is_current(generation) {
+    // 连"最近一次文件复制"都不是了：这份内容本机确实已经不提供，告知对端放弃。
+    if !outgoing.is_servable(generation) {
         debug!("忽略过期代际 {generation} 的文件请求（当前 {}）", outgoing.current());
         return Err(SyncMessage::FileAbort { generation });
     }
+    // 请求的不是当前剪贴板内容，却仍可服务——那只能是对端的手动取回
+    // （自动那条路在收到 Clip 的当场就发 FileNeed，那时它必然还是当前内容）。
+    // 这一份不受"剪贴板变了就中止"的约束。
+    let abort_on_supersede = outgoing.is_current(generation);
     let path = match outgoing.path_for(generation, file_id) {
         Some(p) => p,
         None => {
@@ -230,7 +266,34 @@ pub fn begin_stream(
             })
         }
     };
-    OutgoingStream::start(generation, file_id, path.clone(), offset, allow_compress).map_err(|e| {
+    OutgoingStream::start(
+        generation,
+        file_id,
+        path.clone(),
+        offset,
+        allow_compress,
+        abort_on_supersede,
+    )
+    .map_err(|e| {
+        // 第二道防线。正常情况下复制那一刻就该拦住（`meta_for_path` 会试着
+        // 打开一次），走到这里说明文件是在"复制之后、对端来取之前"变得读不
+        // 了的——或者对端点的是延后取回，隔了一段时间。
+        //
+        // **本地必须说话**：原先这里只把 FileUnavailable 发给对端就完事，
+        // 而对端收到后只是默默丢弃、剪贴板保持原样。于是能修这个问题的人
+        // （本机用户）什么都看不到，对面那个人则看到"粘出来是上一个文件"。
+        if clipsync_clip::filelist::is_permission_denied(&e) {
+            let d = clipsync_clip::filelist::explain_denied(&path);
+            tracing::warn!(
+                "对端来取 {} 时发现读不了：{}。去「{}」把 ClipSync 打开即可。",
+                path.display(),
+                d.reason,
+                d.where_to_fix
+            );
+            crate::dialog::permission_hint_once(&path, d.reason, d.where_to_fix);
+        } else {
+            tracing::warn!("无法向对端提供 {}: {e:#}", path.display());
+        }
         SyncMessage::FileUnavailable {
             generation,
             file_id,

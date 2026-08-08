@@ -91,6 +91,26 @@ cat > "$APP/Contents/Info.plist" <<PLIST
          跑却一切正常（终端自己有这个权限）。 -->
     <key>NSLocalNetworkUsageDescription</key>
     <string>用于在局域网内自动发现你的其它设备，免去手动输入 IP。</string>
+
+    <!-- 文件访问用途说明。
+         复制文件时剪贴板里只有**路径**，内容要由本程序去读——而这些位置都归
+         macOS 的 TCC 管。没有这些键，系统弹窗只有一句干巴巴的默认文案，用户
+         看不出为什么一个剪贴板工具要读他的「文稿」，多半就点了拒绝；而拒绝
+         之后是**静默失败**，此后从这些位置复制文件永远同步不过去，日志里也
+         只有一句"读不了"。
+         排查用 `clipsync clipdiag`（必须从 App 包内跑，终端的授权是另一套）。 -->
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>复制桌面上的文件时，需要读取文件内容才能同步到你的其它设备。</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>复制「文稿」里的文件时，需要读取文件内容才能同步到你的其它设备。</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>复制「下载」里的文件时，需要读取文件内容才能同步到你的其它设备。</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>复制外置磁盘上的文件时，需要读取文件内容才能同步到你的其它设备。</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>复制网络卷上的文件时，需要读取文件内容才能同步到你的其它设备。</string>
+    <key>NSFileProviderDomainUsageDescription</key>
+    <string>复制 iCloud 云盘等位置的文件时，需要读取文件内容才能同步到你的其它设备。</string>
 </dict>
 </plist>
 PLIST
@@ -174,16 +194,49 @@ echo "==> 签名"
 IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
             | grep -o '"Developer ID Application:[^"]*"' | head -1 | tr -d '"' || true)"
 if [[ -n "$IDENTITY" ]]; then
+    # 有证书时**不要**自定义指定要求：证书签名的默认要求本来就既稳定
+    # （认 bundle id + 证书链，重新打包不变）又安全。
     codesign --force --deep --options runtime --sign "$IDENTITY" "$APP"
     echo "    已用证书签名：$IDENTITY"
 else
-    codesign --force --deep --sign - "$APP"
+    # ad-hoc 签名要**显式指定一个稳定的「指定要求」**，否则系统会把它退化成
+    # `cdhash H"..."`——锁死在这一份二进制的哈希上。
+    #
+    # 后果是权限每次重新打包就作废：macOS 的隐私授权（本地网络、其他 App 的
+    # 数据、文件与文件夹）都是按这个要求认 App 的，哈希对不上就当成另一个
+    # 程序。用户看到的现象是**开关自己关掉了**——他明明刚打开过。
+    #
+    # 换成 `identifier "..."` 之后，重新打包不再影响已授的权限：
+    #     两个不同二进制 → cdhash 38a47b… / d17d0970…
+    #     指定要求        → 都是 identifier "com.clipsync.app"
+    #
+    # 代价：任何自称同一个 bundle id 的程序都能继承这些授权。对一个自己编译、
+    # 本机安装的工具是划算的；要既稳定又严格，只能上 Developer ID 证书
+    # （脚本检测到证书会自动改用它，不走这条分支）。
+    codesign --force --deep --sign - \
+        -r="designated => identifier \"${BUNDLE_ID}\"" "$APP"
     echo "    ad-hoc 签名（本机可运行；分发给他人需 Developer ID + 公证）"
 fi
 
 codesign --verify --strict "$APP"
 [[ "$(plutil -extract LSUIElement raw "$APP/Contents/Info.plist")" == "true" ]] \
     || { echo "LSUIElement 未生效，Dock 会出现图标" >&2; exit 1; }
+
+# 指定要求必须是稳定的那种。退化成 cdhash 的话，用户每装一次新包就要把
+# 所有隐私授权重开一遍——而且系统不会说为什么，只是把开关默默关掉。
+if [[ -z "$IDENTITY" ]]; then
+    codesign -d -r- "$APP" 2>&1 | grep -q 'designated => identifier' \
+        || { echo "指定要求退化成了 cdhash——每次重新打包都会让已授权限失效" >&2; exit 1; }
+fi
+
+# 权限用途说明漏一条，对应位置的文件就永远同步不了，而且是**静默**的——
+# 没有报错、没有弹窗，只有日志里一句"读不了"。所以在这儿卡住，别等实机。
+for k in NSLocalNetworkUsageDescription NSDesktopFolderUsageDescription \
+         NSDocumentsFolderUsageDescription NSDownloadsFolderUsageDescription \
+         NSRemovableVolumesUsageDescription NSNetworkVolumesUsageDescription; do
+    plutil -extract "$k" raw "$APP/Contents/Info.plist" > /dev/null 2>&1 \
+        || { echo "Info.plist 缺少 $k——对应位置的文件会静默同步失败" >&2; exit 1; }
+done
 test -s "$APP/Contents/Resources/AppIcon.icns"
 
 # ————————————————————————— 分发包 —————————————————————————

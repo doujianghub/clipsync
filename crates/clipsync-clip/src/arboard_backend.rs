@@ -66,6 +66,11 @@ impl Clipboard for ArboardClipboard {
         // 敏感标记独立于内容类型，先探测一次（不打开剪贴板，开销极小）。
         let sensitive = crate::sensitive::clipboard_is_sensitive();
 
+        // 全部文件都被系统拒了的话，下面会退回文本分支——那条路仍要把"为什么
+        // 没同步成文件"带上去，否则用户看到的就是"复制了文件，对面收到一串
+        // 文件名"，比什么都不发生更让人费解。
+        let mut denied: Vec<crate::DeniedFile> = Vec::new();
+
         // 文件优先：资源管理器复制文件时往往同时提供文件列表与一份文本表示
         // （文件名/路径）。用户的意图是文件，故先看有没有文件列表。
         match crate::filelist::read_file_paths() {
@@ -80,6 +85,7 @@ impl Clipboard for ArboardClipboard {
                 // 反查就会把两条路径都保留，从此与元数据错位。
                 let mut metas = Vec::with_capacity(paths.len());
                 let mut kept = Vec::with_capacity(paths.len());
+                let total = paths.len();
                 for p in paths {
                     match crate::filelist::meta_for_path(&p) {
                         Ok(m) => {
@@ -87,15 +93,45 @@ impl Clipboard for ArboardClipboard {
                             kept.push(p);
                         }
                         // 单个文件读不到信息（已删除/无权限）不应毁掉整次同步，
-                        // 跳过它并记录。
-                        Err(e) => tracing::debug!("跳过无法读取的文件 {}: {e:#}", p.display()),
+                        // 跳过它并继续。
+                        //
+                        // **但必须说出来。** 这里原先只记 DEBUG，于是"从微信复制
+                        // 文件同步不过去"在默认日志级别下一个字都看不到——用户
+                        // 只知道没反应，无从查起。而这偏偏是最需要解释的一类
+                        // 失败：它不是程序的毛病，是一个用户点两下就能解决的
+                        // 系统授权问题。
+                        Err(e) => {
+                            if crate::filelist::is_permission_denied(&e) {
+                                let d = crate::filelist::explain_denied(&p);
+                                tracing::warn!(
+                                    "系统拒绝读取 {}：{}。去「{}」把 ClipSync 打开即可。",
+                                    p.display(),
+                                    d.reason,
+                                    d.where_to_fix
+                                );
+                                denied.push(crate::DeniedFile {
+                                    path: p,
+                                    reason: d.reason.to_string(),
+                                    where_to_fix: d.where_to_fix.to_string(),
+                                });
+                            } else {
+                                tracing::info!("跳过无法读取的文件 {}: {e:#}", p.display());
+                            }
+                        }
                     }
+                }
+                if !denied.is_empty() && metas.is_empty() {
+                    tracing::warn!(
+                        "剪贴板里的 {total} 个文件全都读不了，本次复制未能同步；\
+                         详情见上一行，或运行 `clipsync clipdiag` 逐条查看"
+                    );
                 }
                 if !metas.is_empty() {
                     debug_assert_eq!(metas.len(), kept.len(), "元数据与路径必须等长");
                     return Ok(Some(ClipRead {
                         content: ClipContent::Files(metas),
                         sensitive,
+                        denied,
                         file_paths: kept,
                     }));
                 }
@@ -111,7 +147,7 @@ impl Clipboard for ArboardClipboard {
             match retry_on_occupied(|| self.inner.get_image()) {
                 Ok(img) => {
                     let content = arboard_image_to_content(img);
-                    return Ok(Some(ClipRead::simple(content, sensitive)));
+                    return Ok(Some(ClipRead::simple(content, sensitive).with_denied(denied)));
                 }
                 Err(arboard::Error::ContentNotAvailable) => { /* 退回读取文本 */ }
                 Err(e) => {
@@ -126,7 +162,9 @@ impl Clipboard for ArboardClipboard {
                             img.width,
                             img.height
                         );
-                        return Ok(Some(ClipRead::simple(ClipContent::Image(img), sensitive)));
+                        return Ok(Some(
+                            ClipRead::simple(ClipContent::Image(img), sensitive).with_denied(denied),
+                        ));
                     }
                     return Err(e).context("读取剪贴板图片失败");
                 }
@@ -134,7 +172,9 @@ impl Clipboard for ArboardClipboard {
         }
 
         match retry_on_occupied(|| self.inner.get_text()) {
-            Ok(text) => Ok(Some(ClipRead::simple(ClipContent::Text(text), sensitive))),
+            Ok(text) => Ok(Some(
+                ClipRead::simple(ClipContent::Text(text), sensitive).with_denied(denied),
+            )),
             Err(arboard::Error::ContentNotAvailable) => Ok(None),
             Err(e) => Err(e).context("读取剪贴板文本失败"),
         }

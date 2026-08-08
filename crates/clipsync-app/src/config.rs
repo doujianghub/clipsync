@@ -28,8 +28,21 @@ const APPLICATION: &str = "ClipSync";
 /// 用户可调设置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
-    /// 单次内容最大字节数。默认 100 MiB。
-    pub max_bytes: usize,
+    /// **自动取回上限**：收到的文件在这个大小以内就自动拉取，超过则挂起，
+    /// 由用户在托盘上点一下再拉。默认 100 MiB。
+    ///
+    /// **只管接收，不管发送**：复制多大的文件都照常通告给对端——发送方无从
+    /// 知道对方的网络与磁盘状况，"值不值得拉"这个判断只有收的人做得了。
+    /// 原先它是发送侧的硬上限（`max_bytes`），结果是接收方的设置对它自己毫无
+    /// 保护：A 设「不限」就能把 5 GB 推给设了 100 MiB 的 B。
+    ///
+    /// **也不管文本和图片**：那两类是推过来的，字节到岸了再判断省不下任何
+    /// 东西，只有一个不可调的硬上限（`clipsync_core::INLINE_MAX_BYTES`）。
+    ///
+    /// 保留 `max_bytes` 这个别名，是因为三台机器上都已经有写好的 settings.json，
+    /// 改名不该把用户设过的值悄悄重置成默认。
+    #[serde(alias = "max_bytes")]
+    pub auto_fetch_bytes: usize,
     /// 是否同步图片。
     pub allow_image: bool,
     /// 是否同步文件。
@@ -81,7 +94,7 @@ fn default_compress() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            max_bytes: 100 * 1024 * 1024,
+            auto_fetch_bytes: 100 * 1024 * 1024,
             allow_image: true,
             allow_files: true,
             listen_port: 47_684, // 固定默认端口，便于 mDNS 之外的直连调试
@@ -97,7 +110,6 @@ impl Settings {
     /// 映射为核心引擎的 `Limits`。
     pub fn to_limits(&self) -> clipsync_core::Limits {
         clipsync_core::Limits {
-            max_bytes: self.max_bytes,
             allow_image: self.allow_image,
             allow_files: self.allow_files,
         }

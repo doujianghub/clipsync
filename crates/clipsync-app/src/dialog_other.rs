@@ -15,6 +15,12 @@ pub fn prompt(title: &str, body: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+pub fn ask_action(title: &str, body: &str, action: &str) -> Result<bool> {
+    // 显示不出按钮就等于没人按过它。
+    tracing::info!("[{title}] {body}（本平台无弹窗，「{action}」不可用）");
+    Ok(false)
+}
+
 pub fn confirm(title: &str, body: &str) -> Result<bool> {
     // 无从征得同意，一律当作否——破坏性操作不能默认执行。
     tracing::info!("[{title}] {body}（本平台无确认框，按取消处理）");

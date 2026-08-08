@@ -40,6 +40,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "5"
 ctrlc = "3"
 
+# —— 压缩 —— #
+# 帧层（clipsync-net）与文件分块（clipsync-app）共用，版本必须一致。
+flate2 = "1"
+
 # —— 内部 crate —— #
 clipsync-core = { path = "crates/clipsync-core" }
 clipsync-clip = { path = "crates/clipsync-clip" }

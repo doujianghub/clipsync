@@ -22,7 +22,7 @@ use windows_sys::Win32::UI::Controls::{
     TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
     TDF_POSITION_RELATIVE_TO_WINDOW, TDF_USE_COMMAND_LINKS,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{IDCANCEL, IDNO, IDYES};
+use windows_sys::Win32::UI::WindowsAndMessaging::{IDCANCEL, IDNO, IDOK, IDYES};
 
 /// `TaskDialogIndirect` 的签名，供运行时取址后调用。
 type TaskDialogIndirectFn = unsafe extern "system" fn(
@@ -91,6 +91,30 @@ pub fn show(title: &str, body: &str) -> Result<()> {
     // TDCBF_OK_BUTTON = 1
     cfg.dwCommonButtons = 1;
     run(&cfg).map(|_| ())
+}
+
+/// 信息框 + 一个动作按钮。
+///
+/// 动作走自定义按钮，「好」用系统的 OK——默认按钮因此天然落在「好」上，
+/// 动作是岔路而非主路。不加 `TDF_USE_COMMAND_LINKS`：只有一个动作时，
+/// 那种整行大按钮会喧宾夺主，而这个窗口的主角是配对码。
+pub fn ask_action(title: &str, body: &str, action: &str) -> Result<bool> {
+    let (title_w, body_w, action_w) = (wide(title), wide(body), wide(action));
+    let buttons = [TASKDIALOG_BUTTON {
+        nButtonID: FIRST_BUTTON_ID,
+        pszButtonText: pcwstr(&action_w),
+    }];
+
+    let mut cfg = base_config();
+    cfg.pszWindowTitle = pcwstr(&title_w);
+    cfg.pszContent = pcwstr(&body_w);
+    cfg.cButtons = 1;
+    cfg.pButtons = buttons.as_ptr();
+    // TDCBF_OK_BUTTON = 1
+    cfg.dwCommonButtons = 1;
+    cfg.nDefaultButton = IDOK as i32;
+
+    Ok(run(&cfg)? == FIRST_BUTTON_ID)
 }
 
 /// 确认框。返回用户是否点了「是」。

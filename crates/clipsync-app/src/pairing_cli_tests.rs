@@ -22,7 +22,8 @@ fn accept_until_releases_port_after_deadline() {
     listener.set_nonblocking(true).unwrap();
 
     let deadline = Instant::now() + Duration::from_millis(300);
-    let got = accept_until(&listener, deadline).expect("轮询不应报错");
+    let never = AtomicBool::new(false);
+    let got = accept_until(&listener, deadline, &never).expect("轮询不应报错");
     assert!(got.is_none(), "无人连入时应到期返回 None，而不是永久阻塞");
     assert!(Instant::now() >= deadline, "应确实等到了截止时间");
 
@@ -55,7 +56,8 @@ fn accept_until_returns_connection_in_blocking_mode() {
     });
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    let (stream, _) = accept_until(&listener, deadline)
+    let never = AtomicBool::new(false);
+    let (stream, _) = accept_until(&listener, deadline, &never)
         .expect("不应报错")
         .expect("应接到连接");
 
@@ -76,14 +78,21 @@ fn accept_until_returns_connection_in_blocking_mode() {
 ///
 /// 跑法：`cargo test -p clipsync-app --bin clipsync -- --ignored pairing_dialog`
 ///
-/// 判据：窗口标题为「ClipSync 配对」，正文首行的 4 位配对码清晰可读。
+/// 判据：
+///   1. 窗口标题为「ClipSync 配对」，正文首行的 4 位配对码清晰可读；
+///   2. 有两个按钮，**默认落在「好」**上——换码是岔路，敲回车不该把码换掉；
+///   3. 「有效至」那个时刻等于现在 + 3 分钟；
+///   4. 点「换个配对码」打印 `ACTION=true`，点「好」/Esc 打印 `ACTION=false`。
 #[test]
 #[ignore = "会弹窗并阻塞，需人工/脚本关闭"]
 fn manual_pairing_dialog() {
     let code = PairingCode::generate();
     // 打到 stdout，供外部脚本比对窗口里显示的是不是同一个码。
     println!("EXPECT_CODE={code}");
-    crate::dialog::show_info("ClipSync 配对", &code_dialog_body(code.as_str(), 47_684));
+    let body = code_dialog_body(code.as_str(), 47_684, HOST_SESSION_TIMEOUT);
+    println!("{body}");
+    let acted = crate::dialog::ask_action("ClipSync 配对", &body, "换个配对码");
+    println!("ACTION={acted}");
 }
 
 /// 纯配对码：不带地址，调用方走局域网自动发现。
@@ -155,15 +164,17 @@ fn manual_code_with_address_round_trips() {
 #[test]
 fn dialog_body_tells_the_user_everything_and_mentions_no_clipboard() {
     let code = PairingCode::from_entropy(b"\x01\x02\x03\x04");
-    let body = code_dialog_body(code.as_str(), 47_684);
+    let body = code_dialog_body(code.as_str(), 47_684, HOST_SESSION_TIMEOUT);
 
     assert!(body.contains(code.as_str()), "得有码");
     assert!(body.contains("输入配对码"), "得说去哪儿输");
     assert!(body.contains("配对成功即失效"), "得说清一个码只配一台");
-    assert!(
-        body.contains(&(HOST_SESSION_TIMEOUT.as_secs() / 60).to_string()),
-        "得说多久过期"
-    );
+    // 有效期写成绝对时刻：这个窗口显示出来就改不了字了，写「还有 2 分 47 秒」
+    // 从那一刻起就在撒谎。取不到系统时钟才退回说总时长。
+    match crate::wallclock::hms_after(HOST_SESSION_TIMEOUT) {
+        Some(at) => assert!(body.contains(&format!("有效至 {at}")), "得说到几点：{body}"),
+        None => assert!(body.contains("分钟内有效"), "退化路径也得说多久过期"),
+    }
     assert!(!body.contains("剪贴板"), "不该再提剪贴板");
     assert!(!body.contains("复制"), "不该再提复制");
 }
@@ -173,7 +184,7 @@ fn dialog_body_tells_the_user_everything_and_mentions_no_clipboard() {
 #[ignore = "结果取决于本机网卡，只为肉眼看"]
 fn manual_show_address_blocks() {
     println!("—— 配对码窗口 ——");
-    println!("{}", code_dialog_body("1234", 47_684));
+    println!("{}", code_dialog_body("1234", 47_684, HOST_SESSION_TIMEOUT));
     println!();
     println!("—— 手输地址时 ——");
     println!("请输入对方的 IP（对方窗口里有）：");
@@ -217,4 +228,47 @@ fn address_block_lists_every_ipv4_lan_first() {
             "局域网地址应连续排在最前：{lines:?}"
         );
     }
+}
+
+/// 「换个配对码」必须**当场**生效，而不是等到会话到期。
+///
+/// 取消标志是靠 accept 轮询发现的（`accept()` 一旦阻塞就叫不醒）。这条把
+/// deadline 设在很远的地方，能跑完就说明走的是取消这条路。
+#[test]
+fn accept_until_gives_up_promptly_when_cancelled() {
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        flag.store(true, Ordering::Release);
+    });
+
+    let started = Instant::now();
+    let got = accept_until(&listener, Instant::now() + Duration::from_secs(600), &cancel)
+        .expect("取消不是错误");
+    assert!(got.is_none(), "被取消时不该报告有连接");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "取消应在一两个轮询周期内生效，实际等了 {:?}",
+        started.elapsed()
+    );
+}
+
+/// `Cancelled` 必须能从 `anyhow::Error` 里认出来。
+///
+/// 调用方据此区分"用户要换码"（接着开新一轮，不弹窗）和"真出事了"（弹一个
+/// 配对失败）。若改成靠错误文案匹配，改一次措辞就会让用户在换码时看到一个
+/// 莫名其妙的失败框——`WrongCode` 也是同样的道理。
+#[test]
+fn cancelled_is_recognisable_through_anyhow() {
+    let e = anyhow::Error::new(Cancelled);
+    assert!(e.downcast_ref::<Cancelled>().is_some());
+    // 别的错误不能被误认成取消，否则真故障会被当成换码悄悄吞掉。
+    let other = anyhow::anyhow!("监听配对端口 47685 失败");
+    assert!(other.downcast_ref::<Cancelled>().is_none());
 }

@@ -11,11 +11,25 @@
 use crate::content::ClipContent;
 use crate::device::DeviceId;
 
-/// 大小/类型限制。
+/// **内联内容**（文本、图片）的硬上限。
+///
+/// 这两类是**推**过去的——图片的 RGBA 就躺在 `Clip` 消息里——所以没有"先看看
+/// 多大再决定要不要"这回事：字节到岸了再判断，一个字节也省不下来。它们只能有
+/// 一个防失控的硬上限，而不是一个需要用户权衡的旋钮。
+///
+/// 100 MiB 是"够用得离谱"的量：5000×5000 的截图连 RGBA 也才 100 MB，文本更不
+/// 可能接近。真正需要用户拿主意的是**文件**，那是接收侧
+/// `Settings::auto_fetch_bytes` 的事——文件只传元数据，拉不拉由收的人说了算。
+pub const INLINE_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+/// 类型开关。
+///
+/// **这里没有大小上限**：文件的大小由接收方自己决定（见 `INLINE_MAX_BYTES`
+/// 的说明），发送方一律照发元数据。原先这里有个 `max_bytes` 装在发送侧，
+/// 结果是接收方的设置对它自己毫无保护——A 设「不限」就能把 5 GB 推给设了
+/// 100 MiB 的 B，而带宽和磁盘全花在 B 身上。
 #[derive(Debug, Clone)]
 pub struct Limits {
-    /// 单次内容最大字节数（文本/图片/文件都适用）。默认 100 MiB。
-    pub max_bytes: usize,
     /// 是否同步图片。
     pub allow_image: bool,
     /// 是否同步文件。
@@ -25,7 +39,6 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_bytes: 100 * 1024 * 1024,
             allow_image: true,
             allow_files: true,
         }
@@ -203,8 +216,13 @@ impl SyncEngine {
             return LocalDecision::Skip(SkipReason::KindDisabled);
         }
 
-        // 4) 大小上限。
-        if content.byte_size() > self.limits.max_bytes {
+        // 4) 内联内容的硬上限。
+        //
+        // 文件**不受此限**：它们只把元数据发出去，实际字节由接收方按自己的
+        // 「自动取回上限」决定拉不拉（见 `hub_incoming::begin_incoming_files`）。
+        // 复制多大的文件都照常通告，是这套语义的前提——发送方无从知道对方
+        // 的网络与磁盘状况，那个判断本来就该由收的人来做。
+        if !matches!(content, ClipContent::Files(_)) && content.byte_size() > INLINE_MAX_BYTES {
             return LocalDecision::Skip(SkipReason::TooLarge);
         }
 

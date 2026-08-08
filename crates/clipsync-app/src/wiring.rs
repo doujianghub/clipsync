@@ -98,12 +98,18 @@ pub(crate) fn spawn_clip_watch(
                 if !running.load(Ordering::SeqCst) {
                     return false;
                 }
-                match reader.read() {
+                // 大图从系统剪贴板取出来要现场解码（macOS 上是 TIFF），
+                // 一张 4K 截图能占掉可观的时间——慢的时候得看得见。
+                let t0 = std::time::Instant::now();
+                let got = reader.read();
+                crate::logging::note_slow("读取剪贴板", t0);
+                match got {
                     Ok(Some(read)) => {
                         if is_our_received_files(&read, &received_dir) {
                             tracing::debug!("跳过本机刚落地的接收文件（避免回环）");
                             return true;
                         }
+                        warn_once_about_denied(&read.denied);
                         hub.send(hub::HubEvent::Local {
                             content: read.content,
                             sensitive: read.sensitive,
@@ -120,6 +126,13 @@ pub(crate) fn spawn_clip_watch(
             }
         })?;
     Ok(())
+}
+
+/// 把本次复制里被拒的文件报给用户（只报第一个，一次说清即可）。
+fn warn_once_about_denied(denied: &[clipsync_clip::DeniedFile]) {
+    if let Some(d) = denied.first() {
+        crate::dialog::permission_hint_once(&d.path, &d.reason, &d.where_to_fix);
+    }
 }
 
 /// 这次剪贴板内容是否为本程序自己落地的接收文件。

@@ -55,6 +55,22 @@ pub struct ClipRead {
     ///   1. 对端索取内容时，据此流式读取文件字节。
     ///   2. 识别"这是我们自己刚落地的接收文件"，避免把收到的文件又广播回去。
     pub file_paths: Vec<std::path::PathBuf>,
+    /// 本次复制里被系统**拒绝读取**的文件，及该去哪儿开权限。
+    ///
+    /// 这不是错误——同一次复制里其它文件照常同步。但它必须能传到上层：
+    /// 权限被拒是用户点两下就能解决的事，而它的默认表现是**什么都不发生**。
+    /// 只记日志等于没说，托盘程序的用户不会去翻日志。
+    pub denied: Vec<DeniedFile>,
+}
+
+/// 一个因权限读不了的文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeniedFile {
+    pub path: std::path::PathBuf,
+    /// 这是什么位置（如"另一个 App 的私有数据目录"）。
+    pub reason: String,
+    /// 系统设置里对应的那一页。
+    pub where_to_fix: String,
 }
 
 impl ClipRead {
@@ -64,7 +80,14 @@ impl ClipRead {
             content,
             sensitive,
             file_paths: Vec::new(),
+            denied: Vec::new(),
         }
+    }
+
+    /// 附上本次读取中被系统拒绝的文件。
+    pub fn with_denied(mut self, denied: Vec<DeniedFile>) -> Self {
+        self.denied = denied;
+        self
     }
 }
 

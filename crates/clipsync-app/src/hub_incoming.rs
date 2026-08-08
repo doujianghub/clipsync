@@ -13,11 +13,27 @@ use tracing::{debug, info, warn};
 
 use super::HubState;
 
+/// 一批**挂起待取**的文件：超过自动取回上限，等用户在托盘上点一下。
+///
+/// 只留一份。剪贴板本来就只有一格，同时挂着两份"待取"既无处显示，语义上也
+/// 说不通——新的文件复制就是对旧的取代。
+pub(super) struct PendingFetch {
+    pub(super) from: DeviceId,
+    pub(super) generation: u64,
+    pub(super) files: Vec<FileMeta>,
+    pub(super) total: u64,
+}
+
 /// 一次进行中的文件接收。
 pub(super) struct IncomingTransfer {
     pub(super) generation: u64,
     pub(super) from: DeviceId,
     pub(super) files: Vec<FileMeta>,
+    /// 是否由用户在托盘上手动点「取回」发起。
+    ///
+    /// 自动传输失败了不必打扰人——下次复制同一份内容还会再来一遍。手动那次
+    /// 不同：人刚点了一下，什么反馈都没有只会让人以为按钮坏了。
+    pub(super) manual: bool,
     /// 与 `files` 等长：各文件内容是否已完整落入缓存。
     pub(super) done: Vec<bool>,
     /// 本批文件的总字节数与已到手字节数，供托盘报进度。
@@ -42,9 +58,143 @@ impl IncomingTransfer {
     }
 }
 
+/// 这批文件该不该现在就拉？
+///
+/// 两条规则，单独成纯函数是为了能不搭一整套中枢就把边界测掉：
+///   1. 不超过上限就拉——这是绝大多数情况，行为与从前完全一致；
+///   2. **缓存里整份都有的一律拉**，不管多大。那是零传输：来回切换同一个
+///      大文件、或断线重连后重复通告都会走这条路，此时还要人多点一下纯属
+///      多余，而"取回"这个词也名不副实——根本没什么要取。
+fn should_auto_fetch(total: u64, limit: u64, fully_cached: bool) -> bool {
+    total <= limit || fully_cached
+}
+
 impl HubState {
+    /// 对端通告了一批文件：**由本机决定**要不要现在就拉。
+    ///
+    /// 这是"自动取回上限"落地的地方，也是这套语义的要点——发送方无从知道
+    /// 本机的网络与磁盘状况，"值不值得拉"只有收的人判断得了。超限的挂起，
+    /// 在托盘上点一下再拉（见 [`fetch_pending`](Self::fetch_pending)）。
+    pub(super) fn offer_incoming_files(
+        &mut self,
+        from: DeviceId,
+        generation: u64,
+        files: Vec<FileMeta>,
+    ) {
+        let total: u64 = files.iter().map(|f| f.size).sum();
+        let limit = self.deps.settings.snapshot().auto_fetch_bytes as u64;
+        let cached = files
+            .iter()
+            .all(|f| self.deps.cache.is_complete(f.id, f.size));
+
+        if should_auto_fetch(total, limit, cached) {
+            self.clear_pending();
+            self.begin_incoming_files(from, generation, files, false);
+            return;
+        }
+
+        // 挂起。进行中的接收一并作废——对端剪贴板已经不是那份内容了，
+        // 它自己也会中止；已收字节留在缓存里，将来仍可续传。
+        self.incoming = None;
+        // **告诉引擎"这份内容并没有进我的剪贴板"**。
+        //
+        // `on_remote_clip` 判定 Apply 时就把内容哈希记成了当前状态，而我们这条
+        // 路根本没写剪贴板。不撤销的话，对方过一会儿再复制同一个文件，就会被
+        // 当成重复内容直接跳过——托盘上那一行再也不会出现，用户只会觉得
+        // "又复制了一遍怎么没反应"。
+        self.engine.forget_current();
+        info!(
+            "收到 {} 个文件共 {} 字节，超过自动取回上限 {} 字节，已挂起等待手动取回",
+            files.len(),
+            total,
+            limit
+        );
+        self.pending = Some(PendingFetch {
+            from,
+            generation,
+            files,
+            total,
+        });
+        self.publish_pending();
+    }
+
+    /// 用户在托盘上点了「取回」。
+    pub(super) fn fetch_pending(&mut self) {
+        let Some(p) = self.pending.take() else {
+            debug!("没有待取回的文件，忽略");
+            return;
+        };
+        // 对方不在线就原样放回去：`FileNeed` 根本发不出去，硬着头皮开一个
+        // 永远等不到分块的接收，只会让托盘上的那一行凭空消失。
+        if !self.peers.contains_key(&p.from) {
+            info!("待取文件的来源设备 {} 当前不在线，暂不取回", p.from);
+            self.pending = Some(p);
+            self.publish_pending();
+            crate::hub::notify(
+                "对方当前不在线。\n\n等它上线后再点一次「取回」——\n只要它没有再复制别的文件，这一份就还在。",
+            );
+            return;
+        }
+        self.publish_pending();
+        info!(
+            "手动取回 {} 个文件（共 {} 字节，来自 {}）",
+            p.files.len(),
+            p.total,
+            p.from
+        );
+        self.begin_incoming_files(p.from, p.generation, p.files, true);
+    }
+
+    /// 传输被打断（对端掉线）——手动那次放回待取队列。
+    ///
+    /// 自动传输不必管：下次复制同一份内容还会再来一遍。手动这次是人专门点过
+    /// 的，就此消失等于白点，而已收字节还在缓存里，重连后点一下就能续上。
+    pub(super) fn requeue_if_manual(&mut self) {
+        let Some(t) = self.incoming.take() else { return };
+        if !t.manual {
+            return;
+        }
+        info!("手动取回被中断，放回待取队列（已收部分保留，可续传）");
+        self.pending = Some(PendingFetch {
+            from: t.from,
+            generation: t.generation,
+            total: t.total_bytes,
+            files: t.files,
+        });
+        self.publish_pending();
+    }
+
+    /// 丢弃待取项并同步给托盘。
+    pub(super) fn clear_pending(&mut self) {
+        if self.pending.take().is_some() {
+            self.publish_pending();
+        }
+    }
+
+    /// 把待取项的摘要交给托盘（菜单项、角标、悬停提示都读它）。
+    fn publish_pending(&self) {
+        self.deps
+            .status
+            .set_pending(self.pending.as_ref().map(|p| crate::tray::PendingFetchInfo {
+                from: p.from.to_string(),
+                first_name: p
+                    .files
+                    .first()
+                    .map(|f| f.name.clone())
+                    .unwrap_or_else(|| "文件".into()),
+                count: p.files.len(),
+                total: p.total,
+            }));
+    }
+
     /// 开始接收一批文件：先查缓存，只索取缺失的部分。
-    pub(super) fn begin_incoming_files(&mut self, from: DeviceId, generation: u64, files: Vec<FileMeta>) {
+    pub(super) fn begin_incoming_files(
+        &mut self,
+        from: DeviceId,
+        generation: u64,
+        files: Vec<FileMeta>,
+        manual: bool,
+    ) {
         // 新内容取代任何进行中的接收（其字节已在缓存中，将来可续传）。
         if self.incoming.is_some() {
             debug!("新的剪贴板内容取代了进行中的文件接收");
@@ -72,6 +222,7 @@ impl HubState {
             from: from.clone(),
             files,
             done,
+            manual,
             total_bytes: total,
             got_bytes: cached_bytes,
         };
@@ -252,3 +403,7 @@ impl HubState {
         self.deps.cache.evict_to_limit(&transfer.pinned_ids());
     }
 }
+
+#[cfg(test)]
+#[path = "hub_incoming_tests.rs"]
+mod tests;

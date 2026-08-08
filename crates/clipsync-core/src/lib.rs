@@ -12,5 +12,7 @@ pub mod message;
 
 pub use content::{ClipContent, ContentKind, FileMeta, ImageData};
 pub use device::{DeviceId, DeviceInfo};
-pub use engine::{Limits, LocalDecision, RemoteDecision, SkipReason, SyncEngine};
+pub use engine::{
+    Limits, LocalDecision, RemoteDecision, SkipReason, SyncEngine, INLINE_MAX_BYTES,
+};
 pub use message::{PeerIntro, SyncMessage, PROTOCOL_VERSION};
