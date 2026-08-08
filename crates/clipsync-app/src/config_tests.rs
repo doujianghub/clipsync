@@ -237,3 +237,48 @@ fn the_old_max_bytes_key_still_loads() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 只写想改的那一项，其余该用默认值——而不是把整份配置判为损坏。
+///
+/// 回归自一次真实踩坑：验证发布包时手写了 `{"language":"en"}`，程序却输出
+/// 中文。查下来是这份配置被判损坏、另存为 `.bad` 后回退到了默认值。行为本身
+/// 没错（损坏就该回退），错在**判据**：README 明说这个文件可以手工编辑，那
+/// 少写几个字段就该照默认值补齐，而不是整份作废。
+///
+/// 逐字段断言而不是只测一个：`#[serde(default)]` 是一项一项加的，漏掉哪个
+/// 都只有那一个字段会引发整份失效，光测 language 发现不了。
+#[test]
+fn a_partial_config_fills_in_defaults() {
+    let dir = std::env::temp_dir().join("clipsync_partial_config");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("settings.json"), r#"{"language":"en"}"#).unwrap();
+
+    let s = load_or_init_settings(&dir).expect("部分配置应当能加载");
+    let d = Settings::default();
+
+    assert_eq!(s.language, "en", "写了的字段要生效");
+    assert_eq!(s.auto_fetch_bytes, d.auto_fetch_bytes);
+    assert_eq!(s.allow_image, d.allow_image);
+    assert_eq!(s.allow_files, d.allow_files);
+    assert_eq!(s.listen_port, d.listen_port);
+    assert_eq!(s.file_cache_bytes, d.file_cache_bytes);
+    assert_eq!(s.compress_transfers, d.compress_transfers);
+
+    assert!(
+        !dir.join("settings.json.bad").exists(),
+        "不该被当成损坏配置另存"
+    );
+}
+
+/// 空对象也算合法：等同于全默认。
+#[test]
+fn an_empty_config_object_is_valid() {
+    let dir = std::env::temp_dir().join("clipsync_empty_config");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("settings.json"), "{}").unwrap();
+    let s = load_or_init_settings(&dir).expect("空对象应当能加载");
+    assert_eq!(s.listen_port, Settings::default().listen_port);
+    assert!(!dir.join("settings.json.bad").exists());
+}

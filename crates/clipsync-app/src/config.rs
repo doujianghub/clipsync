@@ -41,13 +41,16 @@ pub struct Settings {
     ///
     /// 保留 `max_bytes` 这个别名，是因为三台机器上都已经有写好的 settings.json，
     /// 改名不该把用户设过的值悄悄重置成默认。
-    #[serde(alias = "max_bytes")]
+    #[serde(alias = "max_bytes", default = "default_auto_fetch_bytes")]
     pub auto_fetch_bytes: usize,
     /// 是否同步图片。
+    #[serde(default = "default_true")]
     pub allow_image: bool,
     /// 是否同步文件。
+    #[serde(default = "default_true")]
     pub allow_files: bool,
     /// 监听端口（TCP，供对端连接）。0 表示随机分配。
+    #[serde(default = "default_listen_port")]
     pub listen_port: u16,
     /// 文件内容缓存上限（字节）。
     ///
@@ -90,6 +93,18 @@ fn default_language() -> String {
     "auto".into()
 }
 
+fn default_auto_fetch_bytes() -> usize {
+    100 * 1024 * 1024 // 100 MiB
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_listen_port() -> u16 {
+    47_684
+}
+
 fn default_file_cache_bytes() -> u64 {
     1024 * 1024 * 1024 // 1 GiB
 }
@@ -105,10 +120,10 @@ fn default_compress() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            auto_fetch_bytes: 100 * 1024 * 1024,
-            allow_image: true,
-            allow_files: true,
-            listen_port: 47_684, // 固定默认端口，便于 mDNS 之外的直连调试
+            auto_fetch_bytes: default_auto_fetch_bytes(),
+            allow_image: default_true(),
+            allow_files: default_true(),
+            listen_port: default_listen_port(), // 固定默认端口，便于 mDNS 之外的直连调试
             file_cache_bytes: default_file_cache_bytes(),
             upload_limit_bytes_per_sec: default_upload_limit(),
             compress_transfers: default_compress(),
