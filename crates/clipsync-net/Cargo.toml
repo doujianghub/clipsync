@@ -32,7 +32,7 @@ blake2 = "0.10"
 # 枚举本机网卡地址。用于通用地识别所有可达路径——不论是物理网卡、
 # Tailscale/ZeroTier/Netbird/WireGuard 等覆盖网虚拟网卡，一律作为候选地址，
 # 无需针对特定组网产品写适配。
-if-addrs = "0.13"
+if-addrs = "0.15"
 # 帧层的自适应压缩。图片以裸 RGBA 传输，一张 4K 截图 33 MB、压完只剩 6%。
 flate2 = { workspace = true }
 
