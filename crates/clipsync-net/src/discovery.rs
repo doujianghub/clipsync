@@ -504,6 +504,59 @@ mod loopback_smoke {
         );
     }
 
+    /// 逐网卡报告组播能力，用来判断"跳过"到底是环境限制还是我们的缺陷。
+    ///
+    /// 平时不跑（`#[ignore]`）。CI 上单独调起它，把结果发成注解——不然
+    /// 只能看到一句"跳过：不支持组播"，凭什么这么说无从查证。
+    #[test]
+    #[ignore = "环境诊断，按需运行"]
+    fn multicast_capability_report() {
+        const PROBE_PORT: u16 = 47_698;
+        let ifs = if_addrs::get_if_addrs().unwrap_or_default();
+        println!("网卡：");
+        for i in &ifs {
+            if let if_addrs::IfAddr::V4(v4) = &i.addr {
+                println!(
+                    "  {:<12} {:<16} loopback={}",
+                    i.name,
+                    v4.ip,
+                    i.is_loopback()
+                );
+            }
+        }
+
+        let Ok(rx) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, PROBE_PORT)) else {
+            println!("绑定 {PROBE_PORT} 失败");
+            return;
+        };
+        let mut joined = Vec::new();
+        for i in &ifs {
+            let if_addrs::IfAddr::V4(v4) = &i.addr else {
+                continue;
+            };
+            if v4.ip.is_link_local() {
+                continue;
+            }
+            match rx.join_multicast_v4(&BEACON_GROUP, &v4.ip) {
+                Ok(()) => joined.push(format!("{}({})", i.name, v4.ip)),
+                Err(e) => println!("  join 失败 {} {}: {e}", i.name, v4.ip),
+            }
+        }
+        println!("join 成功：{joined:?}");
+
+        let _ = rx.set_read_timeout(Some(Duration::from_millis(800)));
+        let tx = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("绑定发送端失败");
+        let _ = tx.set_multicast_loop_v4(true);
+        let sent = tx.send_to(
+            b"probe",
+            SocketAddr::new(IpAddr::V4(BEACON_GROUP), PROBE_PORT),
+        );
+        let mut buf = [0u8; 32];
+        let got = rx.recv_from(&mut buf).is_ok();
+        println!("发送 ok={} / 自收 ok={}", sent.is_ok(), got);
+        println!("结论：组播回环{}", if got { "可用" } else { "不可用" });
+    }
+
     /// 这台机器现在能不能**自发自收**组播。
     ///
     /// CI runner（实测 GitHub 的 macOS runner）的网络沙箱里，组播组加得进去、

@@ -52,6 +52,22 @@ jobs:
       #   - ::error:: 注解：会进 check-run 的 annotations，**匿名 API 也读得到**。
       # 后者才是关键——Actions 的原始日志要登录才能下载，排查时拿不到具体
       # 断言，只能看到一句 "Process completed with exit code 101"。
+      # 组播回环在 GitHub 的 macOS runner 上不通，相关测试会自行跳过。
+      # 这一步把"为什么不通"记录下来——否则那句跳过就只是一个无从查证的
+      # 断言。走 ::warning:: 是因为注解能被匿名 API 读到，原始日志不能。
+      - name: Multicast capability (diagnostic)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          out=$(cargo test -p clipsync-net -- --ignored --nocapture \
+                  multicast_capability_report 2>&1 | sed -n '/网卡：/,/结论：/p')
+          echo "$out"
+          enc="${out//'%'/%25}"
+          enc="${enc//$'\r'/}"
+          enc="${enc//$'\n'/%0A}"
+          echo "::warning title=${{ matrix.name }} 组播能力::$enc"
+
       - name: Surface test failures
         if: failure()
         shell: bash
