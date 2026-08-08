@@ -403,3 +403,60 @@ fn forgetting_current_lets_the_same_content_arrive_again() {
         "撤销后同一份内容应能再次被接受"
     );
 }
+
+/// 写剪贴板失败后，那条回声登记必须撤掉。
+///
+/// 否则用户之后自己复制到同样的内容时，会被当成"我们自己写进去的回声"而
+/// 吞掉——症状是某次复制莫名其妙没同步，且与失败那一刻隔得很远，根本联想
+/// 不到一起。
+#[test]
+fn a_failed_apply_releases_the_echo_slot() {
+    let mut e = engine();
+    let content = ClipContent::Text("同一份内容".into());
+    let hash = content.content_hash();
+
+    // 远端内容到达 → 登记回声 → 写剪贴板失败 → 回滚。
+    e.expect_echo(hash);
+    e.abandon_apply(hash);
+
+    // 现在用户自己复制了同样的东西，必须照常广播出去。
+    assert!(
+        matches!(e.on_local_change(&content, false), LocalDecision::Broadcast { .. }),
+        "回声登记已撤销，这次本地复制应当正常同步"
+    );
+}
+
+/// 对照组：没有撤销时，同样的内容确实会被当成回声吞掉。
+///
+/// 这条锁住的是上面那个测试的**前提**——如果哪天回声机制变了、吞不掉了，
+/// 上面的测试就会变成一个永远通过的空断言，得有人发现。
+#[test]
+fn without_the_rollback_the_same_content_is_swallowed_as_echo() {
+    let mut e = engine();
+    let content = ClipContent::Text("同一份内容".into());
+
+    e.expect_echo(content.content_hash());
+
+    assert!(
+        matches!(e.on_local_change(&content, false), LocalDecision::Skip(SkipReason::Echo)),
+        "登记还在时，这次本地变化应被判为回声"
+    );
+}
+
+/// 失败的应用不该把"当前内容"记成它——剪贴板里其实还是旧东西。
+#[test]
+fn a_failed_apply_does_not_claim_to_be_the_current_content() {
+    let mut e = engine();
+    let content = ClipContent::Text("没写进去的内容".into());
+    let hash = content.content_hash();
+
+    e.expect_echo(hash);
+    e.abandon_apply(hash);
+    // 撤销回声后再来一次本地变化会被广播（上面已验证）；这里验证的是
+    // 广播之后，引擎认的"当前内容"确实是它，而不是之前那次失败留下的状态。
+    let _ = e.on_local_change(&content, false);
+    assert!(
+        matches!(e.on_local_change(&content, false), LocalDecision::Skip(SkipReason::Duplicate)),
+        "重复的同一份内容应被去重"
+    );
+}

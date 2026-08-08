@@ -4,9 +4,6 @@
 //! 它仍是 `arboard_backend` 的子模块（由 `#[path]` 引入），`use super::*`
 //! 照常可用，与写在原文件里没有区别。
 
-// 本文件里的测试目前全是 macOS 限定的，导入也随之限定，否则在别的目标上
-// 会剩一条 unused_imports 告警。
-#[cfg(target_os = "macos")]
 use super::*;
 
 /// 端到端回归：arboard 解不了的图片，整条读取链路也必须能拿到。
@@ -152,4 +149,83 @@ fn same_named_files_keep_meta_and_path_aligned() {
     assert_eq!(metas[0].size, 2, "元数据应描述 b/x.txt（2 字节）而非已删除的 a/x.txt");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Windows 的 1418 必须被认成"占用"。
+///
+/// 这是回归测试：实机日志里出现过
+/// `SetClipboardData failed with error: 线程没有打开的剪贴板。(os error 1418)`，
+/// 而当时的判定只认 `ClipboardOccupied`，于是一次都没重试就报错了，用户那边
+/// 表现为"复制了但对端没更新"。
+#[test]
+fn windows_contention_errors_are_recognised() {
+    let unknown = |d: &str| arboard::Error::Unknown { description: d.into() };
+
+    assert!(is_occupied(&arboard::Error::ClipboardOccupied));
+    assert!(is_occupied(&unknown(
+        "SetClipboardData failed with error: 线程没有打开的剪贴板。 (os error 1418)"
+    )));
+    assert!(is_occupied(&unknown("OpenClipboard failed (os error 5)")));
+}
+
+/// 别把无关错误也当成占用——那会让真正的失败白白拖满整个重试预算。
+#[test]
+fn unrelated_errors_are_not_treated_as_contention() {
+    let unknown = |d: &str| arboard::Error::Unknown { description: d.into() };
+
+    assert!(!is_occupied(&arboard::Error::ContentNotAvailable));
+    assert!(!is_occupied(&arboard::Error::ConversionFailure));
+    assert!(!is_occupied(&unknown("something else entirely")));
+    // 右括号是防这个的：55 不是争用错误码，不能被 "(os error 5" 前缀钓上。
+    assert!(!is_occupied(&unknown("failed (os error 55)")));
+}
+
+/// 占用类错误要真的重试，而且最终成功。
+#[test]
+fn an_occupied_clipboard_is_retried_until_it_frees_up() {
+    let mut left = 3;
+    let got = retry_on_occupied(|| {
+        if left > 0 {
+            left -= 1;
+            Err(arboard::Error::Unknown {
+                description: "SetClipboardData failed (os error 1418)".into(),
+            })
+        } else {
+            Ok("写进去了")
+        }
+    });
+    assert_eq!(got.unwrap(), "写进去了");
+    assert_eq!(left, 0, "应当把三次占用都重试掉");
+}
+
+/// 非占用类错误必须立刻返回，一次都不重试。
+#[test]
+fn other_errors_fail_fast() {
+    let mut calls = 0;
+    let got: std::result::Result<(), _> = retry_on_occupied(|| {
+        calls += 1;
+        Err(arboard::Error::ConversionFailure)
+    });
+    assert!(got.is_err());
+    assert_eq!(calls, 1, "无关错误重试没有意义，只会拖延报错");
+}
+
+/// 重试有总时间上限，不能无限堵住中枢线程。
+///
+/// 用一个"每次都很慢"的操作模拟写大图（实测 240ms/次），验证它不会像固定
+/// 次数那样把预算翻好几倍。
+#[test]
+fn a_slow_operation_does_not_blow_the_budget() {
+    let started = std::time::Instant::now();
+    let got: std::result::Result<(), _> = retry_on_occupied(|| {
+        std::thread::sleep(Duration::from_millis(200));
+        Err(arboard::Error::ClipboardOccupied)
+    });
+    let took = started.elapsed();
+
+    assert!(got.is_err());
+    assert!(
+        took < Duration::from_millis(1200),
+        "慢操作也该在预算附近收手，实际 {took:?}"
+    );
 }

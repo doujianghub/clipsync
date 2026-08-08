@@ -22,14 +22,53 @@ pub struct ArboardClipboard {
     inner: arboard::Clipboard,
 }
 
-/// 剪贴板被占用时的重试次数与间隔。
+/// 剪贴板被占用时的重试间隔。
 ///
 /// Windows/macOS 的剪贴板是独占资源：任何程序写入时都会短暂持锁（浏览器、
-/// Office、密码管理器都如此）。不重试会造成两个后果——本次变化漏同步，以及
-/// 我们的访问直接失败。锁通常只持有几十毫秒，短间隔重试即可化解；总等待
-/// 上限约 300ms，对资源占用无实质影响。
-const RETRY_ATTEMPTS: u32 = 12;
+/// Office、输入法、密码管理器都如此）。不重试会造成两个后果——本次变化漏同步，
+/// 以及我们的访问直接失败。锁通常只持有几十毫秒，短间隔重试即可化解。
 const RETRY_DELAY: Duration = Duration::from_millis(25);
+
+/// 重试的**总时间预算**。
+///
+/// 为什么按时间而不是按次数：单次尝试的代价差着两个数量级。写一段文本不到
+/// 1ms，写一张 4K 图却要先把 33 MB RGBA 转成 DIB，实测 240ms——固定试 12 次
+/// 就是 3 秒，而这期间中枢线程完全堵死，其它设备的同步全都停摆。
+///
+/// 按时间收口后两头都合适：文本能试二十几次，大图试两三次，都不会拖垮中枢。
+const RETRY_BUDGET: Duration = Duration::from_millis(600);
+
+/// 这个错误是不是"剪贴板正被别人占着"。
+///
+/// **为什么要认字符串**：arboard 并不总把争用映射成 `ClipboardOccupied`。
+/// Windows 上 `SetClipboardData` 失败会被原样塞进 `Unknown { description }`，
+/// 实机日志里就是 `SetClipboardData failed with error: 线程没有打开的剪贴板。
+/// (os error 1418)`——于是重试逻辑一次都没触发，直接报错了。
+///
+/// arboard 的文档明说 `description` 不该用来辨认错误，可它没留别的路：错误码
+/// 没有以任何结构化形式暴露出来。这里认的是 `(os error N)` 那一段，它来自
+/// Rust 的 `io::Error` 格式而非系统本地化文案（上面那句中文会随系统语言变，
+/// 错误码不会）。
+///
+/// 万一将来 arboard 改了格式，匹配不上就退回"不重试"——也就是今天的行为，
+/// 不会比现在更糟。
+fn is_occupied(e: &arboard::Error) -> bool {
+    /// Windows 上表示"剪贴板被别人占着"的错误码。
+    ///
+    /// 带右括号是为了不让 `(os error 5)` 误匹配 `(os error 55)`。
+    const CONTENTION: &[&str] = &[
+        "(os error 1418)", // ERROR_CLIPBOARD_NOT_OPEN：没拿到所有权，或中途被抢走
+        "(os error 5)",    // ERROR_ACCESS_DENIED：OpenClipboard 被别的进程挡住
+    ];
+
+    match e {
+        arboard::Error::ClipboardOccupied => true,
+        arboard::Error::Unknown { description } => {
+            CONTENTION.iter().any(|code| description.contains(code))
+        }
+        _ => false,
+    }
+}
 
 /// 去抖动：检测到剪贴板变化后先等这么久，确认没有后续变化再读取。
 /// 取 120ms——足以覆盖常见程序写入多种格式的间隔，用户又感知不到延迟。
@@ -41,17 +80,30 @@ const DEBOUNCE_MAX_ROUNDS: u32 = 5;
 fn retry_on_occupied<T>(
     mut op: impl FnMut() -> std::result::Result<T, arboard::Error>,
 ) -> std::result::Result<T, arboard::Error> {
-    for attempt in 0..RETRY_ATTEMPTS {
+    let deadline = std::time::Instant::now() + RETRY_BUDGET;
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
         match op() {
-            Err(arboard::Error::ClipboardOccupied) => {
-                if attempt + 1 < RETRY_ATTEMPTS {
-                    std::thread::sleep(RETRY_DELAY);
+            Err(e) if is_occupied(&e) => {
+                // 预算用完就把最后一次的错误原样交出去——它比我们自己编的
+                // "占用"更有信息量（带着系统错误码，能查）。
+                if std::time::Instant::now() + RETRY_DELAY >= deadline {
+                    if tries > 1 {
+                        tracing::debug!("剪贴板被占用，重试 {tries} 次仍未成功");
+                    }
+                    return Err(e);
                 }
+                std::thread::sleep(RETRY_DELAY);
             }
-            other => return other,
+            other => {
+                if tries > 1 && other.is_ok() {
+                    tracing::debug!("剪贴板被占用，第 {tries} 次重试成功");
+                }
+                return other;
+            }
         }
     }
-    Err(arboard::Error::ClipboardOccupied)
 }
 
 impl ArboardClipboard {
