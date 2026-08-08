@@ -1,16 +1,39 @@
 version: 2
+
+# 只要安全更新，不要常规的版本追新。
+#
+# **为什么**：首次启用时它一口气开了 10 个 PR，其中三个是跨大版本的破坏性
+# 变更（thiserror 1→2、tray-icon 0.19→0.24、directories 5→6）。CI 全绿并不
+# 说明它们安全——`directories` 换配置目录策略、`tray-icon` 改菜单行为，
+# 这两类改动测试一个都抓不到，却会直接影响老用户。一个个人维护的托盘程序
+# 不需要永远跑在最新依赖上，需要的是别在没人看着的时候悄悄变行为。
+#
+# **怎么做到的**：`open-pull-requests-limit: 0` 关掉该生态的版本追新，而
+# **安全更新不受这个上限约束**，仍会照常开 PR。所以真出了 CVE 一样会被推到
+# 面前，只是不再有"能升就升"的噪音。
+#
+# 安全更新还需要在仓库 Settings › Code security 里打开
+# "Dependabot security updates" 才会生效——这个配置文件管不着那个开关。
+#
+# 想恢复版本追新的话，把 limit 改回 5（或删掉这一行）即可，下面的 ignore
+# 会继续挡住不该自动升的那几个。
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
-    groups:
-      # 补丁级更新合成一个 PR，避免每周被几个独立 PR 淹没。
-      patch-updates:
-        update-types: ["patch"]
+    open-pull-requests-limit: 0
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    open-pull-requests-limit: 0
+    ignore:
+      # MSRV job 的整个意义就是钉死在最低支持版本上验证。让它跟着升级，
+      # 那个 job 就变成了"用最新工具链再编译一遍"——与 Test job 重复，
+      # 而真正想防的（用了高版本才有的 API）反而不再有人拦。
+      #
+      # 即便上面的 limit 为 0 时这条是多余的，也留着：它记录的是"这个依赖
+      # 为什么不能自动升"，而不只是一条开关。
+      - dependency-name: "dtolnay/rust-toolchain"
