@@ -5,6 +5,7 @@
 //! 发起方的失败要区分"找不到路"和"码不对"，各自的话术都不短。
 
 use anyhow::Result;
+use clipsync_core::{t, tf};
 use tracing::{info, warn};
 
 use super::PairingDeps;
@@ -42,14 +43,19 @@ pub(crate) fn join_by_code_interactive(
                 match ask_what_next() {
                     Some(NotFound::RetryWithNewCode) => continue,
                     Some(NotFound::EnterAddress) => {
-                        let Some(h) = dialog::prompt("配对", &ask_address_body(sync_port)) else {
+                        let Some(h) =
+                            dialog::prompt(t!("配对", "Pairing"), &ask_address_body(sync_port))
+                        else {
                             return;
                         };
                         match pairing_cli::connect_hosts(Some(h.trim())) {
                             Ok(s) => s,
                             Err(e) => {
                                 warn!("配对失败: {e:#}");
-                                dialog::show_info("配对失败", &format!("{e:#}"));
+                                dialog::show_info(
+                                    t!("配对失败", "Pairing failed"),
+                                    &format!("{e:#}"),
+                                );
                                 return;
                             }
                         }
@@ -88,9 +94,16 @@ enum NotFound {
 /// 网段的才连得通。不给参照物的话，这个判断只能靠猜——而这恰恰是程序能
 /// 帮上忙、用户又最容易搞错的地方。
 fn ask_address_body(sync_port: u16) -> String {
-    let mut s = "请输入对方的 IP（对方窗口里有）：".to_string();
+    let mut s = t!(
+        "请输入对方的 IP（对方窗口里有）：",
+        "Enter the other machine's IP (shown in its window):"
+    )
+    .to_string();
     if let Some(block) = pairing_cli::addr_block(sync_port) {
-        s.push_str(&format!("\n\n本机地址，供对照挑同网段的：\n{block}"));
+        s.push_str(&tf!(
+            "\n\n本机地址，供对照挑同网段的：\n{block}",
+            "\n\nThis machine's addresses, to help you pick one on the same subnet:\n{block}"
+        ));
     }
     s
 }
@@ -103,14 +116,20 @@ fn ask_address_body(sync_port: u16) -> String {
 /// 死路：对方根本没在监听，IP 填得再对也连不上。
 fn ask_what_next() -> Option<NotFound> {
     let opts = [
-        "让对方重新显示配对码，我输新的".to_string(),
-        "手动填对方地址".to_string(),
+        t!(
+            "让对方重新显示配对码，我输新的",
+            "Ask them for a fresh code"
+        )
+        .to_string(),
+        t!("手动填对方地址", "Enter their address manually").to_string(),
     ];
     match dialog::choose(
-        "没找到对方",
-        &format!(
+        t!("没找到对方", "Nothing found"),
+        &tf!(
             "没找到正在等待配对的设备。\n\n\
              配对码 {} 分钟内有效，多半是过期了。",
+            "No device is waiting to pair.\n\n\
+             Codes are valid for {} minutes, so it has most likely expired.",
             pairing_cli::HOST_SESSION_TIMEOUT.as_secs() / 60
         ),
         &opts,
@@ -125,13 +144,22 @@ fn ask_what_next() -> Option<NotFound> {
 ///
 /// 也接受 `1234@地址` 这种写法——自动发现全落空时的手动出口，命令行同款。
 fn obtain_code() -> Option<(clipsync_net::pairing::PairingCode, Option<String>)> {
-    let input = dialog::prompt("输入配对码", "输入对方显示的 4 位配对码：")?;
+    let input = dialog::prompt(
+        t!("输入配对码", "Enter pairing code"),
+        t!(
+            "输入对方显示的 4 位配对码：",
+            "Type the 4-digit code shown on the other machine:"
+        ),
+    )?;
     match pairing_cli::parse_pairing_input(&input) {
         Some(v) => Some(v),
         None => {
             dialog::show_info(
-                "配对失败",
-                &format!("「{input}」不是有效的配对码。\n\n应为 4 位数字。"),
+                t!("配对失败", "Pairing failed"),
+                &tf!(
+                    "「{input}」不是有效的配对码。\n\n应为 4 位数字。",
+                    "\"{input}\" is not a valid pairing code.\n\nIt should be 4 digits."
+                ),
             );
             None
         }
@@ -143,11 +171,14 @@ fn finish_join(result: Result<clipsync_net::pairing::PairingRecord>, pairing: &P
     match result {
         Ok(record) => {
             pairing.register(&record);
-            dialog::show_info("配对成功", &format!("已与「{}」配对。", record.name));
+            dialog::show_info(
+                t!("配对成功", "Paired"),
+                &tf!("已与「{}」配对。", "Paired with \"{}\".", record.name),
+            );
         }
         Err(e) => {
             warn!("配对失败: {e:#}");
-            dialog::show_info("配对失败", &format!("{e:#}"));
+            dialog::show_info(t!("配对失败", "Pairing failed"), &format!("{e:#}"));
         }
     }
 }

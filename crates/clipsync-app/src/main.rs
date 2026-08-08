@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use clipsync_clip::ArboardClipboard;
-use clipsync_core::SyncEngine;
+use clipsync_core::{teprintln, tprintln, SyncEngine};
 use tracing::{info, warn};
 
 fn main() -> Result<()> {
@@ -131,19 +131,31 @@ fn main() -> Result<()> {
                 }
             }
             None => {
-                eprintln!("用法:");
-                eprintln!("  clipsync pair --host             主持配对，显示配对码");
-                eprintln!("  clipsync pair <配对码>            局域网内自动找到对方");
-                eprintln!("  clipsync pair <配对码>@<对方IP>   跨网络（如 Tailscale）");
+                teprintln!("用法:", "Usage:");
+                teprintln!(
+                    "  clipsync pair --host             主持配对，显示配对码",
+                    "  clipsync pair --host             host a session, show the code"
+                );
+                teprintln!(
+                    "  clipsync pair <配对码>            局域网内自动找到对方",
+                    "  clipsync pair <code>             find the host on the LAN"
+                );
+                teprintln!(
+                    "  clipsync pair <配对码>@<对方IP>   跨网络（如 Tailscale）",
+                    "  clipsync pair <code>@<host-ip>   across networks (e.g. Tailscale)"
+                );
                 Ok(())
             }
         },
         Some("list") => {
             let pairings = config::load_pairings(&dir)?;
             if pairings.is_empty() {
-                println!("尚无已配对设备。用 `clipsync pair --host` 开始配对。");
+                tprintln!(
+                    "尚无已配对设备。用 `clipsync pair --host` 开始配对。",
+                    "No paired devices yet. Run `clipsync pair --host` to start."
+                );
             } else {
-                println!("已配对设备（{}）：", pairings.len());
+                tprintln!("已配对设备（{}）：", "Paired devices ({}):", pairings.len());
                 for p in pairings {
                     println!("  - {} ({})", p.name, p.device);
                     for a in &p.addrs {
@@ -166,29 +178,36 @@ fn main() -> Result<()> {
             match args.get(1).map(|s| s.as_str()) {
                 Some("on") => {
                     autostart::set_enabled(true)?;
-                    println!("已开启开机自启。");
+                    tprintln!("已开启开机自启。", "Launch at login enabled.");
                 }
                 Some("off") => {
                     autostart::set_enabled(false)?;
-                    println!("已关闭开机自启。");
+                    tprintln!("已关闭开机自启。", "Launch at login disabled.");
                 }
                 _ => {
-                    println!(
+                    tprintln!(
                         "开机自启：{}",
+                        "Launch at login: {}",
                         if autostart::is_enabled() {
-                            "已开启"
+                            clipsync_core::t!("已开启", "enabled")
                         } else {
-                            "未开启"
+                            clipsync_core::t!("未开启", "disabled")
                         }
                     );
-                    println!("用法: clipsync autostart [on|off]");
+                    tprintln!(
+                        "用法: clipsync autostart [on|off]",
+                        "Usage: clipsync autostart [on|off]"
+                    );
                 }
             }
             Ok(())
         }
         Some(other) => {
-            eprintln!("未知命令: {other}");
-            eprintln!("用法: clipsync [pair|list|addrs|clipdiag|autostart]");
+            teprintln!("未知命令: {}", "Unknown command: {}", other);
+            teprintln!(
+                "用法: clipsync [pair|list|addrs|clipdiag|autostart]",
+                "Usage: clipsync [pair|list|addrs|clipdiag|autostart]"
+            );
             Ok(())
         }
         None => run_sync(dir, identity, device_name, log_control),

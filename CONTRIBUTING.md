@@ -70,6 +70,12 @@ This catches the most common cross-platform breakage: a test module gated behind
 **Comments are written in Chinese**, matching the existing codebase. Please stay
 consistent rather than mixing languages within a file.
 
+**User-facing text must be bilingual.** Wrap it in `t!("中文", "English")` (or
+`tf!` / `tprintln!` for formatted output) so both languages sit on the same
+line — see `clipsync-core/src/i18n.rs`. Log messages are the exception and stay
+in Chinese: they are diagnostic output, and one language keeps bug reports
+comparable.
+
 **Explain *why*, not *what*.** The code already says what it does. Comments earn
 their place by recording the reasoning that is not recoverable from reading it —
 the alternative that was rejected, the bug that motivated a guard, the measured
@@ -140,7 +146,7 @@ Look at `git log` for the house style. In short:
 
 Use the issue templates. For anything sync-related, logs are essential:
 
-1. Enable **详细日志 / Verbose logging** in the tray (takes effect immediately).
+1. Enable **Verbose logging** in the tray (takes effect immediately).
 2. Reproduce.
 3. Attach `logs/clipsync.log` from the config directory **on both machines** —
    one side alone almost never contains enough to diagnose a connection problem.

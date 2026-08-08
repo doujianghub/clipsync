@@ -130,9 +130,12 @@ impl HubState {
             info!("待取文件的来源设备 {} 当前不在线，暂不取回", p.from);
             self.pending = Some(p);
             self.publish_pending();
-            crate::hub::notify(
+            crate::hub::notify(clipsync_core::t!(
                 "对方当前不在线。\n\n等它上线后再点一次「取回」——\n只要它没有再复制别的文件，这一份就还在。",
-            );
+                "That device is offline right now.\n\nClick \"Fetch\" again once it is \
+                 back — the files are still waiting, as long as it has not copied \
+                 something else in the meantime."
+            ));
             return;
         }
         self.publish_pending();

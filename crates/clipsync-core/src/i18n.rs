@@ -98,6 +98,11 @@ macro_rules! t {
 ///
 /// 两个字面量各自独立格式化，所以插值顺序可以不同——英文语序常常和中文不一样，
 /// 硬套同一个参数顺序会译出别扭的句子。
+///
+/// **隐式命名捕获（`{name}`）能正常工作，但有个坑**：若某个变量**只**在这里
+/// 被用到，`unused_variables` 会误报它没被使用——那个 lint 看不到宏展开后
+/// 生成的捕获。功能是对的，可 CI 用 `-D warnings`，一条误报就够把构建弄红。
+/// 遇到这种变量改成显式传参（`tf!("… {}", "… {}", x)`）即可。
 #[macro_export]
 macro_rules! tf {
     ($zh:literal, $en:literal) => {
@@ -113,6 +118,31 @@ macro_rules! tf {
         } else {
             format!($zh, $($arg)*)
         }
+    };
+}
+
+/// 双语的 `println!`：`tprintln!("中文 {n}", "English {n}")`。
+///
+/// 命令行输出几乎全是"整行一句话"，写成 `println!("{}", tf!(..))` 每一条都要
+/// 多包一层，读起来全是噪音。
+#[macro_export]
+macro_rules! tprintln {
+    ($zh:literal, $en:literal) => {
+        println!("{}", $crate::t!($zh, $en))
+    };
+    ($zh:literal, $en:literal, $($arg:tt)*) => {
+        println!("{}", $crate::tf!($zh, $en, $($arg)*))
+    };
+}
+
+/// 双语的 `eprintln!`。用法同 [`tprintln!`]。
+#[macro_export]
+macro_rules! teprintln {
+    ($zh:literal, $en:literal) => {
+        eprintln!("{}", $crate::t!($zh, $en))
+    };
+    ($zh:literal, $en:literal, $($arg:tt)*) => {
+        eprintln!("{}", $crate::tf!($zh, $en, $($arg)*))
     };
 }
 

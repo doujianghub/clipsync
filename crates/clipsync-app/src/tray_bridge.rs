@@ -9,6 +9,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing::{info, warn};
 
+use clipsync_core::{t, tf};
+
 use crate::pairing_ui::PairingDeps;
 use crate::{autostart, config, dialog, logging, pairing_ui, size_parse, tray};
 
@@ -153,9 +155,10 @@ pub(crate) fn run_tray(
                 if let Err(e) = logging::open_in_file_manager(log_control.dir()) {
                     warn!("打开日志文件夹失败: {e:#}");
                     crate::dialog::show_info(
-                        "ClipSync 日志",
-                        &format!(
+                        t!("ClipSync 日志", "ClipSync logs"),
+                        &tf!(
                             "日志位于：\n{}\n\n（自动打开失败：{e}）",
+                            "Logs are at:\n{}\n\n(could not open automatically: {e})",
                             log_control.dir().display()
                         ),
                     );
@@ -233,9 +236,10 @@ fn pick_setting<T: Copy>(
     apply: impl Fn(&mut config::Settings, T),
 ) {
     let mut items: Vec<String> = presets.iter().map(|(label, _)| label.to_string()).collect();
-    items.push("自定义…".to_string());
+    items.push(t!("自定义…", "Custom…").to_string());
 
-    let Some(idx) = dialog::choose(title, &format!("当前：{current}"), &items) else {
+    let Some(idx) = dialog::choose(title, &tf!("当前：{current}", "Current: {current}"), &items)
+    else {
         return; // 用户取消
     };
 
@@ -264,27 +268,31 @@ fn pick_setting<T: Copy>(
 /// 档位排得密一些是有意的：「自定义…」要弹文本输入框，而输入框是目前唯一
 /// 还依赖 PowerShell 子进程的路径，在某些 Windows 上并不可靠。档位覆盖得越
 /// 全，需要走那条路的人越少。
-const AUTO_FETCH_PRESETS: &[(&str, usize)] = &[
-    ("10 MiB", 10 << 20),
-    ("50 MiB", 50 << 20),
-    ("100 MiB（默认）", 100 << 20),
-    ("200 MiB", 200 << 20),
-    ("500 MiB", 500 << 20),
-    ("1 GiB", 1 << 30),
-    ("2 GiB", 2 << 30),
-    ("不限", usize::MAX),
-];
+fn auto_fetch_presets() -> Vec<(&'static str, usize)> {
+    vec![
+        ("10 MiB", 10 << 20),
+        ("50 MiB", 50 << 20),
+        (t!("100 MiB（默认）", "100 MiB (default)"), 100 << 20),
+        ("200 MiB", 200 << 20),
+        ("500 MiB", 500 << 20),
+        ("1 GiB", 1 << 30),
+        ("2 GiB", 2 << 30),
+        (t!("不限", "Unlimited"), usize::MAX),
+    ]
+}
 
 /// 发送限速的常用档。`0` 表示不限。
-const RATE_PRESETS: &[(&str, u64)] = &[
-    ("不限（默认）", 0),
-    ("2 MB/s", 2_000_000),
-    ("5 MB/s", 5_000_000),
-    ("10 MB/s", 10_000_000),
-    ("20 MB/s", 20_000_000),
-    ("50 MB/s", 50_000_000),
-    ("100 MB/s", 100_000_000),
-];
+fn rate_presets() -> Vec<(&'static str, u64)> {
+    vec![
+        (t!("不限（默认）", "Unlimited (default)"), 0),
+        ("2 MB/s", 2_000_000),
+        ("5 MB/s", 5_000_000),
+        ("10 MB/s", 10_000_000),
+        ("20 MB/s", 20_000_000),
+        ("50 MB/s", 50_000_000),
+        ("100 MB/s", 100_000_000),
+    ]
+}
 
 fn prompt_auto_fetch(settings: &config::SettingsHandle) {
     let cur = settings.snapshot().auto_fetch_bytes;
@@ -295,11 +303,16 @@ fn prompt_auto_fetch(settings: &config::SettingsHandle) {
     };
     pick_setting(
         settings,
-        "自动取回上限",
+        t!("自动取回上限", "Auto-fetch limit"),
         &shown,
-        AUTO_FETCH_PRESETS,
-        "收到的文件多大以内自动拉取，超过的挂起等你点「取回」。\n\
-         输入大小，例如 500MB、1.5GiB；填 0 表示多大都自动拉",
+        &auto_fetch_presets(),
+        t!(
+            "收到的文件多大以内自动拉取，超过的挂起等你点「取回」。\n\
+             输入大小，例如 500MB、1.5GiB；填 0 表示多大都自动拉",
+            "Received files up to this size download automatically; larger ones \
+             wait for you to click Fetch.\n\
+             Enter a size such as 500MB or 1.5GiB; 0 means always fetch"
+        ),
         |s| {
             // 0 在这里表示"不限"，而不是"一个字节都不许传"。
             let v = size_parse::parse_byte_size(s)?;
@@ -373,10 +386,13 @@ fn prompt_upload_limit(settings: &config::SettingsHandle) {
     };
     pick_setting(
         settings,
-        "发送限速",
+        t!("发送限速", "Upload limit"),
         &shown,
-        RATE_PRESETS,
-        "输入速率，例如 10MB/s、20mbps；填 0 表示不限",
+        &rate_presets(),
+        t!(
+            "输入速率，例如 10MB/s、20mbps；填 0 表示不限",
+            "Enter a rate such as 10MB/s or 20mbps; 0 means unlimited"
+        ),
         size_parse::parse_rate,
         |s, v| s.upload_limit_bytes_per_sec = v,
     );
@@ -390,8 +406,11 @@ fn prompt_upload_limit(settings: &config::SettingsHandle) {
 fn prompt_listen_port(settings: &config::SettingsHandle) {
     let cur = settings.snapshot().listen_port;
     let Some(input) = dialog::prompt(
-        "同步端口",
-        &format!("当前：{cur}\n\n填 1024–65535；重启后生效"),
+        t!("同步端口", "Sync port"),
+        &tf!(
+            "当前：{cur}\n\n填 1024–65535；重启后生效",
+            "Current: {cur}\n\nEnter 1024–65535; takes effect after restart"
+        ),
     ) else {
         return;
     };
@@ -402,10 +421,16 @@ fn prompt_listen_port(settings: &config::SettingsHandle) {
             info!("同步端口已设为 {p}（重启后生效）");
         }
         Ok(p) => dialog::show_info(
-            "同步端口",
-            &format!("{p} 属于系统保留范围，请填 1024–65535"),
+            t!("同步端口", "Sync port"),
+            &tf!(
+                "{p} 属于系统保留范围，请填 1024–65535",
+                "{p} is in the reserved range; enter 1024–65535"
+            ),
         ),
-        Err(_) => dialog::show_info("同步端口", &format!("「{input}」不是有效端口")),
+        Err(_) => dialog::show_info(
+            t!("同步端口", "Sync port"),
+            &tf!("「{input}」不是有效端口", "\"{input}\" is not a valid port"),
+        ),
     }
 }
 
@@ -423,8 +448,8 @@ mod tests {
     #[test]
     fn presets_match_their_labels() {
         let by_label = |label: &str| -> usize {
-            AUTO_FETCH_PRESETS
-                .iter()
+            auto_fetch_presets()
+                .into_iter()
                 .find(|(l, _)| *l == label)
                 .unwrap_or_else(|| panic!("找不到档位 {label}"))
                 .1
@@ -438,8 +463,8 @@ mod tests {
 
         // 速率按 1000 进制（网络惯例，与 MB/s 的通常含义一致）。
         let rate = |label: &str| -> u64 {
-            RATE_PRESETS
-                .iter()
+            rate_presets()
+                .into_iter()
                 .find(|(l, _)| *l == label)
                 .unwrap_or_else(|| panic!("找不到限速档 {label}"))
                 .1
@@ -453,14 +478,14 @@ mod tests {
     /// 档位应当递增，否则列表读起来很怪。
     #[test]
     fn presets_are_ordered() {
-        let sizes: Vec<usize> = AUTO_FETCH_PRESETS.iter().map(|(_, v)| *v).collect();
+        let sizes: Vec<usize> = auto_fetch_presets().iter().map(|(_, v)| *v).collect();
         assert!(
             sizes.windows(2).all(|w| w[0] < w[1]),
             "上限档应递增: {sizes:?}"
         );
 
         // 限速的「不限」排第一（0 表示不限，语义上是最大），其余递增。
-        let rates: Vec<u64> = RATE_PRESETS[1..].iter().map(|(_, v)| *v).collect();
+        let rates: Vec<u64> = rate_presets()[1..].iter().map(|(_, v)| *v).collect();
         assert!(
             rates.windows(2).all(|w| w[0] < w[1]),
             "限速档应递增: {rates:?}"

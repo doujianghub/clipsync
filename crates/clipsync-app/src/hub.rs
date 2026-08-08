@@ -256,7 +256,10 @@ impl HubState {
             SyncMessage::FileAbort { generation } => {
                 if self.matches_incoming(generation) {
                     info!("对端已取消文件传输（其剪贴板已更新），已收部分保留待续传");
-                    self.finish_failed("对方已经不再提供这份内容了。\n\n让它重新复制一次即可。");
+                    self.finish_failed(clipsync_core::t!(
+                        "对方已经不再提供这份内容了。\n\n让它重新复制一次即可。",
+                        "The other device no longer offers this content.\n\nAsk it to copy again."
+                    ));
                 }
             }
 
@@ -267,7 +270,11 @@ impl HubState {
             } => {
                 if self.matches_incoming(generation) {
                     warn!("对端无法提供文件（id={file_id:016x}）: {reason}");
-                    self.finish_failed(&format!("对方拿不到这个文件了：{reason}"));
+                    self.finish_failed(&clipsync_core::tf!(
+                        "对方拿不到这个文件了：{}",
+                        "The other device can no longer read this file: {}",
+                        reason
+                    ));
                 }
             }
 

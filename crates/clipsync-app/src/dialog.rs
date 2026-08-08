@@ -90,13 +90,20 @@ pub fn permission_hint_once(what: &std::path::Path, reason: &str, where_to_fix: 
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| what.display().to_string());
-    let body = format!(
+    let body = clipsync_core::tf!(
         "系统不允许 ClipSync 读取「{name}」，这次复制没能同步过去。\n\n\
          {reason}。\n\n\
          去「{where_to_fix}」里把 ClipSync 打开即可。\n\n\
-         这句提示每次运行只出现一次；用 `clipsync clipdiag` 可逐条查看。"
+         这句提示每次运行只出现一次；用 `clipsync clipdiag` 可逐条查看。",
+        "The system blocked ClipSync from reading \"{name}\", so this copy was \
+         not synced.\n\n\
+         Reason: {reason}.\n\n\
+         Open \"{where_to_fix}\" and enable ClipSync.\n\n\
+         This notice appears once per run; run `clipsync clipdiag` to inspect \
+         every path."
     );
-    std::thread::spawn(move || show_info("ClipSync 无法读取文件", &body));
+    let title = clipsync_core::t!("ClipSync 无法读取文件", "ClipSync cannot read a file");
+    std::thread::spawn(move || show_info(title, &body));
 }
 
 /// 弹出一个列表让用户点选，返回选中项的下标。

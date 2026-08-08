@@ -43,6 +43,10 @@ First public release.
 - **Diagnostics.** `clipsync clipdiag` reports per-path clipboard and permission
   verdicts; startup logs local addresses; slow clipboard reads and writes are
   logged when they exceed 200 ms.
+- **English and Simplified Chinese interface.** Follows the system language by
+  default (`NSLocale.preferredLanguages` on macOS, `GetUserDefaultLocaleName`
+  on Windows) and is switchable from the tray without restarting. Log output
+  stays in Chinese by design — it is diagnostic rather than interface text.
 - **macOS file permission handling.** Access denials are detected at copy time
   rather than silently producing stale content on the peer, with a one-time
   dialog naming the exact Settings pane to fix.
@@ -56,8 +60,7 @@ First public release.
 
 ### Known limitations
 
-- The application interface is Simplified Chinese only; documentation is
-  available in English. Localisation is planned but not scheduled.
+- Log messages are Chinese-only; the interface itself is fully localised.
 - Linux compiles but is non-functional: clipboard change detection, dialogs, and
   launch-at-login are no-ops.
 - Promised files (`com.apple.pasteboard.promised-file-url`) are detected and
