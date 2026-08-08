@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v1.0.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: Build macOS (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 打包脚本负责：两个架构各构建一次、lipo 合并、生成图标、写 Info.plist、
+      # ad-hoc 签名（含稳定的 designated requirement）、用 ditto 打 zip。
+      - name: Package .app
+        run: scripts/package-macos.sh --universal
+
+      - name: Verify universal binary
+        run: |
+          BIN=target/ClipSync.app/Contents/MacOS/clipsync
+          lipo -info "$BIN"
+          lipo -info "$BIN" | grep -q "x86_64 arm64" \
+            || { echo "::error::not a universal binary"; exit 1; }
+          codesign --verify --deep --strict "target/ClipSync.app" \
+            || { echo "::error::signature verification failed"; exit 1; }
+
+      - name: Stage artifact
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -n "${{ inputs.tag }}" ] && VERSION="${{ inputs.tag }}" && VERSION="${VERSION#v}"
+          mkdir -p dist
+          cp "target/ClipSync-${VERSION}.zip" \
+             "dist/ClipSync-${VERSION}-macos-universal.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  windows:
+    name: Build Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          if ('${{ inputs.tag }}') { $version = '${{ inputs.tag }}' -replace '^v', '' }
+          scripts\package-windows.ps1 -Version $version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  release:
+    name: Publish release
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # 校验和让下载者能确认文件没在传输中损坏——macOS 的 ad-hoc 签名对
+      # 字节改动极其敏感，"已损坏"报错多半就是这么来的。
+      - name: Generate checksums
+        working-directory: artifacts
+        run: |
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Extract changelog section
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # 取 "## [x.y.z]" 到下一个 "## [" 之间的内容
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { found=1; next }
+            found && /^## \[/       { exit }
+            found                    { print }
+          ' CHANGELOG.md > section.md
+          if [ ! -s section.md ]; then
+            echo "See CHANGELOG.md for details." > section.md
+          fi
+          cat section.md
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          body_path: section.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

@@ -1,285 +1,387 @@
-# ClipSync
+<h1 align="center">ClipSync</h1>
 
-跨设备剪贴板同步 —— 在 Windows 与 macOS 之间**无感、极简、低占用**地同步剪贴板（文本 / 图片 / 文件）。
+<p align="center">
+  <strong>Encrypted peer-to-peer clipboard sync for Windows and macOS.</strong><br>
+  Copy on one machine, paste on another. Text, images, and files.
+</p>
 
-> **文档**
-> - [架构与代码导航](docs/ARCHITECTURE.md) —— 各 crate 职责、数据流、关键设计决策
-> - [macOS 实现指南](docs/MACOS.md) —— 平台代码的实现要点与验证清单（7 项均已补齐）
-> - [跨平台联调记录](docs/CROSS_PLATFORM.md) —— 双侧联调发现的缺陷、成因与待验证项
+<p align="center">
+  <a href="https://github.com/doujianghub/clipsync/actions/workflows/ci.yml"><img src="https://github.com/doujianghub/clipsync/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/doujianghub/clipsync/releases/latest"><img src="https://img.shields.io/github/v/release/doujianghub/clipsync" alt="Release"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey" alt="Platform">
+  <img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust 1.75+">
+</p>
 
-## 特性目标
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+</p>
 
-- **极简配置**：一次性配对码完成互信，之后永久免配置。
-- **无感同步**：不影响系统原生复制粘贴，复制即自动同步。
-- **多内容类型**：文本、图片、小文件（默认上限 100 MiB，可配置）。
-- **最优通信**：自动优选路径——同网段直连 > 覆盖网/VPN > 公网。**不绑定特定组网产品**：直接枚举本机网卡，Tailscale、ZeroTier、Netbird、Nebula、WireGuard 乃至公网端口转发的地址都会被自动识别，无需任何适配或配置。
-- **端到端加密**：Noise 协议（`Noise_IK`），设备公钥互认。
-- **低占用**：Rust 单可执行文件，常驻系统托盘，空闲内存个位数 MB。
-- **敏感内容保护**：自动跳过密码管理器等标记为敏感/瞬态的剪贴板内容。
+---
 
-## 架构
+ClipSync runs quietly in your tray. Pair two devices once with a 4-digit code —
+no accounts, no servers, no IP addresses to type — and from then on anything you
+copy shows up on the other machine. Traffic is end-to-end encrypted and travels
+directly between your devices; nothing passes through a third party.
 
-Cargo workspace，四个 crate：
+Think of it as **Apple's Universal Clipboard, except it works between Windows
+and macOS** — and without an Apple ID, an account of any kind, or a cloud
+service in the middle.
 
-| crate | 职责 | 平台相关 |
-|---|---|---|
-| `clipsync-core` | 消息类型、同步引擎（防回环/去重/过滤），纯逻辑可单测 | 否 |
-| `clipsync-clip` | 剪贴板读写、变化监听、敏感内容探测 | 是 |
-| `clipsync-net` | 发现（mDNS + Tailscale）、传输（Noise）、配对（PAKE） | 部分 |
-| `clipsync-app` | 托盘 UI、组装、配置、开机自启（可执行文件 `clipsync`） | 是 |
+> [!NOTE]
+> **The application interface is currently Chinese-only.** Menus, dialogs, and
+> log messages are in Simplified Chinese. Everything works identically
+> regardless of your system language, but you will be reading Chinese labels.
+> Localisation is on the roadmap; this documentation is in English so you can
+> evaluate, build, and contribute to the project in the meantime.
 
-数据流：本地复制 → 监听捕获并归一化 → 引擎过滤 → 加密广播给已配对在线设备 → 对端引擎判定 → 登记防回环 → 写入本地剪贴板。
+## Use cases
 
-## 构建
+**You work across a Mac and a PC.** This is the case Universal Clipboard leaves
+out entirely: the moment one of your machines runs Windows, Apple's clipboard
+sharing stops being an option. Copy a URL, a paragraph, a screenshot, or a
+`.zip` on either side and paste it on the other.
 
-```bash
-cargo build            # 编译全部
-cargo test             # 运行单元测试（核心逻辑）
-cargo run -p clipsync-app   # 运行后台同步
-```
+**You keep sending yourself files through a chat app.** Messaging yourself a
+file to move it between your own two computers works, but it uploads your data
+to somebody's server, takes several clicks, and mangles image quality. Copy →
+paste is faster and the bytes never leave your machines.
 
-**打包成 macOS 应用**：
+**You copy things out of a remote session.** Working on a desktop over screen
+sharing or Remote Desktop, you often want a command, a log excerpt, or an API
+token on your local machine. ClipSync runs independently of the remote session,
+so the clipboard keeps working even where the session's own clipboard
+integration does not — and on macOS transfers are marked as background traffic,
+so a large file will not degrade the screen sharing you are looking at.
 
-```bash
-scripts/package-macos.sh                    # 本机架构（约 1.6 MB）
-scripts/package-macos.sh --universal        # Intel + Apple Silicon 通用二进制
-scripts/package-macos.sh --universal --dmg  # 再打一个 dmg 便于分发
-```
+**Your workplace does not allow cloud sync.** There is no server component, no
+account, and no telemetry. Traffic goes directly between your devices over your
+own LAN or your own VPN, so it stays inside whatever network boundary you
+already have.
 
-除 `.app` 外还会产出 `ClipSync-<版本>.zip`（用 `ditto` 打，完整保留签名所依赖的
-扩展属性——普通 `zip` 可能弄坏它）。
+**You have more than two machines.** A desktop, a laptop, and a work machine can
+form one group without pairing every combination — devices introduce each other,
+and any one of them can be offline without breaking the rest.
 
-拖进「应用程序」双击即可——图标出现在菜单栏，不占 Dock。图标在打包时现画，
-仓库里不存二进制资源。
+**You move files, not just text.** Copying a file in Explorer or Finder and
+pasting it on the other machine transfers the actual file — with resume,
+integrity verification, and no size limit beyond what you configure.
 
-**给别人用时**：没有开发者证书时只能 ad-hoc 签名，对方首次打开会被系统拦下，
-需**右键点图标 → 打开**（双击不给放行按钮）；macOS 15 及以上改去「系统设置 ›
-隐私与安全性」点「仍要打开」。若提示「已损坏」或「无法打开」，多半是传输弄坏了
-签名，让对方执行 `xattr -cr /Applications/ClipSync.app`。要彻底免掉这些提示，
-需 Apple Developer Program（$99/年）的 Developer ID 证书并做公证——脚本检测到
-证书会自动改用它，无需改动。
+## Features
 
-## 使用
+- **Zero configuration after pairing.** One 4-digit code establishes mutual
+  trust permanently. No account, no cloud service, no config file to edit.
+- **Text, images, and files.** Large files transfer in chunks with resume
+  support; files above a configurable size wait for you to click *Fetch*
+  instead of downloading automatically.
+- **End-to-end encrypted.** Noise protocol (`Noise_IK`) with per-device static
+  keys. Pairing uses SPAKE2, so the 4-digit code never crosses the wire.
+- **Finds the best path by itself.** Same-subnet direct connection is preferred,
+  then overlay networks, then public addresses. **No vendor integration:** it
+  enumerates your network interfaces, so Tailscale, ZeroTier, NetBird, Nebula,
+  WireGuard, and plain port forwarding all work without configuration.
+- **Stays out of the way.** ~11 MB idle memory, ~0.03% idle CPU, a 1.4 MB
+  binary, and a single tray icon. File transfers are marked as background
+  traffic on macOS so they yield to screen sharing and video calls.
+- **Respects sensitive content.** Clipboard entries marked confidential by
+  password managers are skipped automatically.
 
-```bash
-clipsync                      # 后台同步 + 系统托盘（日常用法，可开机自启）
-clipsync pair --host          # 主持配对，显示一次性配对码
-clipsync pair <配对码>          # 自动找到对方，无需输入 IP
-clipsync pair <对方IP> <配对码>  # 自动发现全落空时的手动出口
-clipsync list                 # 列出已配对设备及其已知地址
-clipsync addrs                # 显示本机可达地址及类型（排查连通性）
-clipsync autostart [on|off]   # 查询/设置开机自启
-```
+## How it compares
 
-**配对码是 4 位数字，3 分钟有效，配对成功即失效**（一个码只配一台）。 它只能靠人念、人敲——本工具要解决的正是
-"跨设备复制粘贴还没打通"，用剪贴板把码递过去是循环依赖。托盘菜单里一方选
-「显示配对码…」，另一方选「输入配对码…」敲那四位，**全程不碰命令行、不输
-IP**。配对成功立即生效，无需重启。
+| | Works Windows ↔ macOS | Data stays local | Automatic | Files |
+|---|:---:|:---:|:---:|:---:|
+| **ClipSync** | ✅ | ✅ | ✅ | ✅ |
+| Apple Universal Clipboard | ❌ Apple devices only | ✅ | ✅ | ✅ |
+| Messaging yourself (WeChat, Telegram…) | ✅ | ❌ via their servers | ❌ manual | ✅ |
+| Cloud clipboard managers | ✅ | ❌ via their servers | ✅ | varies |
+| Windows Cloud Clipboard | ❌ Windows only | ❌ via Microsoft | ✅ | ❌ text only |
+| KDE Connect | ⚠️ Linux/Android focused | ✅ | ✅ | ✅ |
+| Remote Desktop / VNC clipboard | ✅ | ✅ | ⚠️ session-bound | ⚠️ limited |
+| Shared folder or USB drive | ✅ | ✅ | ❌ manual | ✅ |
 
-> 1 万种组合看着不多，撑住它的是**每会话 5 次猜测上限**：SPAKE2 让离线穷举
-> 不可能，但在线穷举实测有 818 次/秒（`measure_online_guessing_rate`），没有
-> 次数上限的话十几秒就能跑完 1 万种。有了上限，单会话被猜中的概率是
-> 5/10000，且与有效期多长无关。
->
-> 期间关掉配对码窗口不影响监听——会话只在超时、成功、或连错 5 次时结束。
+ClipSync's niche is the combination: **cross-platform, peer-to-peer, automatic,
+and handles files** — with nothing to sign up for.
 
-**对方在哪儿，程序自己找**，按代价从低到高，前一条落空就自动试下一条：
+It is deliberately *not* a clipboard history manager. There is no searchable
+archive of everything you have ever copied; it syncs the current clipboard and
+nothing more. Pair it with a local history tool if you want both.
 
-| | 手段 | 覆盖 |
-|---|---|---|
-| 1 | 局域网 UDP 组播 | 同网段，最快，零探测 |
-| 2 | 主动探测配对端口 | 见下 |
-| 3 | 才问你要 IP | 兜底 |
+## Installation
 
-第 2 步的候选来自两处，合并成一轮并发探测：
+### Download a release
 
-- **本机各网卡的真实网段**（前缀 ≥ /22）——局域网、ZeroTier、WireGuard、
-  Nebula 的虚拟网卡都有真实网段，这一路不必认识任何厂商；
-- **组网工具报告的对端**——Tailscale、NetBird 的接口掩码是 /32，地址空间是
-  100.64.0.0/10（400 万个），数学上没有网段可扫，只能问工具本身要名单；
-- **覆盖网地址所在的 /24**——上一条的兜底。可执行文件路径表永远列不全，
-  而同一个组网里的机器地址往往挨得很近，扫这 254 个不需要任何外部命令。
+Grab the latest build for your platform from
+[Releases](https://github.com/doujianghub/clipsync/releases/latest).
 
-探测只在你点了「输入配对码…」之后的那几秒内发生，**从不在后台跑**；候选总数
-有上限，网段过大直接跳过。判断"是不是主持方"看的是协议本身（对方 accept 后
-立刻发来的那一帧），而不只是"端口连得上"——开着 TUN 模式代理的机器上连任意
-地址都连得上。
-
-**三台以上**：不必两两都配。已连接的设备会**互相引荐**——A 分别与 B、C 配对
-后，B 和 C 会通过 A 认识彼此并直连，此后 **A 关机也不影响** B 与 C 同步。
-谁当引入者都行（A 主持配 B、再由 B 主持配 C，同样能组成三方互联）。
-
-> 引荐意味着信任是传递的：你信任 B，B 信任 C，你就自动信任了 C。所以设备
-> 列表里会标出「经 某某 认识」，让你分得清哪些是自己亲手加的。
->
-> 既然这些设备构成的是一个**组**，退出也按组来：点某台设备是把它移出组，
-> 组里所有成员一起移除，它自己也会清空配对；点「退出设备组」则是本机离开，
-> 其它设备会把本机删掉。两者都可逆——重新配对一次即可回来。
-
-传大文件时托盘图标会**轻微脉冲**（淡下去再回来），一眼看出正在传输；
-颜色仍表示连接状态，两者互不干扰。
-
-托盘菜单只有九项，日常用得到的都在第一层：
-
-```
-ClipSync — 已连接 1 / 2 台
-──────────────
-显示配对码…            换个配对码             输入配对码…
-已配对设备 ▸
-☑ 同步图片             ☑ 同步文件             ☐ 暂停同步
-☐ 开机自启             高级设置 ▸             退出
-```
-
-配对会话进行中时，第一项会变成实时倒计时（`配对码 1234 · 剩 2:47`）——
-弹窗是系统原生模态窗，显示出来文字就定死了，能动的只有菜单。
-
-有文件等着取回时，菜单最上方会多出一行 `取回 报告.zip 等 3 个（4.2 GB）`，
-托盘图标右上角同时点一个蓝点。没有待取项时这一行不存在。
-
-自动取回上限、发送限速、同步端口、传输前压缩、日志开关收在「高级设置」里——
-少数人偶尔要用，不必每天都看见。标签上直接写着当前值（`自动取回：100 MiB…`），
-点一下弹出常用档让你**点选**；档位不合用就选「自定义…」，接受 `500MB`、
-`1.5GiB`、`20mbps` 这类写法。
-
-图标颜色即状态：绿=已连接、灰=未连接、琥珀=已暂停、红=同步已停止。
-
-### 出问题时怎么查
-
-日志写在配置目录的 `logs/clipsync.log`（4 MB 滚动，保留一代）。托盘勾上
-「详细日志」即可记录 debug 级细节，**无需重启**，复现一次后再关掉；
-「打开日志文件夹」直接定位到该目录。
-
-环境变量：
-- `CLIPSYNC_LOG`：日志级别（如 `debug`）。
-- `CLIPSYNC_CONFIG_DIR`：自定义配置目录（便于一机多实例测试）。
-- `CLIPSYNC_PEERS`：手动补充对端地址（`ip:port` 逗号分隔），用于自动发现覆盖不到的场景（如公网端口转发）。
-- `CLIPSYNC_NO_WATCH`：禁用本地剪贴板监听，作为纯接收设备。
-- `CLIPSYNC_NO_TRAY`：禁用托盘，纯后台运行（服务器/无桌面环境）。
-- `CLIPSYNC_DEVICE_NAME`：自定义本机设备名（默认取系统名：Windows 的
-  `COMPUTERNAME`、macOS 的 `scutil --get ComputerName`）。
-
-### 跨网络是如何工作的
-
-不针对任何组网产品做适配，而是把所有可达地址统一收集、按拓扑距离优选。地址有三个通用来源：
-
-1. **配对时交换** —— 配对完成即互知对方全部地址（含各类 VPN 虚拟网卡）。
-2. **局域网组播信标** —— 同网段设备周期性宣告，IP 变化也能跟上。
-3. **加密通道内互告** —— 已连接的双方持续同步各自地址；只要还有任意一条路径通，其它路径的地址就能学到。
-
-因此无论用 Tailscale、ZeroTier、Netbird、WireGuard，还是直接公网端口转发，都无需额外配置。用 `clipsync addrs` 可查看本机被识别到的地址。
-
-**为什么信标是明文且不认证的？** 因为它只负责"提示地址"，认证始终由传输层负责——
-伪造信标至多导致一次失败的连接尝试，Noise_IK 握手需要对端的静态私钥才能通过。
-
-**端口一览**
-
-| 端口 | 用途 | 协议 |
-|---|---|---|
-| 47684 | 同步连接（`settings.json` 中 `listen_port` 可改） | TCP |
-| 47685 | 配对（仅 `pair` 期间短暂监听） | TCP |
-| 47690 | 设备发现信标（守护进程常驻） | UDP 组播 |
-| 47691 | 配对发现信标（仅 `pair` 期间，与 47690 分开以免抢占） | UDP 组播 |
-
-组播组为 `239.255.71.83`（管理范围地址，不会跨路由器外泄）。
-
-### 文件同步是如何工作的
-
-剪贴板是**「最新值获胜」**的语义，不是队列。文件同步的设计完全围绕这一点：
-
-**复制文件时只发清单，不发内容。** 清单很小（文件名/大小/标识），对端立刻知道有什么，并回答「我需要哪几段」，真正的字节才开始搬运。
-
-**传输中复制了别的内容 → 立即取代。**
-
-| 做法 | 后果 |
+| Platform | Asset |
 |---|---|
-| 等旧传输完成 | 你现在要用的新内容被大文件卡住，体验灾难 |
-| 传完旧的再说 | 对端剪贴板变成旧文件，与你本机不一致，更糟 |
-| **立即取代**（本方案） | 对端剪贴板始终与你一致；已收字节留作续传 |
+| macOS (Apple Silicon + Intel) | `ClipSync-<version>-macos-universal.zip` |
+| Windows (x64) | `ClipSync-<version>-windows-x64.zip` |
 
-发送端在每个分块边界比对代际号，过期立即停止；接收端丢弃未完成的组装转而接收新内容。**文件传输不会阻塞文本同步**——每轮先发控制消息再发文件块，实测 90MB 传输中复制文本仍能毫秒级送达。
+**macOS.** Drag `ClipSync.app` into *Applications*. Because releases are signed
+ad-hoc rather than with a paid Developer ID certificate, macOS blocks the first
+launch: **right-click the icon → Open** (double-clicking gives you no override
+button). On macOS 15 and later, go to *System Settings › Privacy & Security* and
+click *Open Anyway*. If you see "damaged or can't be opened", the signature was
+mangled in transit — run `xattr -cr /Applications/ClipSync.app`.
 
-**再次复制同一文件 → 自动续传或秒同步。**
+**Windows.** Unzip anywhere and run `clipsync.exe`. SmartScreen may warn on
+first run for the same reason; choose *More info → Run anyway*.
 
-| 缓存状态 | 结果 |
+### Build from source
+
+Requires Rust 1.75 or later.
+
+```bash
+git clone https://github.com/doujianghub/clipsync
+cd clipsync
+cargo build --release
+```
+
+The binary lands at `target/release/clipsync`. **Use a release build** — debug
+builds are roughly 25× slower for transfers because encryption and hashing are
+unoptimised.
+
+To produce a macOS `.app` bundle:
+
+```bash
+scripts/package-macos.sh                    # current architecture
+scripts/package-macos.sh --universal        # Intel + Apple Silicon
+scripts/package-macos.sh --universal --dmg  # also build a .dmg
+```
+
+## Quick start
+
+1. Launch ClipSync on both machines. A tray icon appears.
+2. On machine A: tray menu → **显示配对码… / Show pairing code**. A 4-digit code
+   appears with a live countdown.
+3. On machine B: tray menu → **输入配对码… / Enter pairing code**. Type those
+   four digits.
+4. Done. Copy something on either machine.
+
+You never type an IP address — machine B finds machine A on its own. The code is
+valid for 3 minutes, pairs exactly one device, and dies on first success.
+
+> **Why only 4 digits?** The code has to be read aloud or typed by hand — using
+> the clipboard to transfer it would be circular. 10,000 combinations is held up
+> by a **5-guess-per-session limit**: SPAKE2 makes offline brute force
+> impossible, and online guessing was measured at 818 attempts/second, which
+> would exhaust the space in seconds without a cap. With the cap, the chance of
+> a session being guessed is 5/10000 regardless of how long the code lives.
+
+### Three or more devices
+
+You do not need to pair every pair of machines. Connected devices **introduce
+each other**: pair A↔B and A↔C, and then B and C discover one another through A
+and connect directly. After that, **A can go offline** without affecting B↔C.
+
+Introduction means trust is transitive — you trust B, B trusts C, so you trust C.
+The device list marks these entries as *introduced by …* so you can tell them
+apart from the ones you added yourself.
+
+## Command line
+
+Everyday use needs no commands at all; the tray covers everything. These exist
+for scripting and troubleshooting:
+
+```bash
+clipsync                       # run sync + tray (default)
+clipsync pair --host           # host a pairing session, show the code
+clipsync pair <code>           # join — finds the host automatically
+clipsync pair <host-ip> <code> # manual fallback if discovery fails
+clipsync list                  # list paired devices and known addresses
+clipsync addrs                 # show this machine's reachable addresses
+clipsync clipdiag              # diagnose clipboard/permission problems
+clipsync autostart [on|off]    # query or set launch-at-login
+```
+
+## Configuration
+
+Settings live in `settings.json` inside the config directory and are all
+editable from the tray menu — you rarely need to touch the file.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `listen_port` | `47684` | TCP port for sync connections |
+| `auto_fetch_bytes` | 100 MiB | **Received** files up to this size download automatically; larger ones wait for you to click *Fetch*. Does not affect sending, text, or images |
+| `allow_image` / `allow_files` | `true` | Content type switches (apply both ways) |
+| `file_cache_bytes` | 1 GiB | Resume-cache ceiling, evicted least-recently-used |
+| `upload_limit_bytes_per_sec` | `0` | File upload rate limit; `0` means unlimited |
+| `compress_transfers` | `true` | Adaptive compression before sending files |
+| `verbose_log` | `false` | Record debug-level detail |
+
+Config directory:
+
+- **Windows** — `%APPDATA%\ClipSync\`
+- **macOS** — `~/Library/Application Support/ClipSync/`
+
+A corrupted config never prevents startup: it is moved aside as `.bad`, defaults
+are restored, and the event is logged.
+
+### Environment variables
+
+| Variable | Purpose |
 |---|---|
-| 已有完整内容 | 秒同步，零传输 |
-| 有前 N 字节 | 只索取 N+1 之后 |
-| 文件被改过 | 标识随 (大小,修改时间) 改变 → 缓存失效 → 重传 |
+| `CLIPSYNC_LOG` | Log level, e.g. `debug` |
+| `CLIPSYNC_CONFIG_DIR` | Alternate config directory (useful for running two instances on one machine) |
+| `CLIPSYNC_PEERS` | Extra peer addresses, `ip:port` comma-separated, for cases discovery cannot reach |
+| `CLIPSYNC_NO_WATCH` | Disable local clipboard monitoring (receive-only device) |
+| `CLIPSYNC_NO_TRAY` | Run headless, no tray |
+| `CLIPSYNC_DEVICE_NAME` | Override this machine's display name |
 
-**空间可控。** 缓存默认上限 1GB（`settings.json` 的 `file_cache_bytes` 可改），超出按最久未使用淘汰；当前剪贴板引用的内容会被钉住不淘汰。落地文件优先用硬链接，不占额外空间。
+## How it works
 
-**不吃内存、不产生损坏文件。** 全程流式分块（256KB），传 90MB 文件内存恒定约 13MB；传输完成时校验内容哈希，源文件若在传输中被改动会被发现并重传。
+### Finding the other machine
 
-**自适应压缩。** 发送前取文件开头试压，压得动才压——文本/代码/日志类文件等效吞吐提升约 40%，且实际占用带宽更少；jpg/mp4/zip 等已压缩内容自动跳过，不浪费 CPU。可用 `compress_transfers` 关闭。
+Addresses come from three general-purpose sources, and no code anywhere knows
+what "Tailscale" is:
 
-**可限速。** `upload_limit_bytes_per_sec` 设定文件发送上限（0 = 不限速）。**只限文件内容**——限速状态下复制文字依然瞬时同步，不会被大文件堵住。
+1. **Exchanged during pairing** — both sides learn every address the other has,
+   including virtual interfaces.
+2. **LAN multicast beacons** — same-subnet devices announce periodically, so
+   sync survives DHCP changes.
+3. **Told over the encrypted channel** — connected peers keep each other
+   updated. As long as one path works, addresses for the others propagate.
 
-### 实测性能（90MB 文件，本机回环，优化构建）
+Candidates are then ranked by topological distance: same-subnet direct, then
+overlay/VPN, then public. Run `clipsync addrs` to see what your machine
+advertises.
 
-| 场景 | 耗时 | 吞吐 |
+> **Why are beacons plaintext and unauthenticated?** They only *hint* at
+> addresses; authentication is the transport layer's job. Forging a beacon
+> achieves nothing beyond one failed connection attempt, because the `Noise_IK`
+> handshake requires the peer's static private key.
+
+### Ports
+
+| Port | Purpose | Protocol |
 |---|---|---|
-| 不可压缩文件（随机数据） | 0.61 s | 146 MB/s |
-| 可压缩文本（日志类） | 0.49 s | 191 MB/s（等效） |
-| 限速 10 MB/s | 8.36 s | 与设定一致 |
-| 重复内容（缓存完整命中） | ~1 ms | 零传输 |
+| 47684 | Sync connections (`listen_port`) | TCP |
+| 47685 | Pairing (listening only during `pair`) | TCP |
+| 47690 | Device discovery beacon | UDP multicast |
+| 47691 | Pairing discovery beacon (during `pair` only) | UDP multicast |
 
-> 注意：**必须用优化构建**。`cargo build`（debug）下同一传输需 15.5 秒（5.9 MB/s）——
-> 加密与哈希在 debug 下慢一个数量级。日常使用请用 `cargo build --release`。
+The multicast group is `239.255.71.83`, an administratively-scoped address that
+does not leak past your router.
 
-配置目录（日志在其下的 `logs/`）：
-- Windows：`%APPDATA%\ClipSync\` —— 即 `C:\Users\<你>\AppData\Roaming\ClipSync\`
-- macOS：`~/Library/Application Support/ClipSync/`
+### File sync
 
-## 开发路线（里程碑）
+A clipboard is **last-value-wins**, not a queue. File sync is built around that:
 
-- [x] **M0 骨架**：workspace、核心引擎 + 全套单测、配置、日志、优雅退出、stub 后端。
-- [x] **M1 本地剪贴板闭环**：arboard 读写文本/图片 + 序列号轮询监听 + 敏感内容探测 + 防回环。已在真实 Windows 剪贴板端到端验证（文本/图片捕获、去重、敏感跳过均通过；空闲内存 ~13MB debug、CPU≈0）。
-- [x] **M2 传输与配对**：Noise_IK 端到端加密（snow）+ 一次性配对码 PAKE（spake2）+ TCP 分块帧 + 方向性连接去重。已用两个真实进程端到端验证（配对→认证连接→加密同步文本，单一稳定连接无抖动，双实例各 ~10MB）。
-- [ ] **M3 发现与优选**：mDNS + Tailscale 解析 + 路径优选 + 断线重连。
-- [x] **M3 发现与优选**：通用候选地址模型（同网段直连 → 覆盖网 → 公网）+ 本机网卡枚举 + UDP 组播信标 + 配对/加密通道内的地址互告 + `known_good` 重连加速。**不绑定任何组网产品**，Tailscale/ZeroTier/Netbird/WireGuard/公网转发同等支持。已实机验证（自动识别 Tailscale 的 IPv4/IPv6 地址，零手填 IP 完成连接与同步）。
-- [x] **M4 文件同步**：元数据先行 + 流式分块 + 取代语义 + 断点续传 + 内容校验 + LRU 缓存。已实机验证（90MB 传输中被文本打断→文本秒达且部分保留→再复制自动续传→MD5 完全一致→重复复制零传输秒同步；全程内存恒定 ~13MB）。
-- [x] **M5 打磨**：系统托盘（状态图标 + 菜单）、开机自启、暂停同步、纯后台模式兜底。已实机验证（托盘常驻空闲 CPU ≈0.1%、内存 12–15MB；自启注册表项正确写入/删除）。
+**Copying a file sends a manifest, not the bytes.** The receiver learns what
+exists, answers which byte ranges it needs, and only then does data move.
 
-## 状态
+**Copy something else mid-transfer and the transfer is superseded immediately.**
+Waiting for the old transfer would block the content you actually want now;
+finishing it would leave the peer's clipboard holding the wrong thing. Instead
+the sender stops at the next chunk boundary and already-received bytes are kept
+for resume.
 
-**全部里程碑完成。** 程序已可日常使用：托盘常驻、开机自启、一次性配对码建立端到端加密、无需手填 IP 自动发现最优路径、文本/图片/文件同步（含大文件断点续传与取代语义）、敏感内容自动跳过。
+**Re-copying the same file resumes or completes instantly** — a complete cached
+copy syncs with zero transfer; a partial one requests only the remainder. Files
+are identified by size and modification time, so an edited file invalidates its
+cache.
 
-实测指标（release）：空闲 CPU ≈0.03%、内存 ~11 MB、二进制 1.4 MB、传 90MB 文件内存恒定不涨、连接零抖动、172 个测试全过。
+**Memory stays flat.** Everything is streamed in 256 KB chunks; a 90 MB transfer
+holds about 13 MB of memory. Content hashes are verified on completion, so a
+file modified mid-transfer is detected and re-sent rather than silently
+corrupted.
 
-### 配置项（`settings.json`）
+**Compression is adaptive.** A sample of each file is test-compressed; text,
+code, and logs compress and gain roughly 40% effective throughput, while JPEG,
+MP4, and ZIP skip it and waste no CPU.
 
-| 键 | 默认 | 说明 |
+### Performance
+
+Measured on release builds, 90 MB file over loopback:
+
+| Scenario | Time | Throughput |
 |---|---|---|
-| `listen_port` | 47684 | 同步连接监听端口 |
-| `auto_fetch_bytes` | 100 MiB | **收到**的文件多大以内自动拉取；超过则挂起等你在托盘点「取回」。不影响发送，也不管文本/图片 |
-| `allow_image` / `allow_files` | true | 类型开关（收发都受约束） |
-| `file_cache_bytes` | 1 GiB | 续传缓存上限，超出按 LRU 淘汰 |
-| `upload_limit_bytes_per_sec` | 0 | 文件发送限速，0 = 不限速 |
-| `compress_transfers` | true | 传输前自适应压缩 |
-| `verbose_log` | false | 记录 debug 级详细日志 |
+| Incompressible (random data) | 0.61 s | 146 MB/s |
+| Compressible (log-like text) | 0.49 s | 191 MB/s effective |
+| Rate-limited to 10 MB/s | 8.36 s | matches setting |
+| Fully cached repeat | ~1 ms | zero transfer |
 
-> 这些都能在托盘菜单里改，一般不必手工编辑。真改坏了也不会导致程序打不开：
-> 损坏的配置会被另存为 `.bad` 并回退到默认值，日志里有记录。
+Images are compressed at the frame layer before transmission — a 4K screenshot
+is 33 MB as raw RGBA and about 6% of that after compression, which matters a
+great deal on links slower than gigabit.
 
-### 未采纳的优化：多连接分段传输
+## Security
 
-考虑过类似下载工具的多连接分段并行传输，实测后**决定不做**：千兆网线速为
-125 MB/s，而当前单连接已达 135–191 MB/s，**已超过网线速度**，多开连接换不来
-任何提速，只增加握手与 CPU 开销。
+- **Transport:** `Noise_IK` (Curve25519 + ChaCha20-Poly1305 + BLAKE2s). Each
+  device holds a static keypair; the private key never leaves the machine and is
+  stored with `0600` permissions.
+- **Pairing:** SPAKE2 password-authenticated key exchange. The 4-digit code is
+  never transmitted, and offline brute force against a captured handshake is not
+  possible. Online guessing is capped at 5 attempts per session.
+- **Authentication:** peers are identified by static public key. A device that
+  is not paired cannot complete a handshake, so unauthenticated traffic is
+  rejected before any clipboard data exists.
+- **No third party:** there is no relay, no account system, and no telemetry.
+  Data goes directly between your devices.
 
-多连接唯一有效的场景是**高延迟链路**（单条 TCP 吞吐受 `窗口 ÷ RTT` 限制），
-例如 Tailscale 打洞失败走 DERP 中继、或跨地域连接。若将来实测确认卡在 RTT 上，
-再针对性引入不迟。
+**Threat model.** ClipSync protects clipboard contents in transit against
+network observers and against unpaired devices on the same network. It does
+**not** protect against a compromised endpoint — anything that can read your
+clipboard locally can read what ClipSync syncs.
 
-### 尚待完成
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
-- **Windows 侧目视验证**：弹窗的 DPI 感知与字体改动、托盘新增的「输入配对码…」、
-  配对后免重启生效——这几项在 macOS 上完成，未在 Windows 实机确认。
-  详见 [`docs/CROSS_PLATFORM.md`](docs/CROSS_PLATFORM.md) 末尾。
-- **真实密码管理器验证**：两平台至今都用脚本模拟敏感标记。社区约定与"某个
-  软件实际是否遵守"是两回事，模拟测不出后者。
-- **打包**：Windows 免控制台窗口的 GUI 子系统构建（macOS `.app` 已完成，见「构建」）。
+## Troubleshooting
 
-> macOS 平台代码（`NSPasteboard` 文件列表读写、`ConcealedType` 敏感探测、
-> `changeCount` 变更令牌、`NSApplication` 事件循环、开机自启、私钥 0600）
-> **已全部补齐并实测**，见 [`docs/MACOS.md`](docs/MACOS.md)。
+Logs live at `logs/clipsync.log` in the config directory (4 MB rotating, one
+generation kept). Enable **详细日志 / Verbose logging** in the tray for
+debug-level detail — it takes effect without restarting.
+
+Useful signals in the log:
+
+- `本机地址: …` on startup — compare with the peer's line to see whether the two
+  machines are even on the same subnet.
+- `写入剪贴板耗时 … ms` — only logged when it exceeds 200 ms, so its presence
+  means local encoding is a bottleneck.
+- `系统拒绝读取 …` — macOS denied file access; the message names the exact
+  Settings pane to fix it. `clipsync clipdiag` lists every path with a verdict.
+
+**All devices must run the same protocol version.** The wire format changed in
+1.0.0; mixing it with older builds causes repeated reconnects.
+
+## Known limitations
+
+- **The interface is Chinese-only.** Roughly 450 user-facing strings — tray
+  menu, dialogs, error messages, and CLI output — are currently hard-coded in
+  Simplified Chinese. Localisation is planned but not scheduled; contributions
+  are welcome.
+- **Linux is not supported.** The code compiles, but clipboard change detection,
+  dialogs, and launch-at-login are all no-ops, which makes it non-functional
+  rather than merely degraded.
+- **Windows visual verification is incomplete.** Dialog DPI/font handling and
+  some newer tray items were verified on macOS but not on Windows hardware.
+- **Password manager behaviour is simulated in tests.** Sensitive-content
+  detection follows the documented platform conventions, but whether a specific
+  password manager honours them has not been verified against real software.
+- **Promised files** (`com.apple.pasteboard.promised-file-url`) are detected and
+  explained by `clipdiag` but not yet transferred.
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+development setup, testing expectations, and commit conventions.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the fastest way to understand
+the codebase: four crates, with all platform-specific code confined to a handful
+of files.
+
+Note that source comments are written in Chinese, matching the existing
+codebase.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.
