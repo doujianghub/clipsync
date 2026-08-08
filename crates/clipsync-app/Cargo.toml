@@ -42,7 +42,7 @@ flate2 = { workspace = true }
 # 黑框，而且 `powershell -Command -`（从 stdin 喂脚本）是无文件攻击的典型
 # 模式，杀软有充分理由拦它。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Controls",
     "Win32_Foundation",
