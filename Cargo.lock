@@ -319,7 +319,7 @@ version = "1.0.0"
 dependencies = [
  "postcard",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tracing",
 ]
 
@@ -338,7 +338,7 @@ dependencies = [
  "serde",
  "snow",
  "spake2",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tracing",
 ]
 
