@@ -1,0 +1,68 @@
+name: Bug report
+description: Something does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Logs from **both machines** are essential for anything sync-related —
+        one side alone almost never contains enough to diagnose a connection
+        problem. Please redact anything you consider private; logs may contain
+        device names, local IP addresses, and file names.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Copy a 30 MB image on machine A
+        2. Wait
+        3. Paste on machine B — still the previous content
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: ClipSync version
+      description: From the release filename, or `git rev-parse --short HEAD` if built from source
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platforms
+    attributes:
+      label: Platforms involved
+      multiple: true
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows 11
+        - Windows 10
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Enable **详细日志 / Verbose logging** in the tray (takes effect immediately),
+        reproduce, then attach `logs/clipsync.log` from the config directory on
+        both machines.
+      render: shell
+
+  - type: textarea
+    id: addrs
+    attributes:
+      label: Output of `clipsync addrs`
+      description: From both machines. Helps determine whether they are even on the same subnet.
+      render: shell

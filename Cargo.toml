@@ -16,11 +16,15 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.75"
-license = "MIT"
-repository = ""
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/doujianghub/clipsync"
+homepage = "https://github.com/doujianghub/clipsync"
+authors = ["doujianghub <wangxin7779@gmail.com>"]
+keywords = ["clipboard", "sync", "p2p", "noise-protocol", "tray"]
+categories = ["command-line-utilities", "network-programming"]
 
 # 统一依赖版本，避免各 crate 版本漂移。
 # 约束采用宽松写法，由 Cargo 解析到兼容的最新补丁版本。
