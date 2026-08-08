@@ -18,7 +18,11 @@ members = [
 [workspace.package]
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.82"
+# 这个数字由**传递依赖**决定，不是我们代码的选择：
+# arboard → image 0.25 要求 1.88，image → moxcms 要求 edition2024（1.85+）。
+# 想降只能锁旧版 arboard/image，不值得。改动前先跑 `cargo +<版本> build`
+# 实测，别照着自己代码用了什么 API 推断——那样得出的 1.75 与 1.82 都是假的。
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/doujianghub/clipsync"
 homepage = "https://github.com/doujianghub/clipsync"

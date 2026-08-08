@@ -205,7 +205,7 @@ pub fn spawn_dialer(ctx: NetCtx) -> std::thread::JoinHandle<()> {
             loop {
                 // 周期性重采样本机网段：覆盖网上线/网络切换后，地址分类
                 // （同网段直连 vs 覆盖网）才能保持准确。
-                if round % REFRESH_NETWORKS_EVERY == 0 {
+                if round.is_multiple_of(REFRESH_NETWORKS_EVERY) {
                     ctx.addrbook.refresh_local_networks();
                     log_addrbook_state(&ctx);
                 }

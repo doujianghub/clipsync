@@ -81,6 +81,10 @@ fn clipboard_roundtrip_preserves_nfc_filename() {
         "磁盘上的文件名应为 NFC（前置条件）"
     );
 
+    if !crate::clipboard_usable() {
+        eprintln!("跳过：剪贴板不可用（无 GUI 会话）");
+        return;
+    }
     write_file_paths(std::slice::from_ref(&path)).expect("写入剪贴板应成功");
     let read = read_file_paths()
         .expect("读取不应出错")
@@ -133,6 +137,10 @@ fn written_files_survive_writer_exit() {
         })
         .collect();
 
+    if !crate::clipboard_usable() {
+        eprintln!("跳过：剪贴板不可用（无 GUI 会话）");
+        return;
+    }
     let status = std::process::Command::new(&helper)
         .args(&paths)
         .status()

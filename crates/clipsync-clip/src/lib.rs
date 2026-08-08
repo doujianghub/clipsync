@@ -32,6 +32,19 @@ pub mod stub;
 /// 只在 macOS 上编译：眼下所有"写入再读回"的测试都是 macOS 限定的
 /// （Windows 侧的剪贴板行为靠交叉检查与实机验证），在别的目标上留着它
 /// 只会得到一条 dead_code 告警。
+/// 这台机器现在能不能真的用剪贴板。
+///
+/// CI runner 与 ssh 会话里没有可用的窗口服务，`NSPasteboard` 会失败。碰上
+/// 这种环境，依赖真实剪贴板的测试应当**跳过**而不是失败——它们验证的是平台
+/// 集成，在没有平台可集成的地方报红只是噪音，还会淹掉真正的问题。
+///
+/// 判据取"写一次空列表"：读操作在剪贴板本就为空时也返回 Ok，区分不出
+/// "没内容"和"用不了"。
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn clipboard_usable() -> bool {
+    crate::filelist::write_file_paths(&[]).is_ok()
+}
+
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn clipboard_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();

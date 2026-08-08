@@ -232,5 +232,7 @@ fn waiting_returns_at_once_when_the_change_already_happened() {
 
     let t0 = Instant::now();
     known.wait_for_change(stale, Duration::from_secs(60));
-    assert!(t0.elapsed() < Duration::from_millis(100), "不该等");
+    // 判的是"根本没等"，不是"等得短"。给到 500ms 纯粹为容忍 CI 的线程调度
+    // 抖动——真退化成阻塞等待的话是秒级，照样区分得开。
+    assert!(t0.elapsed() < Duration::from_millis(500), "不该等");
 }

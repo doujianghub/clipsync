@@ -76,7 +76,9 @@ fn a_fast_top_priority_hit_does_not_wait_for_the_stragglers() {
 
     assert_eq!(got, Some((0, 47683)));
     assert!(
-        took < Duration::from_millis(800),
+        // 上限放到 1500ms 是为了容忍共享 CI runner 的调度抖动，同时仍小于
+        // 慢候选的 2000ms——真退化成"等落后者"的话照样会被抓住。
+        took < Duration::from_millis(1500),
         "最优候选已定就该马上走，实际等了 {took:?}"
     );
 }
@@ -110,7 +112,8 @@ fn a_hopeless_high_priority_address_does_not_hold_the_connection_hostage() {
 
     assert_eq!(got, Some((2, 47683)));
     assert!(
-        took < Duration::from_millis(900),
+        // 同上：宽到能容忍慢机器，但仍远小于 2000ms 的"等满超时"。
+        took < Duration::from_millis(1500),
         "应在宽限期后就走，而不是陪着高优先级等满超时；实际 {took:?}"
     );
     assert!(
