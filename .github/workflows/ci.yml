@@ -25,7 +25,7 @@ jobs:
           - { name: macOS, os: macos-latest }
           - { name: Windows, os: windows-latest }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -36,14 +36,35 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets
 
+      # 把测试输出同时留一份，失败时贴进 job summary。
+      #
+      # **为什么值得这么做**：Actions 的原始日志要登录才能看，而 check-run 的
+      # summary 任何人都读得到（也包括 API）。失败时最需要的就是那几行
+      # `panicked at`，让它直接可见，省掉"点进去展开某一步"这段路。
       - name: Test
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tee test-output.txt
+
+      - name: Surface test failures
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### ❌ ${{ matrix.name }} 测试失败"
+            echo
+            echo '```'
+            grep -E "^(test .*FAILED|failures:|---- .* stdout ----|thread .* panicked|assertion)" -A4 test-output.txt | head -80 \
+              || tail -60 test-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   lint:
     name: Format and lint
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -64,7 +85,7 @@ jobs:
     name: Cross-compile check
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -85,7 +106,7 @@ jobs:
     name: Minimum supported Rust version
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@1.88.0
 
