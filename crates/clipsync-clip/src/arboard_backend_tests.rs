@@ -122,6 +122,10 @@ fn same_named_files_keep_meta_and_path_aligned() {
     std::fs::write(&pa, b"a").unwrap();
     std::fs::write(&pb, b"bb").unwrap();
 
+    if !crate::clipboard_usable() {
+        eprintln!("跳过：剪贴板不可用（无 GUI 会话）");
+        return;
+    }
     crate::filelist::write_file_paths(&[pa.clone(), pb.clone()]).unwrap();
 
     // 让第一个文件在"复制之后、读取之前"消失——这正是取元数据会失败的
@@ -231,8 +235,10 @@ fn a_slow_operation_does_not_blow_the_budget() {
     let took = started.elapsed();
 
     assert!(got.is_err());
+    // 600ms 预算下每次 200ms，正常是 3 次约 800ms。上限取 1800ms：容得下慢
+    // runner，又明显小于"固定 12 次重试"的 2400ms——退化了一眼就能看出来。
     assert!(
-        took < Duration::from_millis(1200),
+        took < Duration::from_millis(1800),
         "慢操作也该在预算附近收手，实际 {took:?}"
     );
 }

@@ -21,7 +21,7 @@ elsewhere, that is a sign the abstraction is in the wrong place.
 
 ## Development setup
 
-Requires Rust 1.82 or later.
+Requires Rust 1.88 or later.
 
 ```bash
 cargo build
