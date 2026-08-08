@@ -176,8 +176,10 @@ impl Rect {
             (self.x1 - 1 - radius, self.y1 - 1 - radius),
         ];
         for (cx, cy) in corners {
-            let outside_x = (x < cx && cx == self.x0 + radius) || (x > cx && cx != self.x0 + radius);
-            let outside_y = (y < cy && cy == self.y0 + radius) || (y > cy && cy != self.y0 + radius);
+            let outside_x =
+                (x < cx && cx == self.x0 + radius) || (x > cx && cx != self.x0 + radius);
+            let outside_y =
+                (y < cy && cy == self.y0 + radius) || (y > cy && cy != self.y0 + radius);
             if outside_x && outside_y {
                 let dx = x - cx;
                 let dy = y - cy;
@@ -194,7 +196,6 @@ impl Rect {
 mod tests {
     use super::*;
 
-
     #[test]
     fn icon_state_priority() {
         let s = TrayStatus::new(1);
@@ -208,7 +209,6 @@ mod tests {
         assert_eq!(IconState::of(&s), IconState::Paused);
     }
 
-
     #[test]
     fn icon_pixels_have_expected_size_and_content() {
         let px = draw_clipboard(IconState::Connected, false, false);
@@ -217,7 +217,6 @@ mod tests {
         assert!(px.chunks(4).any(|p| p[3] == 255), "应绘制出可见图形");
         assert!(px.chunks(4).any(|p| p[3] == 0), "四周应为透明");
     }
-
 
     #[test]
     fn different_states_produce_different_icons() {
@@ -229,12 +228,19 @@ mod tests {
         assert_ne!(a, c);
     }
 
-
     #[test]
     fn broken_icon_is_visually_distinct() {
         let broken = draw_clipboard(IconState::Broken, false, false);
-        for other in [IconState::Connected, IconState::Disconnected, IconState::Paused] {
-            assert_ne!(broken, draw_clipboard(other, false, false), "故障图标应与 {other:?} 有区别");
+        for other in [
+            IconState::Connected,
+            IconState::Disconnected,
+            IconState::Paused,
+        ] {
+            assert_ne!(
+                broken,
+                draw_clipboard(other, false, false),
+                "故障图标应与 {other:?} 有区别"
+            );
         }
     }
 
@@ -256,7 +262,11 @@ mod tests {
             .collect();
         assert!(!badge_px.is_empty());
         for p in &badge_px {
-            assert_eq!(&p[..3], &[BADGE_COLOR.0, BADGE_COLOR.1, BADGE_COLOR.2], "角标只该是那一种蓝");
+            assert_eq!(
+                &p[..3],
+                &[BADGE_COLOR.0, BADGE_COLOR.1, BADGE_COLOR.2],
+                "角标只该是那一种蓝"
+            );
             assert_eq!(p[3], 255, "角标不透明");
         }
 

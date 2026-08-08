@@ -180,7 +180,12 @@ unsafe fn prompt_inner(title: &str, body: &str) -> Result<Option<String>> {
         right: s(BASE_WIDTH),
         bottom: btn_y + s(BTN_H + MARGIN),
     };
-    AdjustWindowRectEx(&mut rect, WS_POPUPWINDOW | WS_CAPTION, 0, WS_EX_DLGMODALFRAME);
+    AdjustWindowRectEx(
+        &mut rect,
+        WS_POPUPWINDOW | WS_CAPTION,
+        0,
+        WS_EX_DLGMODALFRAME,
+    );
     let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);

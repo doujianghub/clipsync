@@ -84,9 +84,7 @@ impl ClipContent {
         match self {
             ClipContent::Text(s) => s.len(),
             ClipContent::Image(img) => img.rgba.len(),
-            ClipContent::Files(files) => {
-                files.iter().map(|f| f.size as usize).sum()
-            }
+            ClipContent::Files(files) => files.iter().map(|f| f.size as usize).sum(),
         }
     }
 
@@ -166,10 +164,7 @@ mod tests {
 
     #[test]
     fn byte_size_sums_files() {
-        let c = ClipContent::Files(vec![
-            FileMeta::new("a", 10, 1),
-            FileMeta::new("b", 5, 2),
-        ]);
+        let c = ClipContent::Files(vec![FileMeta::new("a", 10, 1), FileMeta::new("b", 5, 2)]);
         assert_eq!(c.byte_size(), 15);
     }
 

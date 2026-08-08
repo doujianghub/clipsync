@@ -136,7 +136,8 @@ fn copy_out(dst: &NSBitmapImageRep, w: usize, h: usize) -> Option<ImageData> {
     let mut rgba = Vec::with_capacity(row_bytes.checked_mul(h)?);
     for y in 0..h {
         // SAFETY: AppKit 保证缓冲区至少 stride × h 字节；每行只读前 row_bytes 个。
-        let row = unsafe { std::slice::from_raw_parts(ptr.add(y * stride) as *const u8, row_bytes) };
+        let row =
+            unsafe { std::slice::from_raw_parts(ptr.add(y * stride) as *const u8, row_bytes) };
         rgba.extend_from_slice(row);
     }
 

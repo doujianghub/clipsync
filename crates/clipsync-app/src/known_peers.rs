@@ -120,7 +120,11 @@ impl KnownPeers {
     }
 
     pub fn contains(&self, device: &DeviceId) -> bool {
-        self.inner.lock().unwrap().iter().any(|p| &p.device == device)
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| &p.device == device)
     }
 
     /// 按静态公钥查找——入站连接的认证依据。

@@ -63,7 +63,9 @@ pub enum SyncMessage {
     ///
     /// 地址的优先级由**接收方**依据自身网络位置判定（同一个 IP 对不同设备可能
     /// 是"同网段直连"或"跨网覆盖"），故此处只传裸地址。
-    Addresses { addrs: Vec<std::net::SocketAddr> },
+    Addresses {
+        addrs: Vec<std::net::SocketAddr>,
+    },
 
     // ———————————————————————————————————————————————————————————
     // 文件内容传输
@@ -113,7 +115,9 @@ pub enum SyncMessage {
     /// 发送方放弃某代际的文件传输（通常因为剪贴板已更新为新内容）。
     ///
     /// 接收方收到后停止等待，但**保留已收到的部分**以便将来续传。
-    FileAbort { generation: u64 },
+    FileAbort {
+        generation: u64,
+    },
     /// 发送方无法提供某文件（已被删除/移动/无权限）。
     FileUnavailable {
         generation: u64,
@@ -140,7 +144,9 @@ pub enum SyncMessage {
     /// B 据此把 C 记为已配对，此后 B 与 C 可直连——**A 关机也不影响**。
     ///
     /// 只在对端协议版本 ≥ 2 时发送（见 [`PROTOCOL_VERSION`]）。
-    Peers { peers: Vec<PeerIntro> },
+    Peers {
+        peers: Vec<PeerIntro>,
+    },
 
     /// 把某台设备**移出设备组**，收到的一方应当忘掉它。
     ///
@@ -156,7 +162,9 @@ pub enum SyncMessage {
     /// 组内任何成员都可以踢任何人——这些本就是同一个人的设备，不必设管理员。
     ///
     /// 只在对端协议版本 ≥ 3 时发送（见 [`PROTOCOL_VERSION`]）。
-    Removed { device: DeviceId },
+    Removed {
+        device: DeviceId,
+    },
 }
 
 impl SyncMessage {

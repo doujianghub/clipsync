@@ -38,6 +38,7 @@ mod filetransfer;
 mod host_probe;
 mod hub;
 mod known_peers;
+mod language;
 mod logging;
 mod net_manager;
 mod pairing_cli;
@@ -69,6 +70,15 @@ fn main() -> Result<()> {
         .map(|s| s.verbose_log)
         .unwrap_or(false);
     let log_control = logging::init(&dir, verbose);
+
+    // 界面语言要在**任何**面向用户的文字产生之前定下来——子命令的输出、
+    // 配对弹窗、托盘菜单都要用它，任何一处走在前面就会漏成中文。
+    let lang = language::apply(
+        config::load_or_init_settings(&dir)
+            .map(|s| language::LangPref::parse(&s.language))
+            .unwrap_or_default(),
+    );
+    tracing::debug!("界面语言: {}", lang.as_str());
     let identity = config::load_or_init_identity(&dir)?;
     let device_name = device_name::device_name_best_effort();
 
@@ -195,7 +205,10 @@ fn run_sync(
     let settings = config::load_or_init_settings(&dir)?;
     let device_id = identity.device_id();
     info!("配置目录: {}", dir.display());
-    info!("日志文件: {}", log_control.dir().join("clipsync.log").display());
+    info!(
+        "日志文件: {}",
+        log_control.dir().join("clipsync.log").display()
+    );
     info!("本机设备: {} ({})", device_name, device_id);
     info!(
         "设置: 自动取回上限={} MiB, 图片={}, 文件={}, 同步端口={}",

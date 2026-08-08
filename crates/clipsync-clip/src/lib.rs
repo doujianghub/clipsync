@@ -2,7 +2,7 @@
 //!
 //! 本 crate 定义平台无关的 trait，具体后端在各里程碑填充：
 //!   - M1：`arboard` 文本/图片 + 平台原生监听（Win 事件 / macOS changeCount）
-//!         + 敏感内容探测。
+//!     + 敏感内容探测。
 //!   - M4：文件列表（Win CF_HDROP / macOS file-url）。
 //!
 //! 当前提供接口定义与一个内存 stub 后端（`stub` 模块），使上层可先行

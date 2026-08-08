@@ -53,8 +53,11 @@ impl PairingDeps {
     pub(crate) fn register(&self, record: &clipsync_net::pairing::PairingRecord) {
         self.known.upsert(record.clone().into());
         if !record.addrs.is_empty() {
-            self.addrbook
-                .add_addrs(&record.device, record.addrs.iter().copied(), AddrSource::Pairing);
+            self.addrbook.add_addrs(
+                &record.device,
+                record.addrs.iter().copied(),
+                AddrSource::Pairing,
+            );
         }
         info!(
             "已登记新配对设备 {} ({})，无需重启即可开始同步",
@@ -140,7 +143,6 @@ impl PairingDeps {
         });
     }
 }
-
 
 /// 托盘里点某台设备 → 确认 → 把它移出设备组。
 ///
@@ -261,7 +263,7 @@ pub(crate) fn host_pairing_interactive(
                 );
                 let code = code.to_string();
                 std::thread::spawn(move || {
-                    if dialog::ask_action("ClipSync 配对", &body, NEW_CODE_LABEL) {
+                    if dialog::ask_action("ClipSync 配对", &body, new_code_label()) {
                         request_new_code(&slot_for_dialog, Some(&code));
                     }
                 });
@@ -295,7 +297,9 @@ pub(crate) fn host_pairing_interactive(
 /// 「换个配对码」在菜单与弹窗上的统一叫法。
 ///
 /// 不叫「刷新」：刷新听起来像"重新拿一遍同一个东西"，而这里旧码当场作废。
-pub(crate) const NEW_CODE_LABEL: &str = "换个配对码";
+pub(crate) fn new_code_label() -> &'static str {
+    clipsync_core::t!("换个配对码", "New code")
+}
 
 /// 显示当前会话的配对码；窗口上的「换个配对码」照常可用。
 ///
@@ -307,7 +311,7 @@ fn show_code_dialog(slot: &PairingHostSlot, sync_port: u16) {
         return;
     };
     let body = pairing_cli::code_dialog_body(&live.code, sync_port, live.remaining);
-    if dialog::ask_action("ClipSync 配对", &body, NEW_CODE_LABEL) {
+    if dialog::ask_action("ClipSync 配对", &body, new_code_label()) {
         request_new_code(slot, Some(&live.code));
     }
 }
@@ -320,7 +324,7 @@ fn request_new_code(slot: &PairingHostSlot, only_if: Option<&str>) {
     if slot.request_new_code(only_if) {
         return;
     }
-    info!("「{NEW_CODE_LABEL}」落空：对应的配对会话已经结束");
+    info!("「{}」落空：对应的配对会话已经结束", new_code_label());
     dialog::show_info(
         "ClipSync 配对",
         "这个配对码已经失效了。\n\n请在托盘菜单里重新选「显示配对码…」。",

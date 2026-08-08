@@ -183,7 +183,11 @@ fn screenshot_like(w: u32, h: u32) -> SyncMessage {
 }
 
 fn image_msg(width: u32, height: u32, rgba: Vec<u8>) -> SyncMessage {
-    let content = ClipContent::Image(clipsync_core::ImageData { width, height, rgba });
+    let content = ClipContent::Image(clipsync_core::ImageData {
+        width,
+        height,
+        rgba,
+    });
     SyncMessage::Clip {
         origin: DeviceId::from_public_key(b"cam"),
         seq: 1,

@@ -240,7 +240,10 @@ pub fn host(
         println!();
     }
     print_manual_hint(&code, sync_port);
-    println!("  正在等待对方连接（{} 秒内有效）…", HOST_SESSION_TIMEOUT.as_secs());
+    println!(
+        "  正在等待对方连接（{} 秒内有效）…",
+        HOST_SESSION_TIMEOUT.as_secs()
+    );
 
     let mut failures = 0u32;
 
@@ -333,7 +336,8 @@ fn print_manual_hint(code: &PairingCode, sync_port: u16) {
     }
     println!("  若两台设备不在同一局域网，在对方设备上运行：");
     for sa in &addrs {
-        println!("      clipsync pair {} {}", fmt_host(sa), code);    }
+        println!("      clipsync pair {} {}", fmt_host(sa), code);
+    }
     println!();
 }
 
@@ -470,8 +474,8 @@ fn discover_host() -> Result<Vec<std::net::SocketAddr>> {
     use clipsync_net::discovery::discover_pairing_hosts;
 
     println!("  正在局域网中查找等待配对的设备…");
-    let hosts = discover_pairing_hosts(std::time::Duration::from_secs(2))
-        .context("局域网配对发现失败")?;
+    let hosts =
+        discover_pairing_hosts(std::time::Duration::from_secs(2)).context("局域网配对发现失败")?;
 
     match hosts.len() {
         0 => anyhow::bail!(

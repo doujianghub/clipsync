@@ -195,7 +195,11 @@ fn denial_is_explained_by_where_the_file_lives() {
     // 另一个 App 的容器——微信、QQ 这类把收到的文件存在自己地盘里。
     let wechat = at("Library/Containers/com.tencent.xinWeChat/Data/tmp/报告.pdf");
     assert!(wechat.reason.contains("App"), "{}", wechat.reason);
-    assert!(wechat.where_to_fix.contains("文件与文件夹"), "{}", wechat.where_to_fix);
+    assert!(
+        wechat.where_to_fix.contains("文件与文件夹"),
+        "{}",
+        wechat.where_to_fix
+    );
 
     // 受保护的个人文件夹，三个分别指向同一页但理由各不相同。
     for (sub, want) in [

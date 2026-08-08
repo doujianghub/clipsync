@@ -182,9 +182,10 @@ impl FileCache {
                     _ => continue,
                 };
                 total += md.len();
-                let atime = md.accessed().or_else(|_| md.modified()).unwrap_or(
-                    std::time::SystemTime::UNIX_EPOCH,
-                );
+                let atime = md
+                    .accessed()
+                    .or_else(|_| md.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                 entries.push((e.path(), md.len(), atime));
             }
         }
@@ -223,8 +224,8 @@ impl FileCache {
 pub fn hash_file(path: &Path) -> Result<u64> {
     use std::io::Read;
 
-    let mut f = std::fs::File::open(path)
-        .with_context(|| format!("打开文件失败: {}", path.display()))?;
+    let mut f =
+        std::fs::File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
     let mut hasher = clipsync_core::hash::Hasher::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {

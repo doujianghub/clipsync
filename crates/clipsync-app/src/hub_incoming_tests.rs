@@ -10,7 +10,10 @@ fn size_decides_whether_to_pull_now() {
     const LIMIT: u64 = 100 << 20; // 100 MiB
     assert!(should_auto_fetch(1, LIMIT, false));
     assert!(should_auto_fetch(LIMIT, LIMIT, false), "正好到线仍算以内");
-    assert!(!should_auto_fetch(LIMIT + 1, LIMIT, false), "过线一个字节就挂起");
+    assert!(
+        !should_auto_fetch(LIMIT + 1, LIMIT, false),
+        "过线一个字节就挂起"
+    );
     assert!(!should_auto_fetch(5 << 30, LIMIT, false));
 }
 

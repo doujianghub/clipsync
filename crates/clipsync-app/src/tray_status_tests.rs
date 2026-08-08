@@ -165,8 +165,16 @@ fn name_length_is_fixed_regardless_of_context() {
 #[test]
 fn tooltip_never_exceeds_the_windows_limit() {
     let cases: [(&str, u64, u64); 4] = [
-        ("sha256-1194192cf2b8e4a09d7c3f5061e2a78863006a.tar.zst", 159_000_000, 18_500_000_000),
-        ("这是一个特别特别特别特别长的中文文件名用来测试截断.mkv", 1, 100),
+        (
+            "sha256-1194192cf2b8e4a09d7c3f5061e2a78863006a.tar.zst",
+            159_000_000,
+            18_500_000_000,
+        ),
+        (
+            "这是一个特别特别特别特别长的中文文件名用来测试截断.mkv",
+            1,
+            100,
+        ),
         ("a.txt", 50, 100),
         (&"x".repeat(300), 1, 2),
     ];
@@ -233,7 +241,10 @@ fn menu_summary_keeps_the_absolute_bytes() {
         total: 17_300_000_000,
     });
     let sum = s.summary();
-    assert!(sum.contains("GiB") || sum.contains("MiB"), "菜单里该有字节数：{sum}");
+    assert!(
+        sum.contains("GiB") || sum.contains("MiB"),
+        "菜单里该有字节数：{sum}"
+    );
     // 提示里也要有已传/总量——只看百分比不知道还剩多少。
     let tip = s.tooltip();
     assert!(tip.contains(" / "), "提示第二行该给出已传/总量：{tip}");
@@ -292,7 +303,10 @@ fn idle_tooltip_mentions_pending_files() {
     let tip = s.tooltip();
     assert!(tip.contains("3 项待取回"), "该说有几项：{tip}");
     assert!(tip.contains("GiB"), "该说多大：{tip}");
-    assert!(tip.chars().count() <= 63, "仍不能超过 Windows 的硬上限：{tip}");
+    assert!(
+        tip.chars().count() <= 63,
+        "仍不能超过 Windows 的硬上限：{tip}"
+    );
 }
 
 /// 传输中不提待取项——那两行已经把 63 个字符占满了。
@@ -317,4 +331,30 @@ fn transfer_tooltip_stays_two_lines_even_with_pending() {
     assert_eq!(tip.split('\n').count(), 2, "传输中恒为两行：{tip:?}");
     assert!(!tip.contains("待取"), "别把进度挤掉：{tip}");
     assert!(tip.chars().count() <= 63);
+}
+
+/// 状态行在英文界面下必须是英文。
+///
+/// 托盘提示是最常被看到的一行字——它要是漏译了，英文用户每次瞄一眼托盘都会
+/// 撞见中文，而开发者在中文系统上永远看不到这个问题。
+#[test]
+fn the_status_line_is_translated() {
+    use clipsync_core::Lang;
+
+    let status = TrayStatus::new(2);
+    status.set_connected_ids(std::collections::HashSet::from(["a".to_string()]));
+
+    let (zh, en) = (
+        crate::language::with_lang(Lang::Zh, || status.summary()),
+        crate::language::with_lang(Lang::English, || status.summary()),
+    );
+    assert_eq!(zh, "ClipSync — 已连接 1 / 2 台");
+    assert_eq!(en, "ClipSync — 1 / 2 connected");
+
+    // 暂停态同理——它是另一条独立分支，漏译过一次就会一直漏。
+    status.set_paused(true);
+    assert_eq!(
+        crate::language::with_lang(Lang::English, || status.summary()),
+        "ClipSync — paused"
+    );
 }

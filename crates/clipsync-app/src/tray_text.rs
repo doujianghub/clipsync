@@ -65,17 +65,17 @@ pub(super) fn bytes_pair(done: u64, total: u64) -> String {
 /// 太长会被系统直接切掉；日志要完整，那是事后排查唯一的凭据。
 pub(super) fn describe(st: &ProgressState, shorten: bool) -> String {
     {
-        let dir = if st.p.sending { "发送" } else { "接收" };
+        let dir = crate::tray::tray_status::transfer_verb(st.p.sending);
         let name = if shorten {
             ellipsize_middle(&st.p.name)
         } else {
             st.p.name.clone()
         };
-        let pct = if st.p.total > 0 {
-            st.p.done.saturating_mul(100) / st.p.total
-        } else {
-            0
-        };
+        let pct =
+            st.p.done
+                .saturating_mul(100)
+                .checked_div(st.p.total)
+                .unwrap_or(0);
 
         // 速度要等锚点之后确实有字节流过才显示。刚开头就报一个由极短时间
         // 算出的数字，往往是个离谱的大值，反而不如不显示。

@@ -13,6 +13,10 @@ use crate::pairing_ui::PairingDeps;
 use crate::{autostart, config, dialog, logging, pairing_ui, size_parse, tray};
 
 /// 在主线程运行托盘，处理菜单动作直到用户退出。
+///
+/// 参数确实多，但它们是一组彼此无关的依赖——打包成结构体只是把同样的字段挪
+/// 个地方声明，调用处并不会因此更清楚，反而多出一个只用一次的类型。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_tray(
     status: tray::TrayStatus,
     running: Arc<AtomicBool>,
@@ -58,7 +62,9 @@ pub(crate) fn run_tray(
                 let name = device_name.clone();
                 let pairing = pairing.clone();
                 std::thread::spawn(move || {
-                    pairing_ui::host_pairing_interactive(&dir, &identity, &name, sync_port, &pairing);
+                    pairing_ui::host_pairing_interactive(
+                        &dir, &identity, &name, sync_port, &pairing,
+                    );
                 });
                 true
             }
@@ -68,7 +74,9 @@ pub(crate) fn run_tray(
                 let name = device_name.clone();
                 let pairing = pairing.clone();
                 std::thread::spawn(move || {
-                    pairing_ui::join_by_code_interactive(&dir, &identity, &name, sync_port, &pairing);
+                    pairing_ui::join_by_code_interactive(
+                        &dir, &identity, &name, sync_port, &pairing,
+                    );
                 });
                 true
             }
@@ -122,6 +130,11 @@ pub(crate) fn run_tray(
                 std::thread::spawn(move || prompt_upload_limit(&s));
                 true
             }
+            tray::TrayAction::PromptLanguage => {
+                let s = settings_for_cb.clone();
+                std::thread::spawn(move || prompt_language(&s));
+                true
+            }
             tray::TrayAction::PromptListenPort => {
                 let s = settings_for_cb.clone();
                 std::thread::spawn(move || prompt_listen_port(&s));
@@ -141,7 +154,10 @@ pub(crate) fn run_tray(
                     warn!("打开日志文件夹失败: {e:#}");
                     crate::dialog::show_info(
                         "ClipSync 日志",
-                        &format!("日志位于：\n{}\n\n（自动打开失败：{e}）", log_control.dir().display()),
+                        &format!(
+                            "日志位于：\n{}\n\n（自动打开失败：{e}）",
+                            log_control.dir().display()
+                        ),
                     );
                 }
                 true
@@ -199,8 +215,6 @@ pub(crate) fn run_tray(
 }
 
 /// 托盘里点某台设备 → 确认 → 把它移出设备组。
-///
-
 /// 常用档 + 自定义：先让用户点选，选了「自定义…」再弹输入框。
 ///
 /// **为什么不直接弹输入框**：选常用值这件事，点一下本来就比打字省事，
@@ -295,6 +309,61 @@ fn prompt_auto_fetch(settings: &config::SettingsHandle) {
     );
 }
 
+/// 选择界面语言。
+///
+/// 用选择框而不是 [`pick_setting`] 那套输入框：语言只有三个固定选项，没有
+/// "自定义"的余地，让人打字反而是在制造出错的机会。
+///
+/// **选项名一律用各语言的自称**（中文 / English），不随当前界面语言翻译——
+/// 这一项恰恰是给"看不懂当前界面"的人找的，在英文界面里把中文写成
+/// "Chinese" 对只认中文的人毫无帮助。
+fn prompt_language(settings: &config::SettingsHandle) {
+    use crate::language::LangPref;
+    use clipsync_core::Lang;
+
+    const CHOICES: [LangPref; 3] = [
+        LangPref::Auto,
+        LangPref::Fixed(Lang::Zh),
+        LangPref::Fixed(Lang::English),
+    ];
+
+    let current = LangPref::parse(&settings.snapshot().language);
+    let items: Vec<String> = CHOICES
+        .iter()
+        .map(|p| {
+            let name = match p {
+                LangPref::Auto => clipsync_core::t!("跟随系统", "Follow system"),
+                LangPref::Fixed(Lang::Zh) => "中文",
+                LangPref::Fixed(Lang::English) => "English",
+            };
+            // 标出当前项：选择框本身不显示"现在是哪个"，没有它就得靠记忆。
+            if *p == current {
+                format!("{name} ✓")
+            } else {
+                name.to_string()
+            }
+        })
+        .collect();
+
+    let picked = match dialog::choose(
+        clipsync_core::t!("界面语言", "Language"),
+        clipsync_core::t!(
+            "选「跟随系统」则随系统语言自动切换。改完立即生效，无需重启。",
+            "\"Follow system\" tracks your system language. Takes effect immediately."
+        ),
+        &items,
+    ) {
+        Some(i) => CHOICES[i],
+        None => return,
+    };
+
+    // 先落盘再生效：反过来的话，写设置失败会留下"这次看着变了、重启又回去"
+    // 的状态，比干脆没变更让人困惑。
+    settings.update(|s| s.language = picked.as_str().to_string());
+    let now = crate::language::apply(picked);
+    info!("界面语言已切换为 {}", now.as_str());
+}
+
 fn prompt_upload_limit(settings: &config::SettingsHandle) {
     let cur = settings.snapshot().upload_limit_bytes_per_sec;
     let shown = if cur == 0 {
@@ -332,7 +401,10 @@ fn prompt_listen_port(settings: &config::SettingsHandle) {
             settings.update(|s| s.listen_port = p);
             info!("同步端口已设为 {p}（重启后生效）");
         }
-        Ok(p) => dialog::show_info("同步端口", &format!("{p} 属于系统保留范围，请填 1024–65535")),
+        Ok(p) => dialog::show_info(
+            "同步端口",
+            &format!("{p} 属于系统保留范围，请填 1024–65535"),
+        ),
         Err(_) => dialog::show_info("同步端口", &format!("「{input}」不是有效端口")),
     }
 }
@@ -382,10 +454,16 @@ mod tests {
     #[test]
     fn presets_are_ordered() {
         let sizes: Vec<usize> = AUTO_FETCH_PRESETS.iter().map(|(_, v)| *v).collect();
-        assert!(sizes.windows(2).all(|w| w[0] < w[1]), "上限档应递增: {sizes:?}");
+        assert!(
+            sizes.windows(2).all(|w| w[0] < w[1]),
+            "上限档应递增: {sizes:?}"
+        );
 
         // 限速的「不限」排第一（0 表示不限，语义上是最大），其余递增。
         let rates: Vec<u64> = RATE_PRESETS[1..].iter().map(|(_, v)| *v).collect();
-        assert!(rates.windows(2).all(|w| w[0] < w[1]), "限速档应递增: {rates:?}");
+        assert!(
+            rates.windows(2).all(|w| w[0] < w[1]),
+            "限速档应递增: {rates:?}"
+        );
     }
 }

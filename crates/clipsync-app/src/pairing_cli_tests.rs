@@ -135,7 +135,10 @@ fn tolerates_messy_input() {
 fn rejects_malformed_input() {
     assert!(parse_pairing_input("").is_none());
     assert!(parse_pairing_input("1234567").is_none());
-    assert!(parse_pairing_input("1234@").is_none(), "@ 后面空着不算有效地址");
+    assert!(
+        parse_pairing_input("1234@").is_none(),
+        "@ 后面空着不算有效地址"
+    );
     // 字符集只有数字：码要靠人念、人敲，字母大小写与 O/0、l/1 之类的混淆
     // 在电话里说不清楚。
     assert!(parse_pairing_input("12A4").is_none());
@@ -150,8 +153,8 @@ fn manual_code_with_address_round_trips() {
     let code = PairingCode::from_entropy(b"\x01\x02\x03\x04");
     for host in ["192.168.1.5", "[fd7a:115c:a1e0::1]", "100.88.88.22"] {
         let s = format!("{code}@{host}");
-        let (back, parsed) = parse_pairing_input(&s)
-            .unwrap_or_else(|| panic!("手动写法应能解析: {s}"));
+        let (back, parsed) =
+            parse_pairing_input(&s).unwrap_or_else(|| panic!("手动写法应能解析: {s}"));
         assert_eq!(back.as_str(), code.as_str());
         assert_eq!(parsed.as_deref(), Some(host));
     }
@@ -216,7 +219,9 @@ fn address_block_lists_every_ipv4_lan_first() {
     }
     // TUN 模式代理的假 IP 段永不可路由，列出来只会让人挑错。
     assert!(
-        !lines.iter().any(|l| l.starts_with("198.18.") || l.starts_with("198.19.")),
+        !lines
+            .iter()
+            .any(|l| l.starts_with("198.18.") || l.starts_with("198.19.")),
         "RFC 2544 基准测试段不该出现：{lines:?}"
     );
 
@@ -249,8 +254,12 @@ fn accept_until_gives_up_promptly_when_cancelled() {
     });
 
     let started = Instant::now();
-    let got = accept_until(&listener, Instant::now() + Duration::from_secs(600), &cancel)
-        .expect("取消不是错误");
+    let got = accept_until(
+        &listener,
+        Instant::now() + Duration::from_secs(600),
+        &cancel,
+    )
+    .expect("取消不是错误");
     assert!(got.is_none(), "被取消时不该报告有连接");
     assert!(
         started.elapsed() < Duration::from_secs(3),

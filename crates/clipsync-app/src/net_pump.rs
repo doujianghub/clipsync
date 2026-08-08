@@ -62,8 +62,7 @@ pub(super) fn pump(
     // 发送限速器：只作用于文件内容，不影响文本/图片同步。
     // 用户可能在托盘里改限速，故记住已应用的设置版本，变化时重建限速器。
     let mut applied_settings = ctx.settings.version();
-    let mut limiter =
-        crate::ratelimit::RateLimiter::new(upload_limit_of(&ctx.settings.snapshot()));
+    let mut limiter = crate::ratelimit::RateLimiter::new(upload_limit_of(&ctx.settings.snapshot()));
     if limiter.is_limited() {
         debug!("文件发送限速已启用");
     }
@@ -275,7 +274,8 @@ fn introduce_peers(
         return Ok(());
     }
     debug!("向 {} 引荐 {} 台设备", peer.name, peers.len());
-    conn.send(&SyncMessage::Peers { peers }).context("引荐设备失败")
+    conn.send(&SyncMessage::Peers { peers })
+        .context("引荐设备失败")
 }
 
 /// 收下对端引荐的设备：登记、落盘、记住地址。

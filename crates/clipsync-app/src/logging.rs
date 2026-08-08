@@ -48,7 +48,14 @@ impl LogControl {
         self.handle
             .reload(build_filter(verbose))
             .context("切换日志级别失败")?;
-        tracing::info!("日志级别已切换为 {}", if verbose { "详细(debug)" } else { "常规(info)" });
+        tracing::info!(
+            "日志级别已切换为 {}",
+            if verbose {
+                "详细(debug)"
+            } else {
+                "常规(info)"
+            }
+        );
         Ok(())
     }
 }
@@ -168,7 +175,11 @@ impl RollingInner {
             // 远好过从此一条都记不下来。
             return;
         }
-        if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&cur) {
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&cur)
+        {
             self.file = f;
             self.written = 0;
         }

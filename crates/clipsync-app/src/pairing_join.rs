@@ -139,10 +139,7 @@ fn obtain_code() -> Option<(clipsync_net::pairing::PairingCode, Option<String>)>
 }
 
 /// 配对收尾：登记 + 告知结果。各路径共用。
-fn finish_join(
-    result: Result<clipsync_net::pairing::PairingRecord>,
-    pairing: &PairingDeps,
-) {
+fn finish_join(result: Result<clipsync_net::pairing::PairingRecord>, pairing: &PairingDeps) {
     match result {
         Ok(record) => {
             pairing.register(&record);

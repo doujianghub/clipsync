@@ -153,16 +153,6 @@ mod tests {
         r#"& `whoami` $env:USERNAME %USERNAME% 结束"#
     );
 
-    /// 手动目视验证：弹出配对码输入框。
-    ///
-    /// 跑法：`cargo test -p clipsync-app --bin clipsync -- --ignored manual_prompt`
-    ///
-    /// 判据：
-    ///   1. 窗口出现，标题为「ClipSync 配对」，提示文字完整可读；
-    ///   2. **Windows 上重点看字体**——正文应是 Segoe UI、边缘锐利，不该有
-    ///      拉伸导致的毛边（那说明 DPI 声明没生效）；输入框应是等宽字体；
-    ///   3. 输入内容点确定 → 打印 `RESULT=Some("...")`，值与所输一致；
-    ///   4. 点取消 / 按 Esc → 打印 `RESULT=None`，且不报错。
     /// 手动目视验证：弹出设置项的选择列表。
     ///
     /// 跑法：`cargo test -p clipsync-app --bin clipsync -- --ignored manual_choose`
@@ -183,6 +173,16 @@ mod tests {
         println!("RESULT={r:?}");
     }
 
+    /// 手动目视验证：弹出配对码输入框。
+    ///
+    /// 跑法：`cargo test -p clipsync-app --bin clipsync -- --ignored manual_prompt`
+    ///
+    /// 判据：
+    ///   1. 窗口出现，标题为「ClipSync 配对」，提示文字完整可读；
+    ///   2. **Windows 上重点看字体**——正文应是 Segoe UI、边缘锐利，不该有
+    ///      拉伸导致的毛边（那说明 DPI 声明没生效）；输入框应是等宽字体；
+    ///   3. 输入内容点确定 → 打印 `RESULT=Some("...")`，值与所输一致；
+    ///   4. 点取消 / 按 Esc → 打印 `RESULT=None`，且不报错。
     #[test]
     #[ignore = "会弹窗并阻塞，需人工/脚本关闭"]
     fn manual_prompt_dialog() {

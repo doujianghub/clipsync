@@ -105,7 +105,10 @@ fn eviction_respects_limit_and_pins() {
     c.evict_to_limit(&[1]);
 
     assert!(c.is_complete(1, 8), "被钉住的内容不得淘汰");
-    let remaining = [1u64, 2, 3].iter().filter(|id| c.is_complete(**id, 8)).count();
+    let remaining = [1u64, 2, 3]
+        .iter()
+        .filter(|id| c.is_complete(**id, 8))
+        .count();
     assert!(remaining < 3, "超出上限后应有内容被淘汰");
 }
 

@@ -55,7 +55,7 @@ fn candidates_are_raced_not_tried_one_by_one() {
     let got = race_by_priority(&list, fake_connect);
     let took = started.elapsed();
 
-    assert_eq!(got.map(|(i, v)| (i, v)), Some((0, 47682)));
+    assert_eq!(got, Some((0, 47682)));
     assert!(
         took < Duration::from_millis(2600),
         "应与最慢的那一个同量级（2 秒），而不是逐个累加，实际 {took:?}"
@@ -74,7 +74,7 @@ fn a_fast_top_priority_hit_does_not_wait_for_the_stragglers() {
     let got = race_by_priority(&list, fake_connect);
     let took = started.elapsed();
 
-    assert_eq!(got.map(|(i, v)| (i, v)), Some((0, 47683)));
+    assert_eq!(got, Some((0, 47683)));
     assert!(
         took < Duration::from_millis(800),
         "最优候选已定就该马上走，实际等了 {took:?}"
@@ -90,7 +90,7 @@ fn priority_beats_speed_within_the_grace_window() {
     // 下标 0 慢（150ms）但优先级最高，下标 1 快（50ms）。差距在 300ms 以内。
     let list = addrs(&[47685, 47683]);
     let got = race_by_priority(&list, fake_connect);
-    assert_eq!(got.map(|(i, v)| (i, v)), Some((0, 47685)), "该等最优的那条");
+    assert_eq!(got, Some((0, 47685)), "该等最优的那条");
 }
 
 /// 但不能无限等下去：高优先级迟迟无果时，用手里已经连上的那条。
@@ -108,7 +108,7 @@ fn a_hopeless_high_priority_address_does_not_hold_the_connection_hostage() {
     let got = race_by_priority(&list, fake_connect);
     let took = started.elapsed();
 
-    assert_eq!(got.map(|(i, v)| (i, v)), Some((2, 47683)));
+    assert_eq!(got, Some((2, 47683)));
     assert!(
         took < Duration::from_millis(900),
         "应在宽限期后就走，而不是陪着高优先级等满超时；实际 {took:?}"

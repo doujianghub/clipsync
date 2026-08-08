@@ -58,7 +58,10 @@ pub fn parse_byte_size(input: &str) -> Result<u64> {
 pub fn parse_rate(input: &str) -> Result<u64> {
     let s = input.trim();
     let lowered = s.to_ascii_lowercase();
-    if matches!(lowered.as_str(), "0" | "不限速" | "无限制" | "unlimited" | "none") {
+    if matches!(
+        lowered.as_str(),
+        "0" | "不限速" | "无限制" | "unlimited" | "none"
+    ) {
         return Ok(0);
     }
     // 去掉速率后缀再按大小解析——`/s`、`ps`、`每秒` 都只是修饰，不影响数值。
@@ -96,7 +99,10 @@ mod tests {
     fn tolerates_messy_user_input() {
         assert_eq!(parse_byte_size(" 500 mb ").unwrap(), 500_000_000);
         assert_eq!(parse_byte_size("1.5GiB").unwrap(), 1_610_612_736);
-        assert_eq!(parse_byte_size("100MiB").unwrap(), parse_byte_size("100mib").unwrap());
+        assert_eq!(
+            parse_byte_size("100MiB").unwrap(),
+            parse_byte_size("100mib").unwrap()
+        );
     }
 
     #[test]

@@ -107,10 +107,7 @@ mod tests {
         let cands = local_candidates(47684);
         // 广播候选中不应包含回环或链路本地地址。
         for sa in &cands {
-            assert!(
-                is_advertisable(sa.ip()),
-                "不应广播不可用地址: {sa}"
-            );
+            assert!(is_advertisable(sa.ip()), "不应广播不可用地址: {sa}");
             assert_eq!(sa.port(), 47684);
         }
     }

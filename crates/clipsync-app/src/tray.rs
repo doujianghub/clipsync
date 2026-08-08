@@ -16,18 +16,19 @@ mod tray_platform;
 mod tray_status;
 
 pub use tray_icon_draw::{make_icon, IconState};
-pub use tray_status::{PendingFetchInfo, TrayStatus, TransferProgress};
 pub(crate) use tray_status::ellipsize_middle;
+pub use tray_status::{PendingFetchInfo, TransferProgress, TrayStatus};
 
 use tray_platform::{init_platform_app, pump_platform_events};
 
 #[path = "tray_menu.rs"]
 mod tray_menu;
 
+use clipsync_core::t;
 pub(crate) use tray_menu::human_bytes;
 use tray_menu::{
-    auto_fetch_label, fetch_label, pairing_label, port_label, rate_label, rebuild_peer_menu,
-    LEAVE_GROUP_ID,
+    auto_fetch_label, fetch_label, language_label, pairing_label, port_label, rate_label,
+    rebuild_peer_menu, LEAVE_GROUP_ID,
 };
 
 // 不再是 Copy：`RemovePeer` 携带 device id。
@@ -60,6 +61,8 @@ pub enum TrayAction {
     RemovePeer(String),
     /// 本机退出设备组：清空全部配对，并告知其它成员。
     LeaveGroup,
+    /// 弹选择框改界面语言。
+    PromptLanguage,
     /// 打开日志所在文件夹。
     OpenLogDir,
     /// 切换详细日志（info ↔ debug）。
@@ -144,19 +147,29 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
     // 没有会话时**保留但禁用**，不隐藏：菜单少一行会让下面的项跟着上移，
     // 点惯了位置的人会点错；灰着也一眼能看出"现在没码可换"。
     let new_code_item = MenuItem::new(
-        crate::pairing_ui::NEW_CODE_LABEL,
+        crate::pairing_ui::new_code_label(),
         live_code.is_some(),
         None,
     );
-    let join_item = MenuItem::new("输入配对码…", true, None);
-    let peers_menu = Submenu::new("已配对设备", true);
+    let join_item = MenuItem::new(t!("输入配对码…", "Enter pairing code…"), true, None);
+    let peers_menu = Submenu::new(t!("已配对设备", "Paired devices"), true);
     let mut peer_items = rebuild_peer_menu(&peers_menu, &(callbacks.current_peers)())?;
 
     // 开关收发两侧都生效，所以可以就叫"同步图片"（见 engine 的 kind_disabled）。
-    let images_item = CheckMenuItem::new("同步图片", true, s0.sync_images, None);
-    let files_item = CheckMenuItem::new("同步文件", true, s0.sync_files, None);
-    let pause_item = CheckMenuItem::new("暂停同步", true, status.is_paused(), None);
-    let autostart_item = CheckMenuItem::new("开机自启", true, crate::autostart::is_enabled(), None);
+    let images_item = CheckMenuItem::new(t!("同步图片", "Sync images"), true, s0.sync_images, None);
+    let files_item = CheckMenuItem::new(t!("同步文件", "Sync files"), true, s0.sync_files, None);
+    let pause_item = CheckMenuItem::new(
+        t!("暂停同步", "Pause syncing"),
+        true,
+        status.is_paused(),
+        None,
+    );
+    let autostart_item = CheckMenuItem::new(
+        t!("开机自启", "Launch at login"),
+        true,
+        crate::autostart::is_enabled(),
+        None,
+    );
 
     // —— 二级：少数人偶尔需要 ——
     //
@@ -169,11 +182,22 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
     let max_item = MenuItem::new(auto_fetch_label(s0.auto_fetch_bytes), true, None);
     let rate_item = MenuItem::new(rate_label(s0.upload_limit), true, None);
     let port_item = MenuItem::new(port_label(s0.listen_port), true, None);
-    let compress_item = CheckMenuItem::new("传输前压缩", true, s0.compress, None);
-    let verbose_item = CheckMenuItem::new("详细日志", true, s0.verbose_log, None);
-    let log_dir_item = MenuItem::new("打开日志文件夹…", true, None);
+    let compress_item = CheckMenuItem::new(
+        t!("传输前压缩", "Compress transfers"),
+        true,
+        s0.compress,
+        None,
+    );
+    let verbose_item = CheckMenuItem::new(
+        t!("详细日志", "Verbose logging"),
+        true,
+        s0.verbose_log,
+        None,
+    );
+    let log_dir_item = MenuItem::new(t!("打开日志文件夹…", "Open log folder…"), true, None);
 
-    let advanced_menu = Submenu::new("高级设置", true);
+    let language_item = MenuItem::new(language_label(), true, None);
+    let advanced_menu = Submenu::new(t!("高级设置", "Advanced"), true);
     advanced_menu
         .append_items(&[
             &max_item,
@@ -183,17 +207,19 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
             &PredefinedMenuItem::separator(),
             &verbose_item,
             &log_dir_item,
+            &PredefinedMenuItem::separator(),
+            &language_item,
         ])
         .map_err(|e| anyhow::anyhow!("构建高级设置子菜单失败: {e}"))?;
 
-    let quit_item = MenuItem::new("退出", true, None);
+    let quit_item = MenuItem::new(t!("退出", "Quit"), true, None);
 
     // 「取回」是**待办通知**，不是常驻入口：没有待取项时整行不存在。
     //
     // 与「换个配对码」不同——那一项是配对入口的近邻，藏起来会让人找不着，
     // 所以留着灰掉。这一项则相反：它出现本身就是信息，常驻一行灰字既没内容
     // 又占地方。位置固定在首行下方，一有东西就在最显眼的地方。
-    let fetch_item = MenuItem::new("取回", true, None);
+    let fetch_item = MenuItem::new(t!("取回", "Fetch"), true, None);
     let mut fetch_shown = false;
     /// `fetch_item` 插入的位置：状态行 + 分隔符之后。
     const FETCH_SLOT: usize = 2;
@@ -223,11 +249,36 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(status.tooltip())
-        .with_icon(make_icon(IconState::of(&status), false, status.pending().is_some())?)
+        .with_icon(make_icon(
+            IconState::of(&status),
+            false,
+            status.pending().is_some(),
+        )?)
         .build()
         .map_err(|e| anyhow::anyhow!("创建托盘图标失败: {e}"))?;
 
+    // 语言一变，所有**固定**文案都要跟着换。动态项（状态行、配对码倒计时、
+    // 带当前值的可调项、设备列表）由下面各自的分支负责，这里只管固定的那些。
+    //
+    // muda 的 set_text 取 &self，所以这个闭包与循环体可以同时不可变借用菜单项。
+    let relabel_static = || {
+        join_item.set_text(t!("输入配对码…", "Enter pairing code…"));
+        peers_menu.set_text(t!("已配对设备", "Paired devices"));
+        images_item.set_text(t!("同步图片", "Sync images"));
+        files_item.set_text(t!("同步文件", "Sync files"));
+        pause_item.set_text(t!("暂停同步", "Pause syncing"));
+        autostart_item.set_text(t!("开机自启", "Launch at login"));
+        compress_item.set_text(t!("传输前压缩", "Compress transfers"));
+        verbose_item.set_text(t!("详细日志", "Verbose logging"));
+        log_dir_item.set_text(t!("打开日志文件夹…", "Open log folder…"));
+        advanced_menu.set_text(t!("高级设置", "Advanced"));
+        quit_item.set_text(t!("退出", "Quit"));
+        language_item.set_text(language_label());
+        new_code_item.set_text(crate::pairing_ui::new_code_label());
+    };
+
     let menu_rx = MenuEvent::receiver();
+    let mut last_lang = clipsync_core::i18n::current();
     let mut last_summary = status.summary();
 
     // 当前画着的图标：状态 + 脉冲相位。两者任一变化才重画——托盘循环每
@@ -275,6 +326,8 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
                 Some(TrayAction::ToggleVerboseLog)
             } else if event.id == log_dir_item.id() {
                 Some(TrayAction::OpenLogDir)
+            } else if event.id == language_item.id() {
+                Some(TrayAction::PromptLanguage)
             } else {
                 peer_items
                     .iter()
@@ -308,14 +361,16 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
                 Some(p) => {
                     fetch_item.set_text(fetch_label(&p.first_name, p.count, p.total));
                     if !fetch_shown {
-                        menu_handle.insert(&fetch_item, FETCH_SLOT)
+                        menu_handle
+                            .insert(&fetch_item, FETCH_SLOT)
                             .map_err(|e| anyhow::anyhow!("插入取回菜单项失败: {e}"))?;
                         fetch_shown = true;
                     }
                 }
                 None => {
                     if fetch_shown {
-                        menu_handle.remove(&fetch_item)
+                        menu_handle
+                            .remove(&fetch_item)
                             .map_err(|e| anyhow::anyhow!("移除取回菜单项失败: {e}"))?;
                         fetch_shown = false;
                     }
@@ -334,6 +389,18 @@ pub fn run(status: TrayStatus, mut callbacks: TrayCallbacks) -> anyhow::Result<(
             // 会话起止时才需要动 enabled，但一次布尔赋值比判断它变没变还便宜。
             new_code_item.set_enabled(live_now.is_some());
             live_code = live_now;
+        }
+
+        // 语言变了：换掉固定文案，并把几个"只在变化时才重算"的缓存作废，
+        // 逼下面的分支把动态文案也重新生成一遍。不这么做的话，状态行和可调项
+        // 会保持旧语言直到它们各自的值恰好发生变化——那可能是几个小时以后。
+        let lang_now = clipsync_core::i18n::current();
+        if lang_now != last_lang {
+            last_lang = lang_now;
+            relabel_static();
+            last_summary.clear();
+            last_settings_version = last_settings_version.wrapping_add(1);
+            last_connected.clear();
         }
 
         // 设置变了就重渲染。改动多半来自后台线程里的弹窗，点击那一刻还没发生。

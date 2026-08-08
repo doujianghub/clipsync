@@ -15,9 +15,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use clipsync_clip::{ArboardClipboard, Clipboard};
-use clipsync_core::{
-    ClipContent, DeviceId, RemoteDecision, SkipReason, SyncEngine, SyncMessage,
-};
+use clipsync_core::{ClipContent, DeviceId, RemoteDecision, SkipReason, SyncEngine, SyncMessage};
 use tracing::{debug, info, warn};
 
 #[path = "hub_incoming.rs"]
@@ -105,10 +103,7 @@ pub struct HubDeps {
 }
 
 /// 启动中枢线程，返回投递句柄。
-pub fn start_hub(
-    engine: SyncEngine,
-    deps: HubDeps,
-) -> (HubHandle, std::thread::JoinHandle<()>) {
+pub fn start_hub(engine: SyncEngine, deps: HubDeps) -> (HubHandle, std::thread::JoinHandle<()>) {
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = std::thread::Builder::new()
         .name("sync-hub".into())
@@ -154,7 +149,8 @@ fn hub_loop(engine: SyncEngine, deps: HubDeps, rx: Receiver<HubEvent>) {
         // 任何内容被处理前设置一定已是最新；空闲时也没有内容需要它生效。
         let sv = st.deps.settings.version();
         if sv != applied_settings {
-            st.engine.set_limits(st.deps.settings.snapshot().to_limits());
+            st.engine
+                .set_limits(st.deps.settings.snapshot().to_limits());
             applied_settings = sv;
         }
 
@@ -247,7 +243,9 @@ impl HubState {
                 data,
                 compressed,
                 plain_len,
-            } => self.on_file_chunk(&from, generation, file_id, offset, &data, compressed, plain_len),
+            } => self.on_file_chunk(
+                &from, generation, file_id, offset, &data, compressed, plain_len,
+            ),
 
             SyncMessage::FileDone {
                 generation,
@@ -336,7 +334,12 @@ impl HubState {
                     warn!("写入本地剪贴板失败: {e:#}");
                     self.engine.abandon_apply(content_hash);
                 } else {
-                    info!("已应用来自 {} 的 [{}] {} 字节", from, kind_label(content), content.byte_size());
+                    info!(
+                        "已应用来自 {} 的 [{}] {} 字节",
+                        from,
+                        kind_label(content),
+                        content.byte_size()
+                    );
                 }
             }
             Err(e) => {
@@ -372,4 +375,3 @@ pub(super) fn notify(message: &str) {
     let message = message.to_string();
     std::thread::spawn(move || crate::dialog::show_info("ClipSync", &message));
 }
-

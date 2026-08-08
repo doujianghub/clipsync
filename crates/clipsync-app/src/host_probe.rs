@@ -180,7 +180,7 @@ fn subnet_candidates(port: u16) -> Vec<SocketAddr> {
             continue;
         }
         let prefix = m.count_ones();
-        if prefix < MIN_PREFIX_V4 || prefix > 30 {
+        if !(MIN_PREFIX_V4..=30).contains(&prefix) {
             continue;
         }
 
@@ -287,7 +287,7 @@ fn run_tool(bins: &[&str], args: &[&str]) -> Option<String> {
             Ok(Ok(o)) if o.status.success() => {
                 return Some(String::from_utf8_lossy(&o.stdout).into_owned())
             }
-            Ok(Ok(_)) => continue, // 工具在，但报错（多半是没登录）
+            Ok(Ok(_)) => continue,  // 工具在，但报错（多半是没登录）
             Ok(Err(_)) => continue, // 这个路径没有可执行文件，换下一个
             Err(_) => {
                 debug!("调用 {bin} 超时，跳过");

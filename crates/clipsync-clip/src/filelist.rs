@@ -111,8 +111,8 @@ pub fn meta_for_path(path: &Path) -> Result<FileMeta> {
     // 用 `context` 而不是 `anyhow!("...{e}")`：后者把 `io::Error` 格式化成字符串
     // 就丢了类型，调用方再也分不出"权限被拒"和"文件不存在"——而这两者对用户
     // 的意义完全不同，一个要去点系统设置，一个只是文件没了。
-    let md = std::fs::metadata(path)
-        .with_context(|| format!("读取文件信息失败 {}", path.display()))?;
+    let md =
+        std::fs::metadata(path).with_context(|| format!("读取文件信息失败 {}", path.display()))?;
 
     // **stat 过了不等于读得了。**
     //
@@ -129,10 +129,7 @@ pub fn meta_for_path(path: &Path) -> Result<FileMeta> {
     // 代价是每个文件多一次 open/close（几微秒），换来的是在**复制的那一刻**
     // 就能把话说清楚。只对普通文件做：对 FIFO 之类 open 会阻塞。
     if md.is_file() {
-        drop(
-            std::fs::File::open(path)
-                .with_context(|| format!("打不开文件 {}", path.display()))?,
-        );
+        drop(std::fs::File::open(path).with_context(|| format!("打不开文件 {}", path.display()))?);
     }
     let name = path
         .file_name()
@@ -165,7 +162,9 @@ mod platform {
         CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
         OpenClipboard, SetClipboardData,
     };
-    use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
     use windows_sys::Win32::UI::Shell::DragQueryFileW;
 
     pub const SUPPORTED: bool = true;
@@ -251,8 +250,7 @@ mod platform {
                 continue;
             }
             let mut buf = vec![0u16; len as usize + 1];
-            let written =
-                unsafe { DragQueryFileW(handle, i, buf.as_mut_ptr(), buf.len() as u32) };
+            let written = unsafe { DragQueryFileW(handle, i, buf.as_mut_ptr(), buf.len() as u32) };
             if written == 0 {
                 continue;
             }
@@ -392,7 +390,9 @@ mod platform {
                 // 不同的 id（id 由文件名派生），导致跨平台缓存命中与断点续传
                 // 对含重音字符的文件静默失效——不报错，只是每次都重传。
                 // 这里归一化回 NFC，与磁盘和 Windows 侧保持一致。
-                paths.push(PathBuf::from(p.precomposedStringWithCanonicalMapping().to_string()));
+                paths.push(PathBuf::from(
+                    p.precomposedStringWithCanonicalMapping().to_string(),
+                ));
             }
         }
 

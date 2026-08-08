@@ -2,6 +2,7 @@
 //!
 //! 中枢更新、托盘读取，两边通过这个共享句柄通信。
 
+use clipsync_core::{t, tf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -122,6 +123,15 @@ pub struct TrayStatus {
     last_transfer: Arc<AtomicU64>,
 }
 
+/// 传输方向的说法。收发两处共用，免得同一个词在两个地方译得不一样。
+pub(crate) fn transfer_verb(sending: bool) -> &'static str {
+    if sending {
+        t!("发送", "Sending")
+    } else {
+        t!("接收", "Receiving")
+    }
+}
+
 impl TrayStatus {
     /// 台数由外部（`KnownPeers`）持有的正路。
     pub fn tracking(paired: Arc<AtomicUsize>) -> Self {
@@ -224,7 +234,6 @@ impl TrayStatus {
 }
 
 impl TrayStatus {
-
     /// 眼下是否正在传文件（据此让托盘图标脉冲、摘要报进度）。
     pub fn is_transferring(&self) -> bool {
         transfer_is_recent(
@@ -274,10 +283,14 @@ impl TrayStatus {
     /// 一句话状态描述，用于托盘提示文本。
     pub fn summary(&self) -> String {
         if self.is_hub_dead() {
-            return "ClipSync — 同步已停止（请重启程序）".to_string();
+            return t!(
+                "ClipSync — 同步已停止（请重启程序）",
+                "ClipSync — sync stopped (please restart)"
+            )
+            .to_string();
         }
         if self.is_paused() {
-            return "ClipSync — 已暂停".to_string();
+            return t!("ClipSync — 已暂停", "ClipSync — paused").to_string();
         }
         // 传输中优先报进度：这时候用户最想知道的是"到哪了"，不是连了几台。
         if let Some(p) = self.progress_text() {
@@ -285,11 +298,20 @@ impl TrayStatus {
         }
         let s = self.snapshot();
         if s.paired == 0 {
-            "ClipSync — 尚未配对设备".to_string()
+            t!("ClipSync — 尚未配对设备", "ClipSync — no paired devices").to_string()
         } else if s.connected == 0 {
-            format!("ClipSync — 未连接（已配对 {} 台）", s.paired)
+            tf!(
+                "ClipSync — 未连接（已配对 {} 台）",
+                "ClipSync — offline ({} paired)",
+                s.paired
+            )
         } else {
-            format!("ClipSync — 已连接 {} / {} 台", s.connected, s.paired)
+            tf!(
+                "ClipSync — 已连接 {} / {} 台",
+                "ClipSync — {} / {} connected",
+                s.connected,
+                s.paired
+            )
         }
     }
 }
@@ -319,8 +341,9 @@ impl TrayStatus {
             None => {
                 let mut s = self.summary();
                 if let Some(p) = self.pending() {
-                    s.push_str(&format!(
+                    s.push_str(&tf!(
                         "\n{} 项待取回（{}）",
+                        "\n{} item(s) to fetch ({})",
                         p.count,
                         crate::tray::human_bytes(p.total)
                     ));
@@ -338,12 +361,12 @@ impl TrayStatus {
         let g = self.progress.lock().unwrap();
         let st = g.as_ref()?;
 
-        let dir = if st.p.sending { "发送" } else { "接收" };
-        let pct = if st.p.total > 0 {
-            st.p.done.saturating_mul(100) / st.p.total
-        } else {
-            0
-        };
+        let dir = transfer_verb(st.p.sending);
+        let pct =
+            st.p.done
+                .saturating_mul(100)
+                .checked_div(st.p.total)
+                .unwrap_or(0);
         let name = ellipsize_middle(&st.p.name);
 
         let mut second = bytes_pair(st.p.done, st.p.total);
