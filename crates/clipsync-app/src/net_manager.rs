@@ -27,9 +27,9 @@ use clipsync_net::transport::NoiseConnection;
 use tracing::{debug, info, warn};
 
 use crate::addrbook::AddrBook;
-use crate::known_peers::{KnownPeer, KnownPeers};
 use crate::filetransfer::OutgoingFiles;
 use crate::hub::{HubEvent, HubHandle};
+use crate::known_peers::{KnownPeer, KnownPeers};
 
 #[path = "net_pump.rs"]
 mod net_pump;

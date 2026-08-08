@@ -45,9 +45,7 @@ pub(crate) fn start_discovery(
         book.add_addrs(&found.device, found.extra_addrs, AddrSource::Beacon);
     }) {
         Ok(_) => {}
-        Err(e) => warn!(
-            "启动信标监听失败（同机多实例时属正常，将依赖配对/通告地址）: {e:#}"
-        ),
+        Err(e) => warn!("启动信标监听失败（同机多实例时属正常，将依赖配对/通告地址）: {e:#}"),
     }
 }
 
@@ -136,12 +134,11 @@ fn warn_once_about_denied(denied: &[clipsync_clip::DeniedFile]) {
 }
 
 /// 这次剪贴板内容是否为本程序自己落地的接收文件。
-pub(crate) fn is_our_received_files(read: &clipsync_clip::ClipRead, received_dir: &std::path::Path) -> bool {
-    !read.file_paths.is_empty()
-        && read
-            .file_paths
-            .iter()
-            .all(|p| p.starts_with(received_dir))
+pub(crate) fn is_our_received_files(
+    read: &clipsync_clip::ClipRead,
+    received_dir: &std::path::Path,
+) -> bool {
+    !read.file_paths.is_empty() && read.file_paths.iter().all(|p| p.starts_with(received_dir))
 }
 
 #[cfg(test)]

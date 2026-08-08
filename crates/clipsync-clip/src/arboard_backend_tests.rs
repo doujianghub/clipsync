@@ -146,7 +146,10 @@ fn same_named_files_keep_meta_and_path_aligned() {
     );
     assert_eq!(metas.len(), 1, "只有一个文件仍存在");
     assert_eq!(read.file_paths[0], pb, "保留的应是仍存在的那条路径");
-    assert_eq!(metas[0].size, 2, "元数据应描述 b/x.txt（2 字节）而非已删除的 a/x.txt");
+    assert_eq!(
+        metas[0].size, 2,
+        "元数据应描述 b/x.txt（2 字节）而非已删除的 a/x.txt"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -159,7 +162,9 @@ fn same_named_files_keep_meta_and_path_aligned() {
 /// 表现为"复制了但对端没更新"。
 #[test]
 fn windows_contention_errors_are_recognised() {
-    let unknown = |d: &str| arboard::Error::Unknown { description: d.into() };
+    let unknown = |d: &str| arboard::Error::Unknown {
+        description: d.into(),
+    };
 
     assert!(is_occupied(&arboard::Error::ClipboardOccupied));
     assert!(is_occupied(&unknown(
@@ -171,7 +176,9 @@ fn windows_contention_errors_are_recognised() {
 /// 别把无关错误也当成占用——那会让真正的失败白白拖满整个重试预算。
 #[test]
 fn unrelated_errors_are_not_treated_as_contention() {
-    let unknown = |d: &str| arboard::Error::Unknown { description: d.into() };
+    let unknown = |d: &str| arboard::Error::Unknown {
+        description: d.into(),
+    };
 
     assert!(!is_occupied(&arboard::Error::ContentNotAvailable));
     assert!(!is_occupied(&arboard::Error::ConversionFailure));

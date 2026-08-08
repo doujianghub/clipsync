@@ -6,7 +6,6 @@
 use anyhow::{Context, Result};
 use std::process::Command;
 
-
 /// 脚本体不含任何用户内容：标题与正文经 `argv` 传入，天然免疫注入。
 const SCRIPT: &str = r#"on run argv
   display dialog (item 2 of argv) with title (item 1 of argv) buttons {"好"} default button 1 with icon note
@@ -62,7 +61,9 @@ pub fn choose(title: &str, body: &str, items: &[String]) -> Result<Option<usize>
     let mut args: Vec<&str> = vec![title, body];
     args.extend(items.iter().map(|s| s.as_str()));
     let picked = run_osascript_args(CHOOSE_SCRIPT, &args)?;
-    let Some(picked) = picked else { return Ok(None) };
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
     let picked = picked.trim();
     if picked.is_empty() {
         return Ok(None); // 用户取消
@@ -179,9 +180,6 @@ end run"#;
             out.contains("do shell script"),
             "载荷应原样回显（说明是数据），实际: {out:?}"
         );
-        assert!(
-            !marker.exists(),
-            "载荷被当作脚本执行了——注入防护失效"
-        );
+        assert!(!marker.exists(), "载荷被当作脚本执行了——注入防护失效");
     }
 }

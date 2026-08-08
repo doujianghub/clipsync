@@ -210,7 +210,11 @@ fn join_multicast_on_all_ifaces(socket: &UdpSocket) -> usize {
             }
         }
     }
-    if joined == 0 && socket.join_multicast_v4(&BEACON_GROUP, &Ipv4Addr::UNSPECIFIED).is_ok() {
+    if joined == 0
+        && socket
+            .join_multicast_v4(&BEACON_GROUP, &Ipv4Addr::UNSPECIFIED)
+            .is_ok()
+    {
         joined = 1;
     }
     joined
@@ -320,10 +324,7 @@ impl Drop for PairingAnnouncer {
 ///
 /// 宣告在返回的 [`PairingAnnouncer`] 被丢弃时停止，因此调用方**必须持有**它
 /// 直到配对结束——用 `let _ = ...` 接收会立即停止宣告。
-pub fn spawn_pairing_announcer(
-    device_name: String,
-    pairing_port: u16,
-) -> Result<PairingAnnouncer> {
+pub fn spawn_pairing_announcer(device_name: String, pairing_port: u16) -> Result<PairingAnnouncer> {
     let target = SocketAddr::new(IpAddr::V4(BEACON_GROUP), PAIRING_BEACON_PORT);
     let beacon = PairingBeacon {
         magic: PAIRING_MAGIC,
@@ -439,7 +440,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn beacon_roundtrips_through_postcard() {        let dev = DeviceId::from_public_key(b"test-device");
+    fn beacon_roundtrips_through_postcard() {
+        let dev = DeviceId::from_public_key(b"test-device");
         let b = Beacon::new(
             &dev,
             47684,
@@ -496,7 +498,10 @@ mod loopback_smoke {
     #[test]
     #[ignore = "需要外部进程在宣告"]
     fn manual_discover_only() {
-        println!("发现结果：{:?}", discover_pairing_hosts(Duration::from_secs(5)));
+        println!(
+            "发现结果：{:?}",
+            discover_pairing_hosts(Duration::from_secs(5))
+        );
     }
 
     /// 同机自发自收：宣告线程发出的配对信标，发现函数必须收得到，

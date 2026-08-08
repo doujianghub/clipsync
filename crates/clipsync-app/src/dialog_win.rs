@@ -18,10 +18,10 @@
 
 use anyhow::Result;
 
-#[path = "dialog_win_task.rs"]
-mod task;
 #[path = "dialog_win_input.rs"]
 mod input;
+#[path = "dialog_win_task.rs"]
+mod task;
 
 pub fn show(title: &str, body: &str) -> Result<()> {
     task::show(title, body)

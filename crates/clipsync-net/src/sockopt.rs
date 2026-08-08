@@ -81,7 +81,13 @@ fn background_bulk(stream: &TcpStream) {
 /// # Safety
 /// `fd` 必须是一个有效的套接字描述符。
 #[cfg(target_os = "macos")]
-unsafe fn setopt(fd: libc::c_int, level: libc::c_int, name: libc::c_int, value: libc::c_int, what: &str) {
+unsafe fn setopt(
+    fd: libc::c_int,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+    what: &str,
+) {
     let rc = libc::setsockopt(
         fd,
         level,
@@ -90,7 +96,10 @@ unsafe fn setopt(fd: libc::c_int, level: libc::c_int, name: libc::c_int, value: 
         std::mem::size_of::<libc::c_int>() as libc::socklen_t,
     );
     if rc != 0 {
-        tracing::debug!("设置 {what} 失败（不影响功能）: {}", std::io::Error::last_os_error());
+        tracing::debug!(
+            "设置 {what} 失败（不影响功能）: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -167,12 +176,21 @@ mod tests {
                     &mut len,
                 )
             };
-            assert_eq!(rc, 0, "getsockopt 失败: {}", std::io::Error::last_os_error());
+            assert_eq!(
+                rc,
+                0,
+                "getsockopt 失败: {}",
+                std::io::Error::last_os_error()
+            );
             v
         };
 
         assert_eq!(read_back(libc::SOL_SOCKET, 0x1116), 1, "服务类型应为 BK(1)");
-        assert_eq!(read_back(libc::IPPROTO_TCP, 0x201), 128 * 1024, "未发送水位应为 128 KiB");
+        assert_eq!(
+            read_back(libc::IPPROTO_TCP, 0x201),
+            128 * 1024,
+            "未发送水位应为 128 KiB"
+        );
     }
 
     /// Nagle 必须真的关掉——这一项在所有平台上都该成功，值得断言。

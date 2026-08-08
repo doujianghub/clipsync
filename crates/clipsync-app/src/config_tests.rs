@@ -15,7 +15,11 @@ fn corrupt_settings_falls_back_instead_of_failing() {
     std::fs::write(dir.join("settings.json"), "{ 这不是合法 JSON ,,, ").unwrap();
 
     let s = load_or_init_settings(&dir).expect("配置损坏不该让启动失败");
-    assert_eq!(s.auto_fetch_bytes, Settings::default().auto_fetch_bytes, "应回退到默认值");
+    assert_eq!(
+        s.auto_fetch_bytes,
+        Settings::default().auto_fetch_bytes,
+        "应回退到默认值"
+    );
 
     // 坏文件要保留下来，用户手写的内容可能还想找回。
     assert!(
@@ -39,7 +43,10 @@ fn corrupt_pairings_falls_back_to_empty() {
 
     let list = load_pairings(&dir).expect("配对记录损坏不该让启动失败");
     assert!(list.is_empty());
-    assert!(dir.join("pairings.json.bad").exists(), "坏文件应保留待人工挽救");
+    assert!(
+        dir.join("pairings.json.bad").exists(),
+        "坏文件应保留待人工挽救"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -114,9 +121,11 @@ fn settings_roundtrip_custom_values() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let mut s = Settings::default();
-    s.auto_fetch_bytes = crate::size_parse::parse_byte_size("777MB").unwrap() as usize;
-    s.upload_limit_bytes_per_sec = crate::size_parse::parse_rate("33MB/s").unwrap();
+    let s = Settings {
+        auto_fetch_bytes: crate::size_parse::parse_byte_size("777MB").unwrap() as usize,
+        upload_limit_bytes_per_sec: crate::size_parse::parse_rate("33MB/s").unwrap(),
+        ..Default::default()
+    };
     save_settings(&dir, &s).unwrap();
 
     let back = load_or_init_settings(&dir).unwrap();
@@ -177,7 +186,6 @@ fn old_records_without_source_still_load() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 /// 每次 `update` 都必须让版本号变。
 ///
 /// 托盘的菜单标签（`单次上限：100 MiB…`）就挂在这个数上——变了才重渲染。
@@ -222,7 +230,10 @@ fn the_old_max_bytes_key_still_loads() {
     .unwrap();
 
     let s = load_or_init_settings(&dir).expect("旧字段名应能读取");
-    assert_eq!(s.auto_fetch_bytes, 524_288_000, "用户设过的 500 MiB 不该被重置");
+    assert_eq!(
+        s.auto_fetch_bytes, 524_288_000,
+        "用户设过的 500 MiB 不该被重置"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

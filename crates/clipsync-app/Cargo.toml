@@ -52,6 +52,8 @@ windows-sys = { version = "0.60", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    # GetUserDefaultLocaleName：界面语言跟随系统（见 language 模块）。
+    "Win32_Globalization",
 ] }
 
 # localtime_r：同上，本地时刻。已在依赖树里（arboard/directories 都用它），
@@ -64,7 +66,7 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSEvent"] }
-objc2-foundation = { version = "0.3", features = ["NSDate", "NSRunLoop"] }
+objc2-foundation = { version = "0.3", features = ["NSDate", "NSRunLoop", "NSLocale", "NSArray", "NSString"] }
 
 # 说明：托盘 UI（tray-icon）与异步运行时（tokio）将分别在能编译验证后
 # 与 M2 引入。M0 为最小可运行骨架：配置 + 日志 + 优雅退出 + stub 演示。

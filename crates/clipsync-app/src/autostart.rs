@@ -177,7 +177,10 @@ mod platform {
                 xml_escape("/Users/me/A&B/clip<sync>"),
                 "/Users/me/A&amp;B/clip&lt;sync&gt;"
             );
-            assert_eq!(xml_escape(r#"/a/"b"/'c'"#), "/a/&quot;b&quot;/&apos;c&apos;");
+            assert_eq!(
+                xml_escape(r#"/a/"b"/'c'"#),
+                "/a/&quot;b&quot;/&apos;c&apos;"
+            );
         }
 
         #[test]
@@ -185,7 +188,10 @@ mod platform {
             let p = "/Users/wang/PythonProject/ClipSync/target/release/clipsync";
             assert_eq!(xml_escape(p), p);
             // 中文路径同样不受影响。
-            assert_eq!(xml_escape("/Users/王鑫/应用/clipsync"), "/Users/王鑫/应用/clipsync");
+            assert_eq!(
+                xml_escape("/Users/王鑫/应用/clipsync"),
+                "/Users/王鑫/应用/clipsync"
+            );
         }
     }
 }

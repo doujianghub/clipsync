@@ -59,7 +59,10 @@ fn non_empty(v: Option<String>) -> Option<String> {
 /// `libc`/`hostname` 依赖。
 #[cfg(unix)]
 fn run_capture(program: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(program).args(args).output().ok()?;
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

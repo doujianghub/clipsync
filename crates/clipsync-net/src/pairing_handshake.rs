@@ -273,7 +273,7 @@ mod tests {
 
         assert_eq!(
             rec.device,
-            clipsync_core::DeviceId::from_public_key(&vec![2u8; 32]),
+            clipsync_core::DeviceId::from_public_key(&[2u8; 32]),
             "应采用公钥派生值"
         );
         assert_ne!(

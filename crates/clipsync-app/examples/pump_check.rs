@@ -2,8 +2,10 @@
 //! 用法：cargo run -p clipsync-app --example pump_check
 #[cfg(target_os = "macos")]
 fn main() {
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventMask,
-                        NSEventModifierFlags, NSEventSubtype, NSEventType};
+    use objc2_app_kit::{
+        NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventMask, NSEventModifierFlags,
+        NSEventSubtype, NSEventType,
+    };
     use objc2_foundation::{MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSPoint};
 
     let mtm = MainThreadMarker::new().expect("必须在主线程");
@@ -30,7 +32,10 @@ fn main() {
     let mode = unsafe { NSDefaultRunLoopMode };
     let mut drained = 0;
     while let Some(e) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
-        NSEventMask::Any, Some(&NSDate::distantPast()), mode, true,
+        NSEventMask::Any,
+        Some(&NSDate::distantPast()),
+        mode,
+        true,
     ) {
         drained += 1;
         let _ = e.r#type();
@@ -43,7 +48,10 @@ fn main() {
     // 队列空时应立即返回 None，不阻塞。
     let t = std::time::Instant::now();
     let none = app.nextEventMatchingMask_untilDate_inMode_dequeue(
-        NSEventMask::Any, Some(&NSDate::distantPast()), mode, true,
+        NSEventMask::Any,
+        Some(&NSDate::distantPast()),
+        mode,
+        true,
     );
     let el = t.elapsed();
     assert!(none.is_none(), "队列应已排空");
@@ -52,4 +60,6 @@ fn main() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn main() { println!("仅适用于 macOS"); }
+fn main() {
+    println!("仅适用于 macOS");
+}

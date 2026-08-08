@@ -10,8 +10,8 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clipsync_net::transport::NoiseConnection;
 use clipsync_net::peer::Candidate;
+use clipsync_net::transport::NoiseConnection;
 use tracing::{debug, info};
 
 use super::{run_connection, NetCtx, DIAL_TIMEOUT};

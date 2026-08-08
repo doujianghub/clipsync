@@ -13,13 +13,21 @@ fn counter_tracks_every_mutation() {
     assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 1);
 
     known.upsert(peer("b", 2));
-    assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 2, "引荐认识一台");
+    assert_eq!(
+        n.load(std::sync::atomic::Ordering::Acquire),
+        2,
+        "引荐认识一台"
+    );
 
     known.upsert(peer("b", 2)); // 重复登记不该把台数记成三台
     assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 2);
 
     known.remove(&peer("b", 2).device);
-    assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 1, "对端广播移出");
+    assert_eq!(
+        n.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "对端广播移出"
+    );
 
     known.remove(&peer("ghost", 9).device); // 不存在的设备
     assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 1);
@@ -50,7 +58,9 @@ fn newly_paired_device_is_visible_immediately() {
     assert_eq!(shared.len(), 2, "克隆出的句柄应看到新设备");
     assert!(shared.contains(&b.device), "拨号线程据此决定拨谁");
     assert_eq!(
-        shared.find_by_static_key(&b.static_public_key).map(|p| p.name),
+        shared
+            .find_by_static_key(&b.static_public_key)
+            .map(|p| p.name),
         Some("b".to_string()),
         "入站握手据静态公钥认证，查不到就会拒绝这台新配对的设备"
     );
@@ -68,7 +78,11 @@ fn upsert_replaces_instead_of_duplicating() {
     assert_eq!(known.len(), 1, "同一 device id 不应出现两条");
     let got = known.snapshot().pop().unwrap();
     assert_eq!(got.name, "改了名的 A");
-    assert_eq!(got.static_public_key, vec![9; 32], "公钥应更新为最新一次配对的");
+    assert_eq!(
+        got.static_public_key,
+        vec![9; 32],
+        "公钥应更新为最新一次配对的"
+    );
 }
 
 /// 解除配对后，拨号与入站认证都必须立刻查不到这台设备。
@@ -128,7 +142,9 @@ fn introduced_device_becomes_connectable() {
 
     assert!(b_side.contains(&c.device), "拨号线程现在会拨 C");
     assert_eq!(
-        b_side.find_by_static_key(&c.static_public_key).map(|p| p.name),
+        b_side
+            .find_by_static_key(&c.static_public_key)
+            .map(|p| p.name),
         Some("c".to_string()),
         "C 主动连过来时也能通过认证——A 在不在线都不影响"
     );

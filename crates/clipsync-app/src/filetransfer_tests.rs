@@ -58,7 +58,9 @@ fn stream_emits_chunks_then_done() {
 
     let m1 = s.next_message(CHUNK_SIZE).unwrap().unwrap();
     match m1 {
-        SyncMessage::FileChunk { offset, ref data, .. } => {
+        SyncMessage::FileChunk {
+            offset, ref data, ..
+        } => {
             assert_eq!(offset, 0);
             assert_eq!(data.len(), CHUNK_SIZE);
         }
@@ -67,7 +69,9 @@ fn stream_emits_chunks_then_done() {
 
     let m2 = s.next_message(CHUNK_SIZE).unwrap().unwrap();
     match m2 {
-        SyncMessage::FileChunk { offset, ref data, .. } => {
+        SyncMessage::FileChunk {
+            offset, ref data, ..
+        } => {
             assert_eq!(offset, CHUNK_SIZE as u64);
             assert_eq!(data.len(), 100);
         }
@@ -75,7 +79,10 @@ fn stream_emits_chunks_then_done() {
     }
 
     let m3 = s.next_message(CHUNK_SIZE).unwrap().unwrap();
-    assert!(matches!(m3, SyncMessage::FileDone { .. }), "末条应为完成消息");
+    assert!(
+        matches!(m3, SyncMessage::FileDone { .. }),
+        "末条应为完成消息"
+    );
 }
 
 /// **关键正确性**：边读边算的哈希必须与重读整个文件算出的完全一致。
@@ -85,7 +92,9 @@ fn stream_emits_chunks_then_done() {
 /// 发送端算错了。用多块（跨越 CHUNK_SIZE 边界）来确保增量路径真的被走到。
 #[test]
 fn incremental_hash_matches_full_reread() {
-    let data: Vec<u8> = (0..(CHUNK_SIZE * 2 + 1234)).map(|i| (i % 251) as u8).collect();
+    let data: Vec<u8> = (0..(CHUNK_SIZE * 2 + 1234))
+        .map(|i| (i % 251) as u8)
+        .collect();
     let p = write_temp("hash_equiv.bin", &data);
 
     // 从头发送：走增量路径。

@@ -25,12 +25,8 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{IDCANCEL, IDNO, IDOK, IDYES};
 
 /// `TaskDialogIndirect` 的签名，供运行时取址后调用。
-type TaskDialogIndirectFn = unsafe extern "system" fn(
-    *const TASKDIALOGCONFIG,
-    *mut i32,
-    *mut i32,
-    *mut BOOL,
-) -> HRESULT;
+type TaskDialogIndirectFn =
+    unsafe extern "system" fn(*const TASKDIALOGCONFIG, *mut i32, *mut i32, *mut BOOL) -> HRESULT;
 
 /// 运行时解析 `TaskDialogIndirect`，**绝不静态链接**。
 ///
@@ -185,7 +181,14 @@ fn run(cfg: &TASKDIALOGCONFIG) -> Result<i32> {
     let mut pressed: i32 = 0;
     // SAFETY: cfg 内的所有字符串指针都指向调用方仍持有的 Vec；
     // pnRadioButton / pfVerificationFlagChecked 传空表示不使用这两项功能。
-    let hr = unsafe { f(cfg, &mut pressed, std::ptr::null_mut(), std::ptr::null_mut()) };
+    let hr = unsafe {
+        f(
+            cfg,
+            &mut pressed,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
     if hr < 0 {
         return Err(anyhow!("TaskDialog 调用失败（HRESULT 0x{hr:08X}）"));
     }

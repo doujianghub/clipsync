@@ -77,6 +77,17 @@ pub struct Settings {
     /// 出问题时从托盘勾上，无需重启即可生效，复现一次再关掉。
     #[serde(default)]
     pub verbose_log: bool,
+
+    /// 界面语言：`auto`（跟随系统）/ `zh` / `en`。
+    ///
+    /// 存字符串而不是枚举，是为了让手工编辑配置的人一眼看懂，也让将来加语言
+    /// 不必改动已有配置的格式。无法识别的值按 `auto` 处理。
+    #[serde(default = "default_language")]
+    pub language: String,
+}
+
+fn default_language() -> String {
+    "auto".into()
 }
 
 fn default_file_cache_bytes() -> u64 {
@@ -102,6 +113,7 @@ impl Default for Settings {
             upload_limit_bytes_per_sec: default_upload_limit(),
             compress_transfers: default_compress(),
             verbose_log: false,
+            language: default_language(),
         }
     }
 }
@@ -143,7 +155,8 @@ pub fn config_dir() -> Result<PathBuf> {
     // 文档、和用户的直觉一致。
     let dir = project_root_dir(&dirs);
 
-    std::fs::create_dir_all(&dir).with_context(|| format!("无法创建配置目录: {}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("无法创建配置目录: {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -307,8 +320,7 @@ pub fn load_or_init_identity(dir: &Path) -> Result<clipsync_net::crypto::StaticI
     } else {
         let id = clipsync_net::crypto::StaticIdentity::generate()?;
         let text = serde_json::to_string_pretty(&id).context("序列化身份失败")?;
-        write_private(&path, &text)
-            .with_context(|| format!("写入身份失败: {}", path.display()))?;
+        write_private(&path, &text).with_context(|| format!("写入身份失败: {}", path.display()))?;
         Ok(id)
     }
 }

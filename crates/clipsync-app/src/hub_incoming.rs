@@ -150,7 +150,9 @@ impl HubState {
     /// 自动传输不必管：下次复制同一份内容还会再来一遍。手动这次是人专门点过
     /// 的，就此消失等于白点，而已收字节还在缓存里，重连后点一下就能续上。
     pub(super) fn requeue_if_manual(&mut self) {
-        let Some(t) = self.incoming.take() else { return };
+        let Some(t) = self.incoming.take() else {
+            return;
+        };
         if !t.manual {
             return;
         }
@@ -173,9 +175,8 @@ impl HubState {
 
     /// 把待取项的摘要交给托盘（菜单项、角标、悬停提示都读它）。
     fn publish_pending(&self) {
-        self.deps
-            .status
-            .set_pending(self.pending.as_ref().map(|p| crate::tray::PendingFetchInfo {
+        self.deps.status.set_pending(self.pending.as_ref().map(|p| {
+            crate::tray::PendingFetchInfo {
                 from: p.from.to_string(),
                 first_name: p
                     .files
@@ -184,7 +185,8 @@ impl HubState {
                     .unwrap_or_else(|| "文件".into()),
                 count: p.files.len(),
                 total: p.total,
-            }));
+            }
+        }));
     }
 
     /// 开始接收一批文件：先查缓存，只索取缺失的部分。
@@ -243,7 +245,11 @@ impl HubState {
                 cached_bytes
             );
         } else {
-            info!("开始接收 {} 个文件（共 {} 字节）", transfer.files.len(), total);
+            info!(
+                "开始接收 {} 个文件（共 {} 字节）",
+                transfer.files.len(),
+                total
+            );
         }
 
         self.incoming = Some(transfer);
@@ -309,12 +315,14 @@ impl HubState {
                 .index_of(file_id)
                 .map(|i| t.files[i].name.clone())
                 .unwrap_or_else(|| "文件".into());
-            self.deps.status.note_transfer(crate::tray::TransferProgress {
-                sending: false,
-                name,
-                done: t.got_bytes,
-                total: t.total_bytes,
-            });
+            self.deps
+                .status
+                .note_transfer(crate::tray::TransferProgress {
+                    sending: false,
+                    name,
+                    done: t.got_bytes,
+                    total: t.total_bytes,
+                });
         }
     }
 

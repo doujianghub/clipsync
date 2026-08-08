@@ -7,6 +7,8 @@
 //! 可调的项一律把**当前值写进标签**（`自动取回：100 MiB…`），省掉一层
 //! "点进去才知道现在是多少"。
 
+use clipsync_core::{t, tf};
+
 use super::TrayPeer;
 
 /// 把字节数写成人能读的形式。
@@ -33,9 +35,9 @@ pub(crate) fn human_bytes(n: u64) -> String {
 /// 超过的挂起来等你点一下，而不是"超过就不同步了"。发送侧不受它影响。
 pub(crate) fn auto_fetch_label(v: usize) -> String {
     if v == usize::MAX {
-        "自动取回：不限…".to_string()
+        t!("自动取回：不限…", "Auto-fetch: unlimited…").to_string()
     } else {
-        format!("自动取回：{}…", human_bytes(v as u64))
+        tf!("自动取回：{}…", "Auto-fetch: {}…", human_bytes(v as u64))
     }
 }
 
@@ -45,24 +47,29 @@ pub(crate) fn auto_fetch_label(v: usize) -> String {
 /// 多个文件时只报头一个加个数——列全了既放不下，也不比"3 个"更有用。
 pub(crate) fn fetch_label(first_name: &str, count: usize, total: u64) -> String {
     let name = crate::tray::ellipsize_middle(first_name);
+    let others = count.saturating_sub(1);
     if count > 1 {
-        format!("取回 {name} 等 {count} 个（{}）", human_bytes(total))
+        tf!(
+            "取回 {name} 等 {count} 个（{}）",
+            "Fetch {name} and {others} more ({})",
+            human_bytes(total)
+        )
     } else {
-        format!("取回 {name}（{}）", human_bytes(total))
+        tf!("取回 {name}（{}）", "Fetch {name} ({})", human_bytes(total))
     }
 }
 
 /// 发送限速的显示值。`0` 表示不限速。
 pub(crate) fn rate_label(v: u64) -> String {
     if v == 0 {
-        "发送限速：不限…".to_string()
+        t!("发送限速：不限…", "Upload limit: unlimited…").to_string()
     } else {
-        format!("发送限速：{}/s…", human_bytes(v))
+        tf!("发送限速：{}/s…", "Upload limit: {}/s…", human_bytes(v))
     }
 }
 
 pub(crate) fn port_label(port: u16) -> String {
-    format!("同步端口：{port}…")
+    tf!("同步端口：{port}…", "Sync port: {port}…")
 }
 
 /// 「显示配对码…」那一项的标签。
@@ -75,9 +82,27 @@ pub(crate) fn port_label(port: u16) -> String {
 /// 心里除一遍，而这一栏的宽度也会跟着位数抖。
 pub(crate) fn pairing_label(live: Option<(&str, u64)>) -> String {
     match live {
-        Some((code, secs)) => format!("配对码 {code} · 剩 {}:{:02}", secs / 60, secs % 60),
-        None => "显示配对码…".to_string(),
+        Some((code, secs)) => tf!(
+            "配对码 {code} · 剩 {}:{:02}",
+            "Code {code} · {}:{:02} left",
+            secs / 60,
+            secs % 60
+        ),
+        None => t!("显示配对码…", "Show pairing code…").to_string(),
     }
+}
+
+/// 「语言」那一项的标签，写出当前生效的语言。
+///
+/// 用各语言的**自称**（中文 / English）而不是当前界面语言里的叫法：英文界面
+/// 下写 "Chinese" 对只认中文的人毫无用处，而这一项恰恰是给"看不懂当前界面"
+/// 的人找的。
+pub(crate) fn language_label() -> String {
+    let name = match clipsync_core::i18n::current() {
+        clipsync_core::Lang::Zh => "中文",
+        clipsync_core::Lang::English => "English",
+    };
+    tf!("语言：{name}…", "Language: {name}…")
 }
 
 /// 设备子菜单里「退出设备组」那一项占用的假 device id。
@@ -105,7 +130,7 @@ pub(super) fn rebuild_peer_menu(
 
     let mut mapping = Vec::with_capacity(peers.len() + 1);
     if peers.is_empty() {
-        let empty = MenuItem::new("（尚未配对）", false, None);
+        let empty = MenuItem::new(t!("（尚未配对）", "(no paired devices)"), false, None);
         menu.append(&empty)
             .map_err(|e| anyhow::anyhow!("构建设备子菜单失败: {e}"))?;
         return Ok(mapping);
@@ -118,7 +143,12 @@ pub(super) fn rebuild_peer_menu(
         // 引荐来的标出引荐人：那台设备不是你亲手加的，信任是从别处传递
         // 过来的，不标出来等于把这件事藏起来。
         let label = match &p.introduced_by {
-            Some(by) => format!("{} {}（经 {by}）", if p.online { '●' } else { '○' }, p.name),
+            Some(by) => tf!(
+                "{} {}（经 {by}）",
+                "{} {} (via {by})",
+                if p.online { '●' } else { '○' },
+                p.name
+            ),
             None => format!("{} {}", if p.online { '●' } else { '○' }, p.name),
         };
         let item = MenuItem::new(label, true, None);
@@ -129,7 +159,7 @@ pub(super) fn rebuild_peer_menu(
 
     // 两件事分开摆：点设备是"把它移出组"，点这里是"我自己退出"。
     let sep = PredefinedMenuItem::separator();
-    let leave = MenuItem::new("退出设备组…", true, None);
+    let leave = MenuItem::new(t!("退出设备组…", "Leave device group…"), true, None);
     menu.append(&sep)
         .and_then(|_| menu.append(&leave))
         .map_err(|e| anyhow::anyhow!("构建设备子菜单失败: {e}"))?;
@@ -181,6 +211,48 @@ mod tests {
         let long = fetch_label("IMG_20260807_143052_HDR_Portrait_Final.heic", 1, 1 << 20);
         assert!(long.contains('…'), "长名字该截断：{long}");
         assert!(long.chars().count() < 30, "截断后应足够短：{long}");
+    }
+
+    /// 英文界面下标签必须真的变成英文。
+    ///
+    /// 光有 `t!` 宏不代表它接上了——漏写一处的表现是那一项**静默**保持中文，
+    /// 而开发者多半在中文系统上开发，永远不会看到。这里逐项比对两种语言的
+    /// 产物，顺便锁住"两边都不为空、且确实不同"。
+    #[test]
+    fn labels_are_translated() {
+        use clipsync_core::Lang;
+
+        let cases: Vec<(String, String)> = crate::language::with_lang(Lang::English, || {
+            vec![
+                (auto_fetch_label(100 << 20), "Auto-fetch: 100 MiB…".into()),
+                (
+                    auto_fetch_label(usize::MAX),
+                    "Auto-fetch: unlimited…".into(),
+                ),
+                (rate_label(0), "Upload limit: unlimited…".into()),
+                (rate_label(10 << 20), "Upload limit: 10 MiB/s…".into()),
+                (port_label(47684), "Sync port: 47684…".into()),
+                (pairing_label(None), "Show pairing code…".into()),
+                (
+                    pairing_label(Some(("1234", 167))),
+                    "Code 1234 · 2:47 left".into(),
+                ),
+                (
+                    fetch_label("report.zip", 1, 4_500_000_000),
+                    "Fetch report.zip (4.2 GiB)".into(),
+                ),
+                // 中文说「等 3 个」是总数，英文说「and 2 more」是余数——
+                // 直译会把数量说错一个。
+                (
+                    fetch_label("report.zip", 3, 4_500_000_000),
+                    "Fetch report.zip and 2 more (4.2 GiB)".into(),
+                ),
+            ]
+        });
+
+        for (got, want) in cases {
+            assert_eq!(got, want);
+        }
     }
 
     /// 配对码那一项：没会话时是入口，有会话时是实时倒计时。

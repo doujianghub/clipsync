@@ -57,7 +57,6 @@ fn describe_addr(ip: std::net::IpAddr) -> &'static str {
     }
 }
 
-
 /// 打印剪贴板的原始内容与文件可读性，用于排查"复制了文件却没同步"。
 ///
 /// **为什么需要它**：这个症状至少有三种成因，表现完全一样（什么都没发生），
@@ -138,7 +137,10 @@ fn print_identity() {
     }
 
     // 指定要求决定授权能不能扛过一次重新安装（见打包脚本里的说明）。
-    let bundle = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent());
+    let bundle = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent());
     if let Some(bundle) = bundle.filter(|b| b.extension().is_some_and(|e| e == "app")) {
         if let Ok(out) = std::process::Command::new("/usr/bin/codesign")
             .args(["-d", "-r-", &bundle.to_string_lossy()])
@@ -149,7 +151,9 @@ fn print_identity() {
                 let req = line.trim().trim_start_matches("# ").trim();
                 println!("  签名要求：{req}");
                 if req.contains("cdhash") {
-                    println!("    ⚠ 锁死在这一份二进制的哈希上——**每装一次新包，已授的权限就作废**，");
+                    println!(
+                        "    ⚠ 锁死在这一份二进制的哈希上——**每装一次新包，已授的权限就作废**，"
+                    );
                     println!("      表现是「开关自己关掉了」。请用新版打包脚本重新打包。");
                 }
             }

@@ -23,9 +23,12 @@ use crate::filecache::{hash_file, CHUNK_SIZE};
 /// 本机可供对端索取的文件登记表：代际号 → [(文件标识, 本机路径)]。
 ///
 /// 只保留最近若干代际——旧代际的内容已不在剪贴板里，对端不会再索取。
+/// 代际 → 该代际下的 (file_id, 本机路径) 清单。
+type FilesByGeneration = Arc<Mutex<HashMap<u64, Vec<(u64, PathBuf)>>>>;
+
 #[derive(Clone, Default)]
 pub struct OutgoingFiles {
-    inner: Arc<Mutex<HashMap<u64, Vec<(u64, PathBuf)>>>>,
+    inner: FilesByGeneration,
     /// 当前代际号：由本地剪贴板变化递增，用于判断传输是否已被取代。
     current: Arc<AtomicU64>,
     /// 最近一次**文件**复制的代际号。
@@ -249,7 +252,10 @@ pub fn begin_stream(
 ) -> std::result::Result<OutgoingStream, SyncMessage> {
     // 连"最近一次文件复制"都不是了：这份内容本机确实已经不提供，告知对端放弃。
     if !outgoing.is_servable(generation) {
-        debug!("忽略过期代际 {generation} 的文件请求（当前 {}）", outgoing.current());
+        debug!(
+            "忽略过期代际 {generation} 的文件请求（当前 {}）",
+            outgoing.current()
+        );
         return Err(SyncMessage::FileAbort { generation });
     }
     // 请求的不是当前剪贴板内容，却仍可服务——那只能是对端的手动取回

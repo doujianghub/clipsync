@@ -18,7 +18,7 @@ members = [
 [workspace.package]
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/doujianghub/clipsync"
 homepage = "https://github.com/doujianghub/clipsync"

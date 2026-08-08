@@ -36,11 +36,7 @@ impl NoiseConnection {
     ///
     /// `local_private` 为本机静态私钥，`remote_public` 为对端静态公钥
     /// （来自配对记录）。IK 模式下发起方须预置对端公钥。
-    pub fn connect(
-        stream: TcpStream,
-        local_private: &[u8],
-        remote_public: &[u8],
-    ) -> Result<Self> {
+    pub fn connect(stream: TcpStream, local_private: &[u8], remote_public: &[u8]) -> Result<Self> {
         crate::sockopt::tune(&stream);
         let handshake = snow::Builder::new(NOISE_PARAMS.parse()?)
             .local_private_key(local_private)
@@ -225,7 +221,11 @@ impl Header {
     const LEN: usize = 9;
 
     fn new(wire_len: usize, plain_len: usize, compressed: bool) -> Self {
-        Self { wire_len, plain_len, compressed }
+        Self {
+            wire_len,
+            plain_len,
+            compressed,
+        }
     }
 
     fn encode(&self) -> [u8; Self::LEN] {
@@ -238,7 +238,11 @@ impl Header {
 
     fn decode(b: &[u8]) -> Result<Self> {
         if b.len() != Self::LEN {
-            return Err(anyhow!("消息头帧长度非法: {}（应为 {}）", b.len(), Self::LEN));
+            return Err(anyhow!(
+                "消息头帧长度非法: {}（应为 {}）",
+                b.len(),
+                Self::LEN
+            ));
         }
         Ok(Self {
             wire_len: u32::from_be_bytes(b[0..4].try_into().unwrap()) as usize,

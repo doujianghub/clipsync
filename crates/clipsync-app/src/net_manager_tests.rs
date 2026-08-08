@@ -169,9 +169,15 @@ fn the_canonical_connection_is_the_one_dialed_by_the_smaller_id() {
     let big = DeviceId::from_hex("d9041402e76da45d");
 
     assert!(is_canonical(&small, &big, true), "小 id 拨出：规范");
-    assert!(is_canonical(&big, &small, false), "大 id 接入：同一条，也规范");
+    assert!(
+        is_canonical(&big, &small, false),
+        "大 id 接入：同一条，也规范"
+    );
     assert!(!is_canonical(&big, &small, true), "大 id 拨出：兜底，让位");
-    assert!(!is_canonical(&small, &big, false), "小 id 接入：同一条，也让位");
+    assert!(
+        !is_canonical(&small, &big, false),
+        "小 id 接入：同一条，也让位"
+    );
 }
 
 /// 让位窗口要远大于常见 RTT，否则"规范连接恰好卡在截止点"的区间就不够窄。

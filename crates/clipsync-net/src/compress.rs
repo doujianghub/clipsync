@@ -63,7 +63,10 @@ pub fn decompress(data: &[u8], expected_len: usize) -> Result<Vec<u8>> {
         .read_to_end(&mut out)
         .context("解压失败")?;
     if out.len() != expected_len {
-        anyhow::bail!("解压结果与声明长度不符（声明 {expected_len}，实得 {}）", out.len());
+        anyhow::bail!(
+            "解压结果与声明长度不符（声明 {expected_len}，实得 {}）",
+            out.len()
+        );
     }
     Ok(out)
 }

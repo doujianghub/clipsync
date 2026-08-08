@@ -199,7 +199,9 @@ impl Clipboard for ArboardClipboard {
             match retry_on_occupied(|| self.inner.get_image()) {
                 Ok(img) => {
                     let content = arboard_image_to_content(img);
-                    return Ok(Some(ClipRead::simple(content, sensitive).with_denied(denied)));
+                    return Ok(Some(
+                        ClipRead::simple(content, sensitive).with_denied(denied),
+                    ));
                 }
                 Err(arboard::Error::ContentNotAvailable) => { /* 退回读取文本 */ }
                 Err(e) => {
@@ -215,7 +217,8 @@ impl Clipboard for ArboardClipboard {
                             img.height
                         );
                         return Ok(Some(
-                            ClipRead::simple(ClipContent::Image(img), sensitive).with_denied(denied),
+                            ClipRead::simple(ClipContent::Image(img), sensitive)
+                                .with_denied(denied),
                         ));
                     }
                     return Err(e).context("读取剪贴板图片失败");
@@ -234,8 +237,9 @@ impl Clipboard for ArboardClipboard {
 
     fn write(&mut self, content: &ClipContent) -> Result<()> {
         match content {
-            ClipContent::Text(s) => retry_on_occupied(|| self.inner.set_text(s.clone()))
-                .context("写入剪贴板文本失败"),
+            ClipContent::Text(s) => {
+                retry_on_occupied(|| self.inner.set_text(s.clone())).context("写入剪贴板文本失败")
+            }
             ClipContent::Image(img) => {
                 retry_on_occupied(|| self.inner.set_image(content_image_to_arboard(img)))
                     .context("写入剪贴板图片失败")

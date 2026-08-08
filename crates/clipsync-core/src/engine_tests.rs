@@ -146,7 +146,10 @@ fn files_are_never_too_large_to_announce() {
         1,
     )]);
     assert!(
-        matches!(e.on_local_change(&huge, false), LocalDecision::Broadcast { .. }),
+        matches!(
+            e.on_local_change(&huge, false),
+            LocalDecision::Broadcast { .. }
+        ),
         "文件只发元数据，多大都该通告出去"
     );
 }
@@ -285,7 +288,11 @@ fn consuming_echo_keeps_order_list_in_sync() {
         LocalDecision::Skip(SkipReason::Echo)
     );
     assert_eq!(e.pending_echo.len(), 1);
-    assert_eq!(e.pending_echo_order.len(), 1, "顺序表未同步摘除已消费的登记");
+    assert_eq!(
+        e.pending_echo_order.len(),
+        1,
+        "顺序表未同步摘除已消费的登记"
+    );
 
     // b 的登记仍在，仍应被抑制。
     assert_eq!(
@@ -346,8 +353,10 @@ fn disabled_kind_is_rejected_on_receive_too() {
     );
     // 被拒的内容不得污染"当前状态"，否则之后重新打开开关时会被误判为重复。
     assert!(
-        matches!(e.on_remote_clip(&text("normal"), text("normal").content_hash()),
-                 RemoteDecision::Apply),
+        matches!(
+            e.on_remote_clip(&text("normal"), text("normal").content_hash()),
+            RemoteDecision::Apply
+        ),
         "其它类型不受影响"
     );
 }
@@ -421,7 +430,10 @@ fn a_failed_apply_releases_the_echo_slot() {
 
     // 现在用户自己复制了同样的东西，必须照常广播出去。
     assert!(
-        matches!(e.on_local_change(&content, false), LocalDecision::Broadcast { .. }),
+        matches!(
+            e.on_local_change(&content, false),
+            LocalDecision::Broadcast { .. }
+        ),
         "回声登记已撤销，这次本地复制应当正常同步"
     );
 }
@@ -438,7 +450,10 @@ fn without_the_rollback_the_same_content_is_swallowed_as_echo() {
     e.expect_echo(content.content_hash());
 
     assert!(
-        matches!(e.on_local_change(&content, false), LocalDecision::Skip(SkipReason::Echo)),
+        matches!(
+            e.on_local_change(&content, false),
+            LocalDecision::Skip(SkipReason::Echo)
+        ),
         "登记还在时，这次本地变化应被判为回声"
     );
 }
@@ -456,7 +471,10 @@ fn a_failed_apply_does_not_claim_to_be_the_current_content() {
     // 广播之后，引擎认的"当前内容"确实是它，而不是之前那次失败留下的状态。
     let _ = e.on_local_change(&content, false);
     assert!(
-        matches!(e.on_local_change(&content, false), LocalDecision::Skip(SkipReason::Duplicate)),
+        matches!(
+            e.on_local_change(&content, false),
+            LocalDecision::Skip(SkipReason::Duplicate)
+        ),
         "重复的同一份内容应被去重"
     );
 }

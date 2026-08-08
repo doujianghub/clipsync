@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 
-
 pub fn show(title: &str, body: &str) -> Result<()> {
     // 无统一的弹窗方案，退化为日志。
     tracing::info!("[{title}] {body}");
@@ -29,6 +28,9 @@ pub fn confirm(title: &str, body: &str) -> Result<bool> {
 
 pub fn choose(title: &str, body: &str, items: &[String]) -> Result<Option<usize>> {
     // 无图形环境，无从选择。
-    tracing::info!("[{title}] {body}（本平台无选择框；可选项：{}）", items.join(" / "));
+    tracing::info!(
+        "[{title}] {body}（本平台无选择框；可选项：{}）",
+        items.join(" / ")
+    );
     Ok(None)
 }

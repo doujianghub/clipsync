@@ -28,11 +28,7 @@ pub struct StaticIdentity {
 impl StaticIdentity {
     /// 生成一对新的静态密钥。
     pub fn generate() -> Result<Self> {
-        let builder = snow::Builder::new(
-            NOISE_PARAMS
-                .parse()
-                .context("解析 Noise 参数失败")?,
-        );
+        let builder = snow::Builder::new(NOISE_PARAMS.parse().context("解析 Noise 参数失败")?);
         let keypair = builder
             .generate_keypair()
             .context("生成 Noise 静态密钥失败")?;

@@ -8,11 +8,11 @@ pub mod content;
 pub mod device;
 pub mod engine;
 pub mod hash;
+pub mod i18n;
 pub mod message;
 
 pub use content::{ClipContent, ContentKind, FileMeta, ImageData};
 pub use device::{DeviceId, DeviceInfo};
-pub use engine::{
-    Limits, LocalDecision, RemoteDecision, SkipReason, SyncEngine, INLINE_MAX_BYTES,
-};
+pub use engine::{Limits, LocalDecision, RemoteDecision, SkipReason, SyncEngine, INLINE_MAX_BYTES};
+pub use i18n::Lang;
 pub use message::{PeerIntro, SyncMessage, PROTOCOL_VERSION};

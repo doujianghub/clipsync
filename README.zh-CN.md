@@ -10,7 +10,7 @@
   <a href="https://github.com/doujianghub/clipsync/releases/latest"><img src="https://img.shields.io/github/v/release/doujianghub/clipsync" alt="Release"></a>
   <a href="#许可证"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey" alt="Platform">
-  <img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust 1.75+">
+  <img src="https://img.shields.io/badge/rust-1.82%2B-orange.svg" alt="Rust 1.82+">
 </p>
 
 <p align="center">
@@ -111,7 +111,7 @@ ClipSync 的位置是这几条的**组合**：跨平台、点对点、自动、�
 
 ### 从源码构建
 
-需要 Rust 1.75 或更高版本。
+需要 Rust 1.82 或更高版本。
 
 ```bash
 git clone https://github.com/doujianghub/clipsync

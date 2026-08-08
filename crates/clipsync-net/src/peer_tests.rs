@@ -35,13 +35,19 @@ fn same_subnet_is_lan_direct() {
 
 #[test]
 fn loopback_is_lan_direct() {
-    assert_eq!(classify(ip("127.0.0.1"), &local()), Some(AddrClass::LanDirect));
+    assert_eq!(
+        classify(ip("127.0.0.1"), &local()),
+        Some(AddrClass::LanDirect)
+    );
 }
 
 /// 不同网段的私有地址属于覆盖网（ZeroTier/WireGuard 等常见网段）。
 #[test]
 fn other_private_subnet_is_overlay() {
-    assert_eq!(classify(ip("10.147.20.3"), &local()), Some(AddrClass::Overlay));
+    assert_eq!(
+        classify(ip("10.147.20.3"), &local()),
+        Some(AddrClass::Overlay)
+    );
     assert_eq!(
         classify(ip("172.16.5.9"), &local()),
         Some(AddrClass::Overlay)
@@ -61,12 +67,18 @@ fn cgnat_range_is_overlay() {
         Some(AddrClass::Overlay)
     );
     // 100.x 但不在 64..128 区间的是公网地址。
-    assert_eq!(classify(ip("100.20.1.1"), &local()), Some(AddrClass::Public));
+    assert_eq!(
+        classify(ip("100.20.1.1"), &local()),
+        Some(AddrClass::Public)
+    );
 }
 
 #[test]
 fn public_ipv4_is_public() {
-    assert_eq!(classify(ip("203.0.113.9"), &local()), Some(AddrClass::Public));
+    assert_eq!(
+        classify(ip("203.0.113.9"), &local()),
+        Some(AddrClass::Public)
+    );
 }
 
 #[test]
@@ -99,7 +111,10 @@ fn ipv6_same_prefix_is_lan_direct() {
         classify(ip("2001:db8:0:1::99"), &l),
         Some(AddrClass::LanDirect)
     );
-    assert_eq!(classify(ip("2001:db8:0:2::99"), &l), Some(AddrClass::Public));
+    assert_eq!(
+        classify(ip("2001:db8:0:2::99"), &l),
+        Some(AddrClass::Public)
+    );
 }
 
 #[test]

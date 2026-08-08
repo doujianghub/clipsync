@@ -16,8 +16,14 @@
 fn windows_dialogs_spawn_no_subprocess() {
     for (name, src) in [
         ("dialog_win.rs", include_str!("../src/dialog_win.rs")),
-        ("dialog_win_task.rs", include_str!("../src/dialog_win_task.rs")),
-        ("dialog_win_input.rs", include_str!("../src/dialog_win_input.rs")),
+        (
+            "dialog_win_task.rs",
+            include_str!("../src/dialog_win_task.rs"),
+        ),
+        (
+            "dialog_win_input.rs",
+            include_str!("../src/dialog_win_input.rs"),
+        ),
     ] {
         assert!(
             !src.contains("Command::new"),
@@ -45,8 +51,16 @@ fn base64_matches_reference_vectors() {
             let n = (b0 << 16) | (b1 << 8) | b2;
             out.push(TABLE[(n >> 18 & 63) as usize] as char);
             out.push(TABLE[(n >> 12 & 63) as usize] as char);
-            out.push(if chunk.len() > 1 { TABLE[(n >> 6 & 63) as usize] as char } else { '=' });
-            out.push(if chunk.len() > 2 { TABLE[(n & 63) as usize] as char } else { '=' });
+            out.push(if chunk.len() > 1 {
+                TABLE[(n >> 6 & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                TABLE[(n & 63) as usize] as char
+            } else {
+                '='
+            });
         }
         out
     }

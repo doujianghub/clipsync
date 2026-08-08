@@ -18,7 +18,10 @@ fn scrapes_overlay_addresses_without_parsing_json() {
 
     assert!(ips.contains(&"100.88.88.22".parse().unwrap()));
     assert!(ips.contains(&"100.88.88.11".parse().unwrap()));
-    assert!(ips.contains(&"100.115.98.83".parse().unwrap()), "跨网段的对端不能漏");
+    assert!(
+        ips.contains(&"100.115.98.83".parse().unwrap()),
+        "跨网段的对端不能漏"
+    );
     assert!(
         ips.contains(&"192.168.3.7".parse().unwrap()),
         "直连端点也是可达地址，捞上来无妨"
@@ -38,7 +41,10 @@ fn skips_addresses_that_cannot_be_a_peer() {
     assert!(!is_reachable_peer("8.8.8.8".parse().unwrap()), "公网不探");
 
     assert!(is_reachable_peer("192.168.3.7".parse().unwrap()));
-    assert!(is_reachable_peer("10.147.17.5".parse().unwrap()), "ZeroTier 常用段");
+    assert!(
+        is_reachable_peer("10.147.17.5".parse().unwrap()),
+        "ZeroTier 常用段"
+    );
     assert!(is_reachable_peer("100.88.88.11".parse().unwrap()), "CGNAT");
 }
 
