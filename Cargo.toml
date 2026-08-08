@@ -41,7 +41,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # —— 配置目录 / 系统 —— #
-directories = "5"
+directories = "6"
 ctrlc = "3"
 
 # —— 压缩 —— #
