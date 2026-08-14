@@ -308,7 +308,12 @@ mod tests {
                 &mut len,
             )
         };
-        assert_eq!(rc, 0, "getsockopt 失败: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            rc,
+            0,
+            "getsockopt 失败: {}",
+            std::io::Error::last_os_error()
+        );
         v
     }
 }

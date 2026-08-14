@@ -12,6 +12,12 @@
 //!   链路上的吞吐被限制在约 `SNDBUF_CAP / RTT`（512 KiB、50 ms 即 ~10 MB/s）。
 //!   对后台流量这正是想要的取舍：局域网（毫秒级 RTT）不受影响，跨地域链路上
 //!   慢一点换来"剪贴板变了立即中止"不被几 MB 的积压拖住。
+//!
+//! **qWAVE 只对真实网卡生效**：QoS 调度发生在网卡的发送队列上，回环没有那个
+//! 队列，所以同机连接（含连本机真实 IP——Windows 会把它短路到回环）上
+//! `QOSAddSocketToFlow` 必然失败。这不是缺陷，只是意味着它无法在同机测试里
+//! 验证，也意味着单机自测跑不出让路效果。失败只记 debug 日志并退回
+//! `SO_SNDBUF` 那半边，连接照常可用。
 
 use std::net::TcpStream;
 use std::os::windows::io::AsRawSocket;
@@ -44,13 +50,16 @@ pub(super) fn background_bulk(stream: &TcpStream) {
     }
 }
 
-/// 把已连接的 socket 加入 qWAVE 的后台流量流。成功与否返回给调用方，
-/// 测试据此断言（`setsockopt` 类失败都是静默的，只有断言能防它悄悄失效）。
+/// 把已连接的 socket 加入 qWAVE 的后台流量流。
+///
+/// 返回是否成功，让调用方能把失败说清楚（是"没有 qWAVE"还是"这条路径不支持"，
+/// 对排查是两回事）。回环连接上必然返回 false，理由见模块说明。
 fn add_to_background_flow(stream: &TcpStream) -> bool {
     let Some(handle) = qos_handle() else {
         return false;
     };
-    let mut flow_id: u32 = 0; // 必须传 0：让系统新建一条流。
+    // 必须传 0：让系统新建一条流。
+    let mut flow_id: u32 = 0;
     // SAFETY: handle 由 QOSCreateHandle 返回且进程存活期内有效；socket 已连接，
     // 因此目的地址可传 NULL；flow_id 是本栈上的可写 u32。
     // 流会随 socket 关闭自动移除，无需配对调用 QOSRemoveSocketFromFlow。
@@ -194,7 +203,12 @@ mod tests {
                 &mut len,
             )
         };
-        assert_eq!(rc, 0, "getsockopt 失败: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            rc,
+            0,
+            "getsockopt 失败: {}",
+            std::io::Error::last_os_error()
+        );
         v
     }
 
@@ -220,18 +234,35 @@ mod tests {
         );
     }
 
-    /// qWAVE 后台流声明必须成功——除非这台机器压根没有 qWAVE（未装该功能的
-    /// Server SKU），那属于环境限制，跳过而不是失败。
+    /// 加入后台流失败**不能**让调优把连接搞坏——这是这里唯一测得到的东西。
+    ///
+    /// **为什么不断言它成功**：测试只连得了自己，而同机连接在 Windows 上一律
+    /// 走回环路径（连本机真实 IP 也一样），qWAVE 不为回环做流量整形——QoS 调度
+    /// 发生在真实网卡的发送队列上，回环压根没有那个队列，于是调用必然失败。
+    ///
+    /// 第一版就是照着 macOS 那套"读回来断言"的思路写的，CI 上当场红：错的是
+    /// 测试前提，不是代码。留这段说明是为了让下一个人别再写一遍——真实链路上
+    /// 是否生效，看连接建立时那行 `QOSAddSocketToFlow 失败` 的 debug 日志，
+    /// 没有它就是成功了。
     #[test]
-    fn background_flow_is_added_when_qwave_exists() {
-        let c = connected_and_tuned();
-        if super::qos_handle().is_none() {
-            eprintln!("跳过：本机没有 qWAVE（QWAVE 服务不可用）");
-            return;
-        }
-        assert!(
-            super::add_to_background_flow(&c),
-            "qWAVE 可用时加入后台流不该失败"
-        );
+    fn a_failed_flow_does_not_break_the_connection() {
+        use std::io::{Read, Write};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 5];
+            s.read_exact(&mut buf).unwrap();
+            s.write_all(&buf).unwrap();
+        });
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        super::background_bulk(&c); // 回环上必然走到失败分支
+        c.write_all(b"hello").unwrap();
+        let mut back = [0u8; 5];
+        c.read_exact(&mut back).unwrap();
+        assert_eq!(&back, b"hello", "声明后台流失败后连接仍须可用");
+        server.join().unwrap();
     }
 }
