@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "clipsync-app"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "clipsync-clip",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "clipsync-clip"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "clipsync-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "postcard",
  "serde",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "clipsync-net"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "blake2",

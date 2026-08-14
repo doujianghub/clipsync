@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-15
+
+Wire-compatible with 1.0.0 — the protocol version is unchanged, so a 1.1.0
+device syncs with a 1.0.0 device without reconnect loops.
+
+### Added
+
+- **File transfers now yield to interactive traffic on Windows too.** Sync
+  connections are declared as background flows through qWAVE
+  (`QOSTrafficTypeBackground`, DSCP CS1) and their kernel send backlog is
+  capped, so copying a large file no longer degrades a Remote Desktop session
+  or a video call running over the same link. macOS has done this since 1.0.0;
+  Windows was a no-op, which is exactly the platform most likely to be on the
+  far end of a remote desktop connection.
+- **Dead connections are now detected in about a minute** instead of the
+  kernel's default retransmission timeout of roughly fifteen. TCP keepalive is
+  enabled (30 s idle, 10 s interval, 3 probes) along with a retransmission
+  deadline. A peer that vanishes without closing — lid closed, Wi-Fi switched,
+  VPN dropped — used to leave a zombie connection registered, and the new
+  connection it opened on waking was rejected as a duplicate; both devices then
+  sat there online but not syncing.
+
+### Changed
+
+- **Broadcasting to several devices now compresses once**, not once per
+  connection. Serialisation and compression are shared across peers; only
+  encryption stays per-connection, since each Noise session has its own keys
+  and nonce sequence. Previously a 4K screenshot cost an extra 15 ms of
+  serialisation, 40 ms of deflate, and a 33 MB memory copy for every additional
+  device — the last device in a group waited longest.
+- Per-stage timings (encode, send, receive, decompress) are logged when they
+  exceed 200 ms, with throughput included for the byte-moving stages.
+
+### Fixed
+
+- **A `settings.json` containing only some fields is no longer treated as
+  corrupt.** Four keys lacked defaults, so omitting any one of them made the
+  whole file fail to parse; it was then renamed `.bad` and silently replaced by
+  defaults. The README documents this file as hand-editable, which it was not.
+- `scripts/package-macos.sh` no longer runs backticked words inside the
+  `Info.plist` XML comments as shell commands.
+
 ## [1.0.0] - 2026-08-08
 
 First public release.
@@ -67,4 +109,5 @@ First public release.
   explained but not transferred.
 - Some Windows dialog and tray details were verified on macOS only.
 
+[1.1.0]: https://github.com/doujianghub/clipsync/releases/tag/v1.1.0
 [1.0.0]: https://github.com/doujianghub/clipsync/releases/tag/v1.0.0

@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 # 这个数字由**传递依赖**决定，不是我们代码的选择：
 # arboard → image 0.25 要求 1.88，image → moxcms 要求 edition2024（1.85+）。
