@@ -41,5 +41,16 @@ flate2 = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows 的对应能力（见 sockopt_win.rs）：
+#   - WinSock：keepalive/重传超时/发送缓冲的 setsockopt 常量与函数
+#   - QoS：qWAVE 后台流量声明（QOSAddSocketToFlow）
+# windows-sys 已随 arboard（clipsync-clip）缓存，此处仅增加 feature，不引入新下载。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_QoS",
+] }
+
 [features]
 default = []

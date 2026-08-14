@@ -51,8 +51,9 @@ paste is faster and the bytes never leave your machines.
 sharing or Remote Desktop, you often want a command, a log excerpt, or an API
 token on your local machine. ClipSync runs independently of the remote session,
 so the clipboard keeps working even where the session's own clipboard
-integration does not — and on macOS transfers are marked as background traffic,
-so a large file will not degrade the screen sharing you are looking at.
+integration does not — and transfers are marked as background traffic (macOS
+service class / Windows qWAVE), so a large file will not degrade the screen
+sharing you are looking at.
 
 **Your workplace does not allow cloud sync.** There is no server component, no
 account, and no telemetry. Traffic goes directly between your devices over your
@@ -82,7 +83,8 @@ integrity verification, and no size limit beyond what you configure.
   WireGuard, and plain port forwarding all work without configuration.
 - **Stays out of the way.** ~11 MB idle memory, ~0.03% idle CPU, a 1.4 MB
   binary, and a single tray icon. File transfers are marked as background
-  traffic on macOS so they yield to screen sharing and video calls.
+  traffic on macOS and Windows so they yield to screen sharing, video calls,
+  and remote desktop sessions.
 - **Respects sensitive content.** Clipboard entries marked confidential by
   password managers are skipped automatically.
 - **English and Chinese interface.** Follows your system language, switchable
@@ -348,6 +350,13 @@ Useful signals in the log:
 
 **All devices must run the same protocol version.** The wire format changed in
 1.0.0; mixing it with older builds causes repeated reconnects.
+
+**Using Remote Desktop or screen sharing between the same machines?** Turn off
+the session's own clipboard redirection (in the RDP client: Local Resources →
+Clipboard). With both active, every copy is transferred twice — once by the
+session, once by ClipSync — which doubles the bandwidth hit on the very link
+your screen is coming through. ClipSync alone is the better half to keep: its
+transfers are compressed, cached, resumable, and marked as background traffic.
 
 ## Known limitations
 

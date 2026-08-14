@@ -1,17 +1,48 @@
 //! 同步连接的套接字调优。
 //!
-//! 两件事：关掉 Nagle，以及**把这条连接声明成后台批量流量**。
+//! 三件事：关掉 Nagle、**把这条连接声明成后台批量流量**、以及**给死连接一个
+//! 发现期限**。
 //!
-//! 后者是这个模块存在的理由。剪贴板同步在用户眼里是个后台差事，可它在网络
-//! 上一点也不客气：一条不限速的 TCP 会一路加窗到把链路和沿途队列填满。用户
-//! 这时候正在做的事——屏幕共享、视频通话、远程终端——全都排在那条队列后面，
-//! 于是"复制了个文件"表现为"屏幕共享卡了"。
+//! 声明后台流量是这个模块存在的理由。剪贴板同步在用户眼里是个后台差事，可它
+//! 在网络上一点也不客气：一条不限速的 TCP 会一路加窗到把链路和沿途队列填满。
+//! 用户这时候正在做的事——屏幕共享、视频通话、远程桌面——全都排在那条队列
+//! 后面，于是"复制了个文件"表现为"屏幕共享卡了"。
 //!
 //! 限速能治，但要用户猜一个数字，且猜不准：链路空着时限速是白白慢，链路忙时
 //! 同一个数字又还是太快。正确的做法是让系统按**实时拥塞**决定，我们只需说清
-//! 自己是什么流量。
+//! 自己是什么流量。macOS 与 Windows 的做法不同（服务类型 vs qWAVE），各自见
+//! 平台实现。
+//!
+//! 死连接期限解决的是另一个问题：对端不辞而别（合盖睡眠、换 Wi-Fi、VPN 断开）
+//! 时 TCP 不会有任何通知，收发泵的读超时只会一轮轮正常超时，写出去的字节则由
+//! 内核默默重传**十几分钟**才报错。这期间 `ConnRegistry` 里还挂着旧连接，对端
+//! 醒来后拨进来的新连接会被当成重复连接关掉——两台明明都在线的设备就这么
+//! 互相干瞪眼。协议里的 `Ping`/`Pong` 从没人发过，保活这件事内核本来就会做，
+//! 只是默认周期（2 小时）等于没有，把它调到分钟级即可。
 
 use std::net::TcpStream;
+
+/// 空闲多少秒后开始发保活探测。
+///
+/// 与 `KEEPALIVE_INTVL_SECS`/`KEEPALIVE_CNT` 合起来：链路断了约 60 秒内读到
+/// 错误、泵退出、`ConnRegistry` 释放，对端重连不再被挡。取 30 秒起步是因为
+/// Wi-Fi 漫游、AP 切换这类几秒钟的抖动不该杀掉一条健康连接。
+#[cfg(any(target_os = "macos", windows))]
+const KEEPALIVE_IDLE_SECS: i32 = 30;
+/// 保活探测无应答后，隔多少秒再探一次。
+#[cfg(any(target_os = "macos", windows))]
+const KEEPALIVE_INTVL_SECS: i32 = 10;
+/// 连续多少次探测无应答判定连接已死。
+#[cfg(any(target_os = "macos", windows))]
+const KEEPALIVE_CNT: i32 = 3;
+/// 有数据待重传时，持续这么多秒毫无进展（一个 ACK 都等不到）就放弃连接。
+///
+/// 保活只管**空闲**连接；一旦有未确认数据（比如每 60 秒的地址通告写进了死链
+/// 路），走的是重传路径，默认要指数退避到十几分钟才放弃。健康网络上连续
+/// 30 秒收不到任何 ACK 只有链路断了一种解释——真在重传的慢链路每轮都会
+/// 收到 ACK，不会触发这个期限。
+#[cfg(any(target_os = "macos", windows))]
+const RETRANS_ABORT_SECS: i32 = 30;
 
 /// 调整套接字参数以适配本协议的收发模式。
 ///
@@ -24,6 +55,7 @@ pub fn tune(stream: &TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!("设置 TCP_NODELAY 失败（不影响功能，可能略增延迟）: {e}");
     }
+    keepalive(stream);
     background_bulk(stream);
 }
 
@@ -76,6 +108,50 @@ fn background_bulk(stream: &TcpStream) {
     }
 }
 
+/// 打开保活并给重传设期限，让死连接在约一分钟内暴露（理由见模块说明）。
+#[cfg(target_os = "macos")]
+fn keepalive(stream: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+
+    // libc 尚未导出，取自 netinet/tcp.h：重传持续 N 秒无进展即放弃连接。
+    const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80;
+
+    let fd = stream.as_raw_fd();
+    // SAFETY: fd 来自活着的 TcpStream，optval 均为各选项要求的 c_int。
+    unsafe {
+        setopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1, "SO_KEEPALIVE");
+        // macOS 的"空闲阈值"叫 TCP_KEEPALIVE（Linux 上才叫 TCP_KEEPIDLE）。
+        setopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPALIVE,
+            KEEPALIVE_IDLE_SECS,
+            "TCP_KEEPALIVE",
+        );
+        setopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            KEEPALIVE_INTVL_SECS,
+            "TCP_KEEPINTVL",
+        );
+        setopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPCNT,
+            KEEPALIVE_CNT,
+            "TCP_KEEPCNT",
+        );
+        setopt(
+            fd,
+            libc::IPPROTO_TCP,
+            TCP_RXT_CONNDROPTIME,
+            RETRANS_ABORT_SECS,
+            "TCP_RXT_CONNDROPTIME",
+        );
+    }
+}
+
 /// 设一个 `c_int` 型套接字选项，失败只记日志。
 ///
 /// # Safety
@@ -103,17 +179,24 @@ unsafe fn setopt(
     }
 }
 
-/// 非 macOS 平台暂无等价能力。
+#[cfg(windows)]
+#[path = "sockopt_win.rs"]
+mod win;
+
+#[cfg(windows)]
+use win::{background_bulk, keepalive};
+
+/// 其余平台（目前只剩 Linux，非发布目标）暂无等价实现。
 ///
-/// Linux 有 `SO_PRIORITY`/`IP_TOS`，但那只是打标记，要沿途设备配合才有意义，
-/// 家用网络里基本没人配；真正的退让得靠 LEDBAT 类拥塞控制，内核没有现成开关。
-/// Windows 的等价物是 qWAVE（`QOSAddSocketToFlow` + `QOSTrafficTypeBackground`），
-/// 有效但要额外维护 QoS 句柄的生命周期——等有人真的在 Windows 上撞到这个问题
-/// 再说，眼下不为一个假想的需求加一层。
-///
-/// 这两个平台上文件传输仍会尽力占满链路，用户可用托盘里的「上传限速」兜底。
-#[cfg(not(target_os = "macos"))]
+/// Linux 有现成的对应物（TCP_NOTSENT_LOWAT、TCP_KEEPIDLE、TCP_USER_TIMEOUT、
+/// SO_PRIORITY），但 CI 不编译 Linux 目标，写了也是一段没人验证的死代码——
+/// 等真有 Linux 发布需求时随 CI 一起加。此前文件传输在 Linux 上仍会尽力占满
+/// 链路，用户可用托盘里的「上传限速」兜底。
+#[cfg(not(any(target_os = "macos", windows)))]
 fn background_bulk(_stream: &TcpStream) {}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn keepalive(_stream: &TcpStream) {}
 
 #[cfg(test)]
 mod tests {
@@ -155,52 +238,77 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn background_class_is_really_applied() {
-        use std::os::unix::io::AsRawFd;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let _server = std::thread::spawn(move || listener.accept());
-        let c = TcpStream::connect(addr).unwrap();
-        super::tune(&c);
-
-        let read_back = |level, name| {
-            let mut v: libc::c_int = -1;
-            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            // SAFETY: fd 有效，缓冲区尺寸与 c_int 匹配。
-            let rc = unsafe {
-                libc::getsockopt(
-                    c.as_raw_fd(),
-                    level,
-                    name,
-                    &mut v as *mut libc::c_int as *mut libc::c_void,
-                    &mut len,
-                )
-            };
-            assert_eq!(
-                rc,
-                0,
-                "getsockopt 失败: {}",
-                std::io::Error::last_os_error()
-            );
-            v
-        };
-
-        assert_eq!(read_back(libc::SOL_SOCKET, 0x1116), 1, "服务类型应为 BK(1)");
+        let c = connected_and_tuned();
         assert_eq!(
-            read_back(libc::IPPROTO_TCP, 0x201),
+            read_back(&c, libc::SOL_SOCKET, 0x1116),
+            1,
+            "服务类型应为 BK(1)"
+        );
+        assert_eq!(
+            read_back(&c, libc::IPPROTO_TCP, 0x201),
             128 * 1024,
             "未发送水位应为 128 KiB"
+        );
+    }
+
+    /// 保活与重传期限也一样：常量是字面量，只有读回来才知道真的生效了。
+    /// 少了它们，死连接要靠十几分钟的重传超时才暴露，期间挡着对端重连。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dead_link_detection_is_really_applied() {
+        let c = connected_and_tuned();
+        assert_ne!(
+            read_back(&c, libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+            0,
+            "SO_KEEPALIVE 应已打开"
+        );
+        assert_eq!(
+            read_back(&c, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE),
+            super::KEEPALIVE_IDLE_SECS,
+            "保活空闲阈值"
+        );
+        assert_eq!(
+            read_back(&c, libc::IPPROTO_TCP, 0x80),
+            super::RETRANS_ABORT_SECS,
+            "重传放弃期限"
         );
     }
 
     /// Nagle 必须真的关掉——这一项在所有平台上都该成功，值得断言。
     #[test]
     fn nagle_is_actually_off() {
+        let c = connected_and_tuned();
+        assert!(c.nodelay().unwrap(), "TCP_NODELAY 应已启用");
+    }
+
+    /// 建一条已调优的回环连接（监听端由游离线程收下即可）。
+    fn connected_and_tuned() -> TcpStream {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let _server = std::thread::spawn(move || listener.accept());
         let c = TcpStream::connect(addr).unwrap();
         super::tune(&c);
-        assert!(c.nodelay().unwrap(), "TCP_NODELAY 应已启用");
+        c
+    }
+
+    /// 读回一个 `c_int` 型套接字选项。
+    #[cfg(target_os = "macos")]
+    fn read_back(c: &TcpStream, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+        use std::os::unix::io::AsRawFd;
+
+        let mut v: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: fd 有效，缓冲区尺寸与 c_int 匹配。
+        let rc = unsafe {
+            libc::getsockopt(
+                c.as_raw_fd(),
+                level,
+                name,
+                &mut v as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt 失败: {}", std::io::Error::last_os_error());
+        v
     }
 }
