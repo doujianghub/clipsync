@@ -304,8 +304,11 @@ Measured on release builds, 90 MB file over loopback:
 | Fully cached repeat | ~1 ms | zero transfer |
 
 Images are compressed at the frame layer before transmission — a 4K screenshot
-is 33 MB as raw RGBA and about 6% of that after compression, which matters a
-great deal on links slower than gigabit.
+is 33 MB as raw RGBA and typically 6%–15% of that after compression (flat UI
+areas squeeze hardest; noisy photographic content skips compression
+automatically), which matters a great deal on links slower than gigabit. When
+broadcasting to several devices the compression runs once and every connection
+shares the same bytes.
 
 ## Security
 

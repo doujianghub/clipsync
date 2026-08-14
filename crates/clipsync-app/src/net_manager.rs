@@ -23,6 +23,7 @@ use clipsync_net::crypto::StaticIdentity;
 use clipsync_net::local::local_candidates;
 use clipsync_net::pairing::PairingRecord;
 use clipsync_net::peer::AddrSource;
+use clipsync_net::prepared::PreparedMessage;
 use clipsync_net::transport::NoiseConnection;
 use tracing::{debug, info, warn};
 
@@ -370,7 +371,7 @@ fn run_connection(conn: NoiseConnection, ctx: &NetCtx, via: Option<SocketAddr>) 
         ctx.addrbook.mark_good(&peer.device, &addr);
     }
 
-    let (out_tx, out_rx) = std::sync::mpsc::channel::<SyncMessage>();
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<std::sync::Arc<PreparedMessage>>();
     ctx.hub.send(HubEvent::PeerConnected {
         device: peer.device.clone(),
         name: peer.name.clone(),

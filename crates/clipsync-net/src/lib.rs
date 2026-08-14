@@ -17,6 +17,7 @@ pub mod local;
 pub mod pairing;
 pub mod pairing_handshake;
 pub mod peer;
+pub mod prepared;
 pub mod sockopt;
 pub mod transport;
 pub mod wire;

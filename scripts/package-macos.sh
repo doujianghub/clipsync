@@ -61,6 +61,10 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/clipsync"
 
+# heredoc 刻意不加引号——下面的 ${APP_NAME}/${VERSION} 要展开。代价是反引号
+# 也会被当成命令替换，**包括 XML 注释里的**：曾经注释里一句 `send_to` 就让
+# 打包过程冒出两行 "command not found"，而注释内容被静默替换成空。所以本段
+# 里的反引号一律写成 \` 。
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -86,7 +90,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <!-- 本地网络权限（macOS 14+ 必需）。
          局域网自动发现靠 UDP 组播（239.255.71.83），而 macOS 会把组播/广播
          归入"本地网络"隐私类别：没有这条声明，系统既不会弹授权请求，发送也
-         直接失败——`send_to` 返回 EHOSTUNREACH (errno 65)。
+         直接失败——\`send_to\` 返回 EHOSTUNREACH (errno 65)。
          症状是日志里刷"局域网信标一个网卡都发不出去"，而同一份代码从终端
          跑却一切正常（终端自己有这个权限）。 -->
     <key>NSLocalNetworkUsageDescription</key>
@@ -98,7 +102,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
          看不出为什么一个剪贴板工具要读他的「文稿」，多半就点了拒绝；而拒绝
          之后是**静默失败**，此后从这些位置复制文件永远同步不过去，日志里也
          只有一句"读不了"。
-         排查用 `clipsync clipdiag`（必须从 App 包内跑，终端的授权是另一套）。 -->
+         排查用 \`clipsync clipdiag\`（必须从 App 包内跑，终端的授权是另一套）。 -->
     <key>NSDesktopFolderUsageDescription</key>
     <string>复制桌面上的文件时，需要读取文件内容才能同步到你的其它设备。</string>
     <key>NSDocumentsFolderUsageDescription</key>

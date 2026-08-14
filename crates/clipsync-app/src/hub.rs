@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use clipsync_clip::{ArboardClipboard, Clipboard};
 use clipsync_core::{ClipContent, DeviceId, RemoteDecision, SkipReason, SyncEngine, SyncMessage};
+use clipsync_net::prepared::PreparedMessage;
 use tracing::{debug, info, warn};
 
 #[path = "hub_incoming.rs"]
@@ -44,7 +45,7 @@ pub enum HubEvent {
     PeerConnected {
         device: DeviceId,
         name: String,
-        tx: Sender<SyncMessage>,
+        tx: Sender<Arc<PreparedMessage>>,
     },
     /// 某对端断开。
     PeerDisconnected { device: DeviceId },
@@ -87,7 +88,9 @@ impl HubHandle {
 /// 每个已连接对端的运行时状态。
 struct Peer {
     name: String,
-    tx: Sender<SyncMessage>,
+    /// 出站队列。传的是**已编码压缩**的消息而非 `SyncMessage`：一份内容广播
+    /// 给 N 台设备时，序列化与压缩只该做一次。见 [`PreparedMessage`]。
+    tx: Sender<Arc<PreparedMessage>>,
 }
 
 /// 中枢运行所需的外部组件。
@@ -172,10 +175,15 @@ fn hub_loop(engine: SyncEngine, deps: HubDeps, rx: Receiver<HubEvent>) {
                     device: device.clone(),
                 };
                 // 发给**所有**对端，包括被移出的那台自己。
-                for peer in st.peers.values() {
-                    let _ = peer.tx.send(msg.clone());
+                match st.prepare(&msg) {
+                    Some(p) => {
+                        for peer in st.peers.values() {
+                            let _ = peer.tx.send(Arc::clone(&p));
+                        }
+                        info!("已通知 {} 台在线设备：移出 {}", st.peers.len(), device);
+                    }
+                    None => warn!("移出 {} 的通知未能编码，在线设备不会收到", device),
                 }
-                info!("已通知 {} 台在线设备：移出 {}", st.peers.len(), device);
             }
             HubEvent::Unpaired { device } => {
                 // 丢掉发送通道即切断连接：对应 pump 会读到 Disconnected 并退出。
@@ -368,8 +376,11 @@ impl HubState {
     }
 
     fn send_to(&self, device: &DeviceId, msg: SyncMessage) {
-        if let Some(p) = self.peers.get(device) {
-            let _ = p.tx.send(msg);
+        let Some(p) = self.peers.get(device) else {
+            return;
+        };
+        if let Some(prepared) = self.prepare(&msg) {
+            let _ = p.tx.send(prepared);
         }
     }
 }

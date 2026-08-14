@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clipsync_core::SyncMessage;
+use clipsync_net::prepared::PreparedMessage;
 use clipsync_net::transport::{NoiseConnection, RecvOutcome};
 use tracing::{debug, info, warn};
 
@@ -34,7 +35,7 @@ pub(super) fn pump(
     mut conn: NoiseConnection,
     peer: &KnownPeer,
     ctx: &NetCtx,
-    out_rx: std::sync::mpsc::Receiver<SyncMessage>,
+    out_rx: std::sync::mpsc::Receiver<std::sync::Arc<PreparedMessage>>,
 ) -> Result<()> {
     // 空闲时用较长读超时（省 CPU）；传文件时用极短超时（保吞吐）；
     // 被限速时按限速器建议等待（避免空转）。
@@ -81,7 +82,9 @@ pub(super) fn pump(
         // 1) 优先发出中枢的待发消息，确保文本同步不被文件传输拖延。
         loop {
             match out_rx.try_recv() {
-                Ok(msg) => conn.send(&msg).context("向对端发送失败")?,
+                // 中枢已经编码压缩过，这里只剩加密与写出——加密是每连接独有的
+                // （各自的会话密钥与 nonce），没法共享，好在它很便宜。
+                Ok(msg) => conn.send_prepared(&msg).context("向对端发送失败")?,
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(()),
             }

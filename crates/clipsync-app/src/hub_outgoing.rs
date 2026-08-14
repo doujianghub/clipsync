@@ -5,7 +5,10 @@
 //! 去"。两侧的判断依据完全不同：发送侧看的是引擎的过滤规则（敏感内容、
 //! 类型开关、内联硬上限），接收侧看的是本机的自动取回上限与缓存命中。
 
+use std::sync::Arc;
+
 use clipsync_core::{ClipContent, LocalDecision, SkipReason, SyncMessage};
+use clipsync_net::prepared::PreparedMessage;
 use tracing::{debug, info};
 
 use super::HubState;
@@ -47,13 +50,43 @@ impl HubState {
                     info!("已复制 [{kind}] {size} 字节，但暂无对端连接（seq={seq}）");
                     return;
                 }
+
+                // 编码压缩**只做一次**，N 台设备共享同一份字节。从前是每条连接
+                // 各编各压：两台设备时日志里会出现两行一模一样的「帧层压缩」，
+                // 一张 4K 截图白花 15 ms 序列化加 40 ms deflate 再加一份 33 MB
+                // 内存副本，而且随设备数线性增长。
+                let t0 = std::time::Instant::now();
+                let Some(prepared) = self.prepare(&msg) else {
+                    return;
+                };
+                crate::logging::note_slow("编码与压缩", t0);
+
+                let wire = prepared.wire_len();
                 for peer in self.peers.values() {
-                    let _ = peer.tx.send(msg.clone());
+                    let _ = peer.tx.send(Arc::clone(&prepared));
                 }
-                info!("已同步 [{kind}] {size} 字节 → {} 台设备", self.peers.len());
+                info!(
+                    "已同步 [{kind}] {size} 字节（上线 {wire}）→ {} 台设备",
+                    self.peers.len()
+                );
             }
             LocalDecision::Skip(reason) => {
                 self.log_skip(reason, &content);
+            }
+        }
+    }
+
+    /// 编码一条待发消息，供广播与单播共用。
+    ///
+    /// 失败只可能是序列化出错（内容本身有问题），此时该条消息发不出去，但
+    /// 中枢必须继续跑——所以返回 `None` 由调用方决定怎么说，而不是让整个
+    /// 中枢线程崩掉。
+    pub(super) fn prepare(&self, msg: &SyncMessage) -> Option<Arc<PreparedMessage>> {
+        match PreparedMessage::encode(msg) {
+            Ok(p) => Some(Arc::new(p)),
+            Err(e) => {
+                tracing::warn!("编码待发消息失败，本条不发送: {e:#}");
+                None
             }
         }
     }

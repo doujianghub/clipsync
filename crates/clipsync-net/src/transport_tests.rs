@@ -1,4 +1,7 @@
 //! `transport` 的单元测试（单独成文件以控制行数，仍是其子模块）。
+//!
+//! 只测**连接**这一层：握手、认证、多帧重组、端到端还原。压缩该不该发生、
+//! 压到多少，是 `prepared` 的事，测试也在那边。
 
 use super::*;
 use crate::crypto::StaticIdentity;
@@ -76,74 +79,6 @@ fn noise_roundtrip_over_tcp() {
     server.join().unwrap();
 }
 
-/// 一张截图大小的图片必须在帧层被压掉——这是加压缩的**全部理由**。
-///
-/// 断言的是压缩比而不是"压过了"：真正要守住的是"4K 截图别再占 33 MB 带宽"，
-/// 一个只调用了压缩但压不动的实现同样是失败的。
-#[test]
-fn a_screenshot_sized_image_gets_squeezed() {
-    let img = screenshot_like(3840, 2160);
-    let raw = img.encode().unwrap();
-    let (body, compressed) = super::pack(&img, &raw);
-
-    assert!(compressed, "截图这么大的图片必须压");
-    assert!(
-        body.len() * 10 < raw.len(),
-        "截图应压到一成以下：{} → {}",
-        raw.len(),
-        body.len()
-    );
-}
-
-/// 文件分块不该在帧层再压一遍——应用层已按文件类型自适应压过了。
-#[test]
-fn file_chunks_are_left_alone() {
-    let msg = SyncMessage::FileChunk {
-        generation: 1,
-        file_id: 2,
-        offset: 0,
-        data: vec![0u8; 256 * 1024],
-        compressed: true,
-        plain_len: 256 * 1024,
-    };
-    let raw = msg.encode().unwrap();
-    let (body, compressed) = super::pack(&msg, &raw);
-    assert!(!compressed, "文件分块应原样透传，避免重复压缩");
-    assert_eq!(body.len(), raw.len());
-}
-
-/// 小消息不值得压：省下的字节抵不过一次压缩调用。
-#[test]
-fn small_messages_skip_compression() {
-    let msg = SyncMessage::Clip {
-        origin: DeviceId::from_public_key(b"x"),
-        seq: 0,
-        content_hash: 0,
-        content: ClipContent::Text("短文本".into()),
-    };
-    let raw = msg.encode().unwrap();
-    let (_, compressed) = super::pack(&msg, &raw);
-    assert!(!compressed);
-}
-
-/// 压不动的内容退回原始字节，不能因为"压过了"就把更大的结果发出去。
-#[test]
-fn incompressible_content_falls_back_to_raw() {
-    // 伪随机 RGBA，模拟照片/噪点——deflate 只会让它变大。
-    let mut x: u32 = 0x1234_5678;
-    let rgba: Vec<u8> = std::iter::repeat_with(|| {
-        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        (x >> 16) as u8
-    })
-    .take(512 * 1024)
-    .collect();
-    let msg = image_msg(512, 256, rgba);
-    let raw = msg.encode().unwrap();
-    let (body, compressed) = super::pack(&msg, &raw);
-    assert!(!compressed, "随机内容压不动，应退回原始字节");
-    assert_eq!(body.len(), raw.len());
-}
-
 /// 端到端：一张大图片过真实 socket 走一遭，字节必须**逐字节还原**。
 ///
 /// 压缩最危险的失败模式不是报错，而是悄悄还原出不一样的东西——图片会显示
@@ -169,6 +104,48 @@ fn a_compressed_image_survives_a_real_roundtrip() {
     conn.send(&sent).unwrap();
 
     assert_eq!(server.join().unwrap(), expect, "解压后必须逐字节一致");
+}
+
+/// 一份 [`PreparedMessage`] 发给**两条独立连接**，两边都必须逐字节还原。
+///
+/// 这是"压一次发给 N 台"能成立的全部前提。共享的是压缩后的明文帧，而每条
+/// Noise 连接有各自的会话密钥与 nonce 序列——加密仍是各做各的。真要是哪天
+/// 把共享的边界画错、连密文一起复用了，两端的 nonce 就会错位，这个测试会
+/// 当场失败，而不是等到线上出现"某台设备收不到图片"。
+#[test]
+fn one_prepared_message_serves_two_connections() {
+    let msg = screenshot_like(640, 480);
+    let expect = msg.clone();
+    let prepared = PreparedMessage::encode(&msg).unwrap();
+    assert!(
+        prepared.wire_len() < prepared.plain_len(),
+        "构造前提：应被压缩"
+    );
+
+    let mut servers = Vec::new();
+    let mut conns = Vec::new();
+    for _ in 0..2 {
+        let srv = StaticIdentity::generate().unwrap();
+        let cli = StaticIdentity::generate().unwrap();
+        let srv_pub = srv.public_key.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        servers.push(std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut conn = NoiseConnection::accept(s, &srv.private_key).unwrap();
+            conn.recv().unwrap().unwrap()
+        }));
+        let stream = TcpStream::connect(addr).unwrap();
+        conns.push(NoiseConnection::connect(stream, &cli.private_key, &srv_pub).unwrap());
+    }
+
+    // 同一份字节，发两次。
+    for conn in conns.iter_mut() {
+        conn.send_prepared(&prepared).unwrap();
+    }
+    for (i, s) in servers.into_iter().enumerate() {
+        assert_eq!(s.join().unwrap(), expect, "第 {i} 条连接的还原结果不一致");
+    }
 }
 
 /// 构造一条"截图那样"的图片消息：大片同色 + 少量噪点。

@@ -209,31 +209,14 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RollingFile {
     }
 }
 
+// 耗时打点已下沉到 `clipsync-core::timing`——网络层也要打点，而它不依赖本
+// crate。此处转出，调用点无需关心它住在哪个 crate。
+pub use clipsync_core::timing::note_slow;
+
 /// 在系统文件管理器中打开某个目录。
 ///
 /// 日志目录在两个平台上都藏得很深（macOS 的 `~/Library/Application Support/`
 /// 在 Finder 里默认隐藏），让用户自己找等于不给。
-/// 慢到值得说一句的阈值。
-///
-/// 定在 200ms：低于这个数用户根本感觉不到，记了也只是噪音；超过了就是他会
-/// 抱怨"怎么这么慢"的量级，那时日志里必须有一行能指出慢在哪一段。
-const NOTEWORTHY: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// 关键路径耗时：只在慢得值得注意时记一行。
-///
-/// **为什么需要**："同步慢"这类抱怨，光看首尾两条日志只能算出一个总时长，
-/// 分不清是卡在读剪贴板、压缩、网络还是写剪贴板上——只能靠猜，来回好几轮。
-/// 一行分段耗时就能省掉全部猜测。
-///
-/// 用 INFO 而不是 DEBUG：慢是用户**已经感觉到**的事，等他先去开详细日志再
-/// 复现一次，等于把诊断成本转嫁给他。而阈值保证了不慢的时候它一声不吭。
-pub fn note_slow(what: &str, since: std::time::Instant) {
-    let dt = since.elapsed();
-    if dt >= NOTEWORTHY {
-        tracing::info!("{what}耗时 {} ms", dt.as_millis());
-    }
-}
-
 pub fn open_in_file_manager(dir: &Path) -> Result<()> {
     // 目录可能还没建（从未写过日志），先确保存在，否则文件管理器会报错。
     let _ = std::fs::create_dir_all(dir);
