@@ -120,14 +120,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc, x86_64-apple-darwin
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: cross
 
-      - name: Check Windows target
-        run: cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
+      # 用 clippy 而不是 check：clippy 本身就做完整类型检查，多出来的只有 lint。
+      #
+      # **Windows 专有代码此前从没被 lint 过**：lint job 只跑本机（macOS）目标，
+      # 被 #[cfg(windows)] 挡住的那些文件它一行都看不到，而这里又只用 cargo
+      # check，抓不到 clippy 级别的问题。sockopt_win.rs、dialog_win_task.rs、
+      # tray 的 Windows 分支全在这个盲区里——dialog_win_task.rs 攒下 4 处
+      # unnecessary_cast 就是这么来的，等到有人本地手动跑一次才发现。
+      - name: Clippy Windows target
+        run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc
 
+      # Intel macOS 与本机同属 macOS，cfg 分支一致，lint 结果不会有差别——
+      # 这里只需确认它能编译，跑 clippy 是白花时间。
       - name: Check Intel macOS target
         run: cargo check --workspace --all-targets --target x86_64-apple-darwin
 

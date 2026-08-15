@@ -108,7 +108,7 @@ pub fn ask_action(title: &str, body: &str, action: &str) -> Result<bool> {
     cfg.pButtons = buttons.as_ptr();
     // TDCBF_OK_BUTTON = 1
     cfg.dwCommonButtons = 1;
-    cfg.nDefaultButton = IDOK as i32;
+    cfg.nDefaultButton = IDOK;
 
     Ok(run(&cfg)? == FIRST_BUTTON_ID)
 }
@@ -124,8 +124,8 @@ pub fn confirm(title: &str, body: &str) -> Result<bool> {
     cfg.pszContent = pcwstr(&body_w);
     // TDCBF_YES_BUTTON | TDCBF_NO_BUTTON = 2 | 4
     cfg.dwCommonButtons = 2 | 4;
-    cfg.nDefaultButton = IDNO as i32;
-    Ok(run(&cfg)? == IDYES as i32)
+    cfg.nDefaultButton = IDNO;
+    Ok(run(&cfg)? == IDYES)
 }
 
 /// 列表选择，用 Command Links 呈现——每个选项是一个大按钮，比列表框好按也好看。
@@ -157,7 +157,7 @@ pub fn choose(title: &str, body: &str, items: &[String]) -> Result<Option<usize>
     cfg.dwCommonButtons = 8;
 
     let pressed = run(&cfg)?;
-    if pressed == IDCANCEL as i32 {
+    if pressed == IDCANCEL {
         return Ok(None);
     }
     let idx = pressed - FIRST_BUTTON_ID;
